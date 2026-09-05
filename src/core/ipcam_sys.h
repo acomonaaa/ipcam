@@ -1,0 +1,53 @@
+#ifndef IPCAM_SYS_H
+#define IPCAM_SYS_H
+
+/*
+ * BCF2 mo_sys 风格的系统初始化 / 版本 / 横幅模块。
+ *
+ *  - ipcam_sys_init: 早于所有子系统调用；打印版本横幅 + 注册崩溃 handler
+ *  - ipcam_sys_print_banner: 进程启动时打印
+ *  - ipcam_sys_register_crash_handlers: 注册 SIGSEGV/SIGBUS/SIGILL handler dump param
+ */
+
+#include "ipcam_log.h"
+
+/* 库版本（与 BCF2 LIB_VERSION 风格一致：0xMMmmpp = Major.Minor.Patch） */
+#define LIBIPCAM_LOG_VERSION       0x00010001
+#define LIBIPCAM_PARAM_VERSION     0x00010001
+#define LIBIPCAM_RINGBUF_VERSION   0x00010001
+#define LIBIPCAM_CAPTURE_VERSION   0x00010001
+#define LIBIPCAM_DISPLAY_VERSION   0x00010001
+#define LIBIPCAM_ENCODE_VERSION    0x00010001
+#define LIBIPCAM_STREAM_VERSION    0x00010001
+#define LIBIPCAM_NET_VERSION       0x00010001
+
+/* 库版本字符串（g_git_info 占位；实际项目用 git describe） */
+#define LIBIPCAM_GIT_INFO   "dev"
+#define LIBIPCAM_BUILD_USER "build"
+
+#define LIBIPCAM_LIB_VER_FMT(lib_name)                                   \
+    do {                                                                 \
+        unsigned char v1, v2, v3;                                        \
+        v1 = (lib_name##_VERSION >> 16) & 0xff;                          \
+        v2 = (lib_name##_VERSION >> 8)  & 0xff;                          \
+        v3 = (lib_name##_VERSION)       & 0xff;                          \
+        MLOGI(#lib_name " ver: %x.%x.%x_%s (build: %s %s)\n",           \
+              v1, v2, v3, LIBIPCAM_GIT_INFO, __DATE__, __TIME__);        \
+    } while (0)
+
+/* 早于所有子系统的初始化（注册崩溃 handler、log init） */
+int  ipcam_sys_init(const char *module);
+
+/* 进程启动横幅 */
+void ipcam_sys_print_banner(void);
+
+/* 打印所有子模块版本 */
+void ipcam_sys_print_lib_versions(void);
+
+/* 注册 SIGSEGV/SIGBUS/SIGILL handler（dump 缓存的 param 快照 + backtrace） */
+void ipcam_sys_register_crash_handlers(void);
+
+/* 在正常上下文调用，预拍一份 param 快照供 crash handler 异步安全读 */
+void ipcam_sys_take_snapshot(void);
+
+#endif /* IPCAM_SYS_H */

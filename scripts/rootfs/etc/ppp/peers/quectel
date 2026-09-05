@@ -1,0 +1,26 @@
+# /etc/ppp/peers/quectel - Quectel EC20/Air720 模组 PPP 拨号配置
+#
+# 由 ipcam 的 net_4g.c 通过 `pppd call quectel` 调用。
+# 请根据实际模组型号修改 /dev/ttyUSB* 和 APN。
+
+/dev/ttyUSB3
+115200
+nocrtscts
+modem
+noauth
+noipdefault
+defaultroute
+usepeerdns
+replacedefaultroute
+persist
+holdoff 5
+maxfail 0
+
+# 用户名/密码（CT/EU/CM 三家运营商通常不校验）
+user ""
+password ""
+
+# APN（ipcam 启动时通过 AT+CGDCONT 设置；这里仅作默认）
+connect '/usr/sbin/chat -s -v -t 5 ABORT "NO CARRIER" ABORT "NO DIALTONE" ABORT "BUSY" "" "AT" "" "AT+CGDCONT=1,\\"IP\\",\\"cmnet\\"" "" "ATD*99#" CONNECT'
+
+disconnect '/usr/sbin/chat -s -v -t 1 "" "+++"" "" "AT" "" "ATH" ""'

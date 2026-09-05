@@ -1,0 +1,134 @@
+#!/bin/sh
+# /etc/init.d/S90ipcam - 启动 ipcam 守护进程
+#
+# BusyBox rc 风格：start|stop|restart|status|rollback。
+# 集成 OTA watchdog：用 wget 探测 /healthz（BusyBox ash 无 /dev/tcp）；
+# 仅在 .prev 存在（说明刚做过 commit）时才考虑 rollback，避免开机误退。
+# 健康成功后删除 .prev，避免后续每次启动都进看门狗。
+
+DAEMON=/usr/bin/ipcam
+PIDFILE=/var/run/ipcam.pid
+LOGFILE=/var/log/ipcam.log
+PREV=$DAEMON.prev
+WATCHDOG_TIMEOUT=60
+
+is_running() {
+    [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null
+}
+
+# BusyBox ash 不支持 /dev/tcp；用 wget（板级 BusyBox 通常启用）。
+# /healthz 响应体为 {"ok":true}
+probe_healthz() {
+    local port=${IPCAM_HTTP_PORT:-8080}
+    if ! command -v wget >/dev/null 2>&1; then
+        echo "[S90ipcam] wget not found; cannot probe healthz" >&2
+        return 1
+    fi
+    local body
+    body=$(wget -q -T 2 -O - "http://127.0.0.1:${port}/healthz" 2>/dev/null) || return 1
+    case "$body" in
+        *ok*|*OK*|*200*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+wait_healthz() {
+    local timeout=$1 i=0
+    while [ $i -lt $timeout ]; do
+        if is_running && probe_healthz; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+auto_rollback() {
+    [ -f "$PREV" ] || { echo "[S90ipcam] no .prev; nothing to rollback"; return 0; }
+    echo "[S90ipcam] healthz watchdog FAILED, rolling back to $PREV"
+    if [ -f "$DAEMON" ]; then
+        mv "$DAEMON" "$DAEMON.broken"
+    fi
+    mv "$PREV" "$DAEMON"
+    chmod +x "$DAEMON"
+}
+
+start_once() {
+    [ -c /dev/video0 ] || echo "[S90ipcam] WARN: /dev/video0 not present"
+    [ -c /dev/fb0 ]    || echo "[S90ipcam] WARN: /dev/fb0 not present"
+
+    if is_running; then
+        echo "[S90ipcam] already running (pid $(cat $PIDFILE))"
+        return 0
+    fi
+
+    start-stop-daemon -S -b -m -p $PIDFILE -x $DAEMON -- > $LOGFILE 2>&1
+    local pid=$(cat $PIDFILE 2>/dev/null)
+    echo "[S90ipcam] started, pid=$pid, log=$LOGFILE"
+
+    # Watchdog：仅在 .prev 存在（即刚做过 commit）才等待 + rollback
+    if [ -f "$PREV" ]; then
+        echo "[S90ipcam] .prev detected (post-OTA); waiting for healthz..."
+        if wait_healthz $WATCHDOG_TIMEOUT; then
+            echo "[S90ipcam] healthz OK; new version activated"
+            rm -f $DAEMON.broken "$PREV"
+        else
+            echo "[S90ipcam] healthz timeout (${WATCHDOG_TIMEOUT}s); killing and rolling back"
+            if [ -n "$pid" ]; then kill "$pid" 2>/dev/null; fi
+            sleep 1
+            is_running && kill -9 "$pid" 2>/dev/null
+            auto_rollback
+            $0 start
+        fi
+    else
+        # 普通启动：不 watchdog，让 init 流程继续
+        sleep 2  # 给 ipcam 一点启动时间
+        if ! is_running; then
+            echo "[S90ipcam] process not running after 2s; check $LOGFILE"
+            return 1
+        fi
+    fi
+}
+
+case "$1" in
+  start)
+    echo "[S90ipcam] starting ipcam ..."
+    start_once
+    ;;
+  stop)
+    echo "[S90ipcam] stopping ipcam ..."
+    if [ -f $PIDFILE ]; then
+        kill "$(cat $PIDFILE)" 2>/dev/null || true
+        for i in 1 2 3 4 5; do
+            sleep 1
+            is_running || break
+        done
+        rm -f $PIDFILE
+    fi
+    killall ipcam 2>/dev/null || true
+    ;;
+  restart)
+    $0 stop
+    sleep 1
+    $0 start
+    ;;
+  status)
+    if is_running; then
+        echo "[S90ipcam] running, pid=$(cat $PIDFILE)"
+    else
+        echo "[S90ipcam] stopped"
+    fi
+    ;;
+  rollback)
+    echo "[S90ipcam] manual rollback"
+    auto_rollback
+    $0 start
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart|status|rollback}"
+    exit 1
+    ;;
+esac
+
+exit 0

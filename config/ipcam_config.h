@@ -1,0 +1,82 @@
+#ifndef IPCAM_CONFIG_H
+#define IPCAM_CONFIG_H
+
+/* ===== 编译期默认值；可在 Makefile 里 -D 覆盖 ===== */
+
+#ifndef IPCAM_VERSION
+#define IPCAM_VERSION          "0.1.0"
+#endif
+
+#ifndef IPCAM_MODEL
+#define IPCAM_MODEL            "ipcam-imx6ull"
+#endif
+
+/* 摄像头采集分辨率（OV5640 输出 YUYV 4:2:2，每像素 2 字节） */
+#ifndef IPCAM_CAPTURE_WIDTH
+#define IPCAM_CAPTURE_WIDTH    640
+#endif
+#ifndef IPCAM_CAPTURE_HEIGHT
+#define IPCAM_CAPTURE_HEIGHT   480
+#endif
+
+/* LCD 显示分辨率（fb0 由内核报告；这里只是默认裁剪/缩放目标） */
+#ifndef IPCAM_LCD_WIDTH
+#define IPCAM_LCD_WIDTH        1024
+#endif
+#ifndef IPCAM_LCD_HEIGHT
+#define IPCAM_LCD_HEIGHT       600
+#endif
+
+/* 帧率上限（实际由 V4L2 S_PARM 决定，这里是软上限） */
+#ifndef IPCAM_TARGET_FPS
+#define IPCAM_TARGET_FPS       15
+#endif
+
+/* MJPEG 编码质量（1-100，越高越清晰越慢） */
+#ifndef IPCAM_JPEG_QUALITY
+#define IPCAM_JPEG_QUALITY     75
+#endif
+
+/* HTTP 服务端口 */
+#ifndef IPCAM_HTTP_PORT
+#define IPCAM_HTTP_PORT        8080
+#endif
+
+/* 环形缓冲帧数（采集侧最多缓存 N 帧，超过则丢弃最旧） */
+#ifndef IPCAM_RING_DEPTH
+#define IPCAM_RING_DEPTH       4
+#endif
+
+/* 设备节点 */
+#ifndef IPCAM_VIDEO_DEV
+#define IPCAM_VIDEO_DEV        "/dev/video0"
+#endif
+#ifndef IPCAM_FB_DEV
+#define IPCAM_FB_DEV           "/dev/fb0"
+#endif
+
+/* 网络模式：'4g' 或 'wifi' 或 'none'（none = 仅本地显示） */
+#ifndef IPCAM_NET_MODE
+#define IPCAM_NET_MODE         "none"
+#endif
+
+/* 4G APN（pppd 拨号用） */
+#ifndef IPCAM_4G_APN
+#define IPCAM_4G_APN           "cmnet"
+#endif
+
+/* WiFi SSID/PWD（运行时可改；编译期仅供默认） */
+#ifndef IPCAM_WIFI_SSID
+#define IPCAM_WIFI_SSID        ""
+#endif
+#ifndef IPCAM_WIFI_PSK
+#define IPCAM_WIFI_PSK         ""
+#endif
+
+/* 调试日志等级（对应 log.h 的 ipcam_log_level_t）：
+ *   0=FATAL  1=PRINT  2=ERROR  3=WARNING  4=INFO  5=DEBUG */
+#ifndef IPCAM_LOG_LEVEL
+#define IPCAM_LOG_LEVEL        4   /* default: INFO */
+#endif
+
+#endif /* IPCAM_CONFIG_H */

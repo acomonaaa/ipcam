@@ -1,0 +1,26 @@
+# Build outputs
+/ipcam
+*.o
+*.a
+*.so
+/output/
+
+# Third-party build trees (keep empty placeholder dirs if any)
+thirdparts/libjpeg-turbo/src/
+thirdparts/libjpeg-turbo/install/
+thirdparts/libjpeg-turbo/build/
+
+# Editor / OS
+*~
+*.swp
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime / local
+*.log
+/etc/
+/core
+core.[0-9]*
+core.[0-9]*.*
+
