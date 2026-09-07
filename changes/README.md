@@ -13,3 +13,4 @@
 | 日期（北京时间） | 标题 | 文档 |
 | --- | --- | --- |
 | 2026-09-05 | P0/P1 关键缺陷修复 | [2026-09-05-p0-p1-关键缺陷修复.md](2026-09-05-p0-p1-关键缺陷修复.md) |
+| 2026-09-07 | `ipcam` 正确性与线程生命周期修复 | [2026-09-07-projectproof-ipcam-correctness-lifecycle.md](2026-09-07-projectproof-ipcam-correctness-lifecycle.md) |

@@ -104,6 +104,9 @@ void ipcam_ring_release(ipcam_ring_buffer_t *rb);
 /* 标记缓冲关闭；唤醒所有阻塞线程 */
 void ipcam_ring_close(ipcam_ring_buffer_t *rb);
 
+/* 查询缓冲是否已关闭；用于健康检查区分“无帧”与“生产者已停止”。 */
+int ipcam_ring_is_closed(ipcam_ring_buffer_t *rb);
+
 /* 当前帧数（仅供统计） */
 int ipcam_ring_count(ipcam_ring_buffer_t *rb);
 

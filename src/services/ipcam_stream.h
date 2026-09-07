@@ -20,8 +20,9 @@
  * shutdown 顺序（main.c cleanup_all 负责 ring_close）：
  *   1) running=0，shutdown+close listen_fd
  *   2) join accept_loop
- *   3) wait until detached client threads drain (client_cnt)
- *   4) destroy client_mtx
+ *   3) shutdown client fd，由客户端线程最终 close
+ *   4) close JPEG ring，等待 detached client 线程 drain
+ *   5) 确认 client_cnt=0 后再销毁同步对象
  */
 #define IPCAM_MAX_TRACKED_CLIENTS 32
 
@@ -32,10 +33,11 @@ typedef struct ipcam_stream_ctx_s {
     volatile sig_atomic_t *running;
     pthread_t            thread;      /* accept 循环线程（可 join） */
 
-    pthread_mutex_t      client_mtx;    /* 保护 client_cnt + client_threads[] */
+    pthread_mutex_t      client_mtx;    /* 保护 client_cnt + client_fds[] */
+    pthread_cond_t       client_cond;   /* 客户端线程退出时唤醒 stop 等待者 */
     pthread_mutex_t      ring_mtx;      /* 序列化 jpeg_rb 的多 reader 访问 */
     int                  client_cnt;
-    pthread_t            client_threads[IPCAM_MAX_TRACKED_CLIENTS];
+    int                  client_fds[IPCAM_MAX_TRACKED_CLIENTS];
 } ipcam_stream_ctx_t;
 
 int  ipcam_stream_start(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,

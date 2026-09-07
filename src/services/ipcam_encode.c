@@ -2,8 +2,10 @@
 #include "ipcam_encode.h"
 #include "ipcam_log.h"
 #include "ipcam_param.h"
+#include "ipcam_scale.h"
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +25,11 @@
  *   Y[i]   (i in [0, W*H))              = src[(i/W)*W*2 + (i%W)*2 + 0]
  *   Cb[j]  (j in [0, (W/2)*H))          = src[(j/(W/2))*W*2 + (j%(W/2))*4 + 1]
  *   Cr[j]  (j in [0, (W/2)*H))          = src[(j/(W/2))*W*2 + (j%(W/2))*4 + 3]
+ *
+ * 为什么拆分放在编码线程而不是采集线程：ring 里存 packed 原始帧，
+ * display（packed 转 RGB565）与 encode（packed 转平面 YUV）各取所需；
+ * 拆分每帧只做一次、无重复劳动，而采集线程保持纯拷贝，避免生产者变重
+ * 导致两路消费同时丢帧。
  */
 static void unpack_yuyv_to_planar(const unsigned char *src, int w, int h,
                                  unsigned char *Y, unsigned char *Cb, unsigned char *Cr)
@@ -46,6 +53,39 @@ static void unpack_yuyv_to_planar(const unsigned char *src, int w, int h,
     }
 }
 
+/*
+ * 统一检查平面分配的乘法，避免异常配置在 malloc 前发生 size_t 溢出。
+ * 这里不限制业务分辨率，只负责验证“宽×高”能否安全表示；具体设备上限
+ * 由 V4L2 协商和缩放模块的定点计算上限共同约束。
+ */
+static int checked_plane_bytes(int width, int height, size_t *bytes)
+{
+    if (width <= 0 || height <= 0 || !bytes) return -1;
+    if ((size_t)width > SIZE_MAX / (size_t)height) return -1;
+    *bytes = (size_t)width * (size_t)height;
+    return 0;
+}
+
+/*
+ * 色度平面最临近缩放：4:2:2 色度本身是低频半分辨率信号，
+ * 双线性的收益/代价比不高，最临近足够且最便宜。
+ */
+static void plane_nearest_scale(const unsigned char *src, int sw, int sh,
+                                unsigned char *dst, int dw, int dh)
+{
+    for (int dy = 0; dy < dh; dy++) {
+        int sy = dy * sh / dh;
+        if (sy >= sh) sy = sh - 1;
+        const unsigned char *srow = src + (size_t)sy * sw;
+        unsigned char *drow = dst + (size_t)dy * dw;
+        for (int dx = 0; dx < dw; dx++) {
+            int sx = dx * sw / dw;
+            if (sx >= sw) sx = sw - 1;
+            drow[dx] = srow[sx];
+        }
+    }
+}
+
 static void *encode_thread(void *arg)
 {
     ipcam_encode_ctx_t *ctx = arg;
@@ -56,6 +96,8 @@ static void *encode_thread(void *arg)
     tjhandle tj = tjInitCompress();
     if (!tj) {
         MLOGE("tjInitCompress: %s\n", tjGetErrorStr());
+        /* 编码线程无法启动时，不能让主循环继续报告服务健康。 */
+        if (ctx->running) *ctx->running = 0;
         return NULL;
     }
 
@@ -75,6 +117,7 @@ static void *encode_thread(void *arg)
         MLOGE("alloc YUV planes failed\n");
         free(Yp); free(Cbp); free(Crp);
         tjDestroy(tj);
+        if (ctx->running) *ctx->running = 0;
         return NULL;
     }
 
@@ -94,14 +137,40 @@ static void *encode_thread(void *arg)
 
         unpack_yuyv_to_planar((const unsigned char *)frame.rawData, W, H, Yp, Cbp, Crp);
 
-        const unsigned char *planes[3] = { Yp, Cbp, Crp };
-        int strides[3] = { W, Wp, Wp };
+        /*
+         * 输出分辨率 != 采集分辨率时，在 planar 域逐平面缩放后再编码：
+         * Y 双线性（保细节平滑）、色度最临近（低频信号足够）。
+         * 选 planar 域而非 packed 域缩放：packed 4:2:2 的色度有偶像素
+         * 对齐约束（见 display 的 sx&~1），planar 各平面独立缩放更干净。
+         */
+        const unsigned char *planes[3];
+        int strides[3];
+        int enc_w, enc_h;
+        if (ctx->scale_on) {
+            if (ipcam_scale_plane_bilinear(Yp, W, H, ctx->Ys,
+                                            ctx->out_w, ctx->out_h,
+                                            ctx->xs0, ctx->xfrac) != 0) {
+                MLOGE("invalid Y-plane scale parameters, stopping encoder\n");
+                if (ctx->running) *ctx->running = 0;
+                ipcam_ring_release(ctx->in_rb);
+                break;
+            }
+            plane_nearest_scale(Cbp, Wp, H, ctx->Cbs, ctx->out_w / 2, ctx->out_h);
+            plane_nearest_scale(Crp, Wp, H, ctx->Crs, ctx->out_w / 2, ctx->out_h);
+            planes[0] = ctx->Ys; planes[1] = ctx->Cbs; planes[2] = ctx->Crs;
+            enc_w = ctx->out_w;
+        } else {
+            planes[0] = Yp; planes[1] = Cbp; planes[2] = Crp;
+            enc_w = W;
+        }
+        enc_h = ctx->out_h;
+        strides[0] = enc_w; strides[1] = enc_w / 2; strides[2] = enc_w / 2;
 
         /*
          * libjpeg-turbo 2.1.x 参数顺序为 (handle, planes, width, strides, height, …)。
          * 曾误写成 strides/W 对调，会导致压缩失败、崩溃或垃圾 JPEG。
          */
-        if (tjCompressFromYUVPlanes(tj, planes, W, strides, H, TJSAMP_422,
+        if (tjCompressFromYUVPlanes(tj, planes, enc_w, strides, enc_h, TJSAMP_422,
                                     &jpeg_buf, &jpeg_size,
                                     ipcam_param_get_jpeg_quality(),
                                     TJFLAG_FASTDCT) != 0) {
@@ -172,4 +241,10 @@ void ipcam_encode_stop(ipcam_encode_ctx_t *ctx)
         pthread_join(ctx->thread, NULL);
         ctx->thread = 0;
     }
+
+    /* 释放缩放路径的常驻缓冲（scale_on=0 时均为 NULL，free 空指针安全） */
+    free(ctx->Ys); free(ctx->Cbs); free(ctx->Crs);
+    free(ctx->xs0); free(ctx->xfrac);
+    ctx->Ys = ctx->Cbs = ctx->Crs = NULL;
+    ctx->xs0 = ctx->xfrac = NULL;
 }

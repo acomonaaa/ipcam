@@ -27,6 +27,15 @@ static int xioctl(int fd, int req, void *arg)
 
 static void capture_teardown(ipcam_capture_ctx_t *ctx)
 {
+    /*
+     * 先停止驱动对 MMAP buffer 的使用，再解除映射；这样清理顺序与
+     * V4L2 的 buffer 所有权一致，避免驱动仍在 DMA 时用户态回收内存。
+     */
+    if (ctx->fd >= 0) {
+        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        xioctl(ctx->fd, VIDIOC_STREAMOFF, &type);
+    }
+
     if (ctx->bufs) {
         for (int i = 0; i < ctx->n_bufs; i++) {
             if (ctx->bufs[i].start && ctx->bufs[i].start != MAP_FAILED)
@@ -94,8 +103,11 @@ static int capture_open_device(ipcam_capture_ctx_t *ctx)
         ctx->fd = -1;
         return -1;
     }
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
-        MLOGE("%s is not a capture device\n", IPCAM_VIDEO_DEV);
+    __u32 device_caps = cap.capabilities;
+    if (device_caps & V4L2_CAP_DEVICE_CAPS) device_caps = cap.device_caps;
+    if (!(device_caps & V4L2_CAP_VIDEO_CAPTURE) ||
+        !(device_caps & V4L2_CAP_STREAMING)) {
+        MLOGE("%s lacks video-capture or streaming capability\n", IPCAM_VIDEO_DEV);
         close(ctx->fd);
         ctx->fd = -1;
         return -1;
@@ -175,6 +187,7 @@ static void *capture_thread(void *arg)
     MLOGI("capture thread start\n");
     if (xioctl(ctx->fd, VIDIOC_STREAMON, &type) < 0) {
         MLOGE("STREAMON: %s\n", strerror(errno));
+        if (ctx->running) *ctx->running = 0;
         return NULL;
     }
 
@@ -189,6 +202,15 @@ static void *capture_thread(void *arg)
             if (errno == EAGAIN) continue;
             /* EIO = 硬件错误（CSI 接触不良 / 传感器故障），不是 EAGAIN 的可重试变体 */
             MLOGE("DQBUF fatal: %s\n", strerror(errno));
+            if (ctx->running) *ctx->running = 0;
+            break;
+        }
+
+        /* 驱动返回的 index 是外部输入，必须先校验再作为数组下标使用。 */
+        if (buf.index >= (unsigned int)ctx->n_bufs) {
+            MLOGE("DQBUF returned invalid index=%u (n_bufs=%d)\n",
+                  buf.index, ctx->n_bufs);
+            if (ctx->running) *ctx->running = 0;
             break;
         }
 
@@ -197,6 +219,7 @@ static void *capture_thread(void *arg)
             MLOGW("frame %u marked BUF_FLAG_ERROR, dropping\n", buf.sequence);
             if (xioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
                 MLOGE("QBUF after error: %s\n", strerror(errno));
+                if (ctx->running) *ctx->running = 0;
                 break;
             }
             continue;
@@ -222,6 +245,7 @@ static void *capture_thread(void *arg)
 
         if (xioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
             MLOGE("QBUF: %s\n", strerror(errno));
+            if (ctx->running) *ctx->running = 0;
             break;
         }
     }
@@ -269,21 +293,22 @@ void ipcam_capture_stop(ipcam_capture_ctx_t *ctx)
     /* 1) 设 running=0，让线程退出 DQBUF 循环 */
     if (ctx->running) *ctx->running = 0;
 
-    /* 2) 关 fd（让 DQBUF 立刻返回 EBADF，避免依赖 STREAMOFF 的不可靠唤醒） */
+    /*
+     * 2) 只用 STREAMOFF 唤醒 DQBUF，不提前 close fd；采集线程仍可能在
+     * 退出收尾阶段访问该 fd，必须等 join 完成后再由 teardown 关闭。
+     */
     if (ctx->fd >= 0) {
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         xioctl(ctx->fd, VIDIOC_STREAMOFF, &type);
-        close(ctx->fd);   /* EBADF 让 DQBUF 立即返回 */
-        ctx->fd = -1;
     }
 
-    /* 3) join（线程不会再卡在 DQBUF，因为 fd 已关） */
+    /* 3) join（STREAMOFF 后等待线程不再访问 fd） */
     if (ctx->thread) {
         pthread_join(ctx->thread, NULL);
         ctx->thread = 0;
     }
 
-    /* 4) 释放 mmap（capture_teardown 看到 fd==-1 会跳过 close） */
+    /* 4) 线程完全退出后，再统一释放 mmap 并关闭 fd。 */
     capture_teardown(ctx);
 }
 

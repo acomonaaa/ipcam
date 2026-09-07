@@ -170,6 +170,20 @@ void ipcam_ring_close(ipcam_ring_buffer_t *rb)
     pthread_mutex_unlock(&rb->mtx);
 }
 
+int ipcam_ring_is_closed(ipcam_ring_buffer_t *rb)
+{
+    if (!rb) return 1;
+
+    /*
+     * closed 与 count 都受同一把锁保护；健康检查必须读取一致状态，
+     * 否则可能把刚关闭且已清空的 ring 误报成“暂时没有帧”。
+     */
+    pthread_mutex_lock(&rb->mtx);
+    int closed = rb->closed;
+    pthread_mutex_unlock(&rb->mtx);
+    return closed;
+}
+
 int ipcam_ring_count(ipcam_ring_buffer_t *rb)
 {
     if (!rb) return 0;
