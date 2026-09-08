@@ -97,4 +97,17 @@ void ipcam_log_printf(ipcam_log_level_t level, const char *module,
 #define MLOGI(fmt, ...)  ipcam_log_printf(IPCAM_LOG_INFO,    NULL, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 #define MLOGD(fmt, ...)  ipcam_log_printf(IPCAM_LOG_DEBUG,   NULL, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 
+/*
+ * BCF2 的 MLOG 宏允许每个源文件声明自己的短模块名（如 MAIN、HTTP、SD）。
+ * ipcam 大多数日志仍使用进程模块名，避免无意义地改写已有输出；媒体链路的
+ * 关键运行日志使用下面这组显式模块宏，便于在串口或 /var/log/ipcam.log 中
+ * 直接按 CAP / DISP / ENC / HTTP 定位问题，同时保留源文件和行号。
+ */
+#define MLOGF_M(module, fmt, ...) ipcam_log_printf(IPCAM_LOG_FATAL,   module, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define MLOGP_M(module, fmt, ...) ipcam_log_printf(IPCAM_LOG_PRINT,   module, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define MLOGE_M(module, fmt, ...) ipcam_log_printf(IPCAM_LOG_ERROR,   module, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define MLOGW_M(module, fmt, ...) ipcam_log_printf(IPCAM_LOG_WARNING, module, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define MLOGI_M(module, fmt, ...) ipcam_log_printf(IPCAM_LOG_INFO,    module, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define MLOGD_M(module, fmt, ...) ipcam_log_printf(IPCAM_LOG_DEBUG,   module, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+
 #endif /* IPCAM_LOG_H */

@@ -21,6 +21,8 @@
 
 #include "ipcam_config.h"
 
+#define IPCAM_MAIN_LOG_MODULE "MAIN"
+
 static volatile sig_atomic_t g_running = 1;
 
 static void on_signal(int sig)
@@ -56,10 +58,10 @@ static void cleanup_all(subsys_t *s)
     if (s->rb_yuyv_enc)  ipcam_ring_close(s->rb_yuyv_enc);
     if (s->rb_jpeg)      ipcam_ring_close(s->rb_jpeg);
 
-    if (s->stream_started)  { MLOGI("stopping stream_http\n");   ipcam_stream_stop(&s->http);  s->stream_started = 0; }
-    if (s->encode_started)  { MLOGI("stopping encode\n");        ipcam_encode_stop(&s->enc);   s->encode_started = 0; }
-    if (s->display_started) { MLOGI("stopping display\n");       ipcam_display_stop(&s->dis);  s->display_started = 0; }
-    if (s->capture_started) { MLOGI("stopping capture\n");       ipcam_capture_stop(&s->cap);  s->capture_started = 0; }
+    if (s->stream_started)  { MLOGI_M(IPCAM_MAIN_LOG_MODULE, "stopping stream_http\n");   ipcam_stream_stop(&s->http);  s->stream_started = 0; }
+    if (s->encode_started)  { MLOGI_M(IPCAM_MAIN_LOG_MODULE, "stopping encode\n");        ipcam_encode_stop(&s->enc);   s->encode_started = 0; }
+    if (s->display_started) { MLOGI_M(IPCAM_MAIN_LOG_MODULE, "stopping display\n");       ipcam_display_stop(&s->dis);  s->display_started = 0; }
+    if (s->capture_started) { MLOGI_M(IPCAM_MAIN_LOG_MODULE, "stopping capture\n");       ipcam_capture_stop(&s->cap);  s->capture_started = 0; }
 
     if (s->net_started) {
         if (s->net_is_4g) ipcam_net_4g_stop(&s->net4g);
@@ -90,7 +92,16 @@ static int run_daemon(void)
 
     /* 应用运行时 log level */
     uint8_t ll = ipcam_param_get_log_level();
-    if (ll < IPCAM_LOG_BUTT) {
+    const char *log_level_env = getenv("IPCAM_LOG_LEVEL");
+    /*
+     * ipcam_log_init() 已经解析环境变量；若环境变量存在，必须保留它的优先级，
+     * 不能再被持久化参数覆盖，否则现场用 IPCAM_LOG_LEVEL=5 开 DEBUG 不生效。
+     * 没有环境变量时才使用 /etc/ipcam.conf 中保存的级别。
+     */
+    if (log_level_env && *log_level_env) {
+        MLOGI_M(IPCAM_MAIN_LOG_MODULE,
+                "log level override from IPCAM_LOG_LEVEL=%s\n", log_level_env);
+    } else if (ll < IPCAM_LOG_BUTT) {
         ipcam_log_setlevel((ipcam_log_level_t)ll);
     }
 
@@ -117,25 +128,41 @@ static int run_daemon(void)
         if (s.net_is_4g) {
             ipcam_net_4g_init(&s.net4g, ipcam_param_get_apn(), "/dev/ttyUSB2");
             if (ipcam_net_4g_start(&s.net4g) == 0) s.net_started = 1;
-            else MLOGW("4G start failed, continuing in local-only mode\n");
+            else MLOGW_M(IPCAM_MAIN_LOG_MODULE,
+                         "4G start failed, continuing in local-only mode\n");
         } else {
             ipcam_net_wifi_init(&s.netwf, ipcam_param_get_wifi_ssid(),
                                 ipcam_param_get_wifi_psk(), "wlan0");
             if (ipcam_net_wifi_start(&s.netwf) == 0) s.net_started = 1;
-            else MLOGW("WiFi start failed, continuing in local-only mode\n");
+            else MLOGW_M(IPCAM_MAIN_LOG_MODULE,
+                         "WiFi start failed, continuing in local-only mode\n");
         }
     } else {
-        MLOGI("net mode = none; running locally only\n");
+        MLOGI_M(IPCAM_MAIN_LOG_MODULE, "net mode = none; running locally only\n");
     }
 
     /* 2) 环形缓冲（按 param 决定尺寸） */
     uint16_t cap_w_cfg = ipcam_param_get_capture_w();
     uint16_t cap_h_cfg = ipcam_param_get_capture_h();
+
+    /*
+     * 参数模块已经在写入/加载时校验过一次；这里仍在分配前做防御性检查，
+     * 防止手工构造的 CRC 正确但不满足 packed 4:2:2 约束的配置消耗大量内存。
+     */
+    if (cap_w_cfg < 2 || cap_w_cfg > 4096 || (cap_w_cfg & 1) != 0 ||
+        cap_h_cfg < 1 || cap_h_cfg > 4096) {
+        MLOGE_M(IPCAM_MAIN_LOG_MODULE,
+              "invalid capture size %ux%u (width must be even, range 2..4096)\n",
+              cap_w_cfg, cap_h_cfg);
+        cleanup_all(&s);
+        return 1;
+    }
+
     size_t yuyv_bytes = (size_t)cap_w_cfg * cap_h_cfg * 2;
     s.rb_yuyv_disp = ipcam_ring_create(IPCAM_RING_DEPTH, yuyv_bytes);
     s.rb_yuyv_enc  = ipcam_ring_create(IPCAM_RING_DEPTH, yuyv_bytes);
     if (!s.rb_yuyv_disp || !s.rb_yuyv_enc) {
-        MLOGE("alloc yuyv ring buffer(s) failed\n");
+        MLOGE_M(IPCAM_MAIN_LOG_MODULE, "alloc yuyv ring buffer(s) failed\n");
         cleanup_all(&s);
         return 1;
     }
@@ -143,14 +170,15 @@ static int run_daemon(void)
     size_t jpeg_bytes = 256 * 1024;
     s.rb_jpeg = ipcam_ring_create(IPCAM_RING_DEPTH, jpeg_bytes);
     if (!s.rb_jpeg) {
-        MLOGE("alloc jpeg ring buffer failed\n");
+        MLOGE_M(IPCAM_MAIN_LOG_MODULE, "alloc jpeg ring buffer failed\n");
         cleanup_all(&s);
         return 1;
     }
 
     /* 3) 启动线程（顺序：capture -> display -> encode -> stream） */
-    if (ipcam_capture_start(&s.cap, s.rb_yuyv_disp, s.rb_yuyv_enc, &g_running) < 0) {
-        MLOGE("capture start failed\n");
+    if (ipcam_capture_start(&s.cap, s.rb_yuyv_disp, s.rb_yuyv_enc,
+                            cap_w_cfg, cap_h_cfg, &g_running) < 0) {
+        MLOGE_M(IPCAM_MAIN_LOG_MODULE, "capture start failed\n");
         cleanup_all(&s);
         return 1;
     }
@@ -158,17 +186,20 @@ static int run_daemon(void)
 
     int cap_w = cap_w_cfg, cap_h = cap_h_cfg;
     ipcam_capture_get_dimensions(&s.cap, &cap_w, &cap_h);
-    MLOGI("capture final dims: %dx%d\n", cap_w, cap_h);
+    MLOGI_M(IPCAM_MAIN_LOG_MODULE, "capture final dims: %dx%d\n", cap_w, cap_h);
 
     if (ipcam_display_start(&s.dis, s.rb_yuyv_disp, cap_w, cap_h, &g_running) < 0) {
-        MLOGE("display start failed\n");
+        MLOGE_M(IPCAM_MAIN_LOG_MODULE, "display start failed\n");
         cleanup_all(&s);
         return 1;
     }
     s.display_started = 1;
 
-    if (ipcam_encode_start(&s.enc, s.rb_yuyv_enc, s.rb_jpeg, cap_w, cap_h, &g_running) < 0) {
-        MLOGE("encode start failed\n");
+    /* out_w/out_h = 0 表示跟随采集分辨率（旁路缩放）；非 0 走编码前插值缩放 */
+    if (ipcam_encode_start(&s.enc, s.rb_yuyv_enc, s.rb_jpeg, cap_w, cap_h,
+                           ipcam_param_get_out_w(), ipcam_param_get_out_h(),
+                           &g_running) < 0) {
+        MLOGE_M(IPCAM_MAIN_LOG_MODULE, "encode start failed\n");
         cleanup_all(&s);
         return 1;
     }
@@ -179,24 +210,26 @@ static int run_daemon(void)
 
     if (!encode_is_stub) {
         if (ipcam_stream_start(&s.http, s.rb_jpeg, &g_running) < 0) {
-            MLOGE("http stream start failed\n");
+            MLOGE_M(IPCAM_MAIN_LOG_MODULE, "http stream start failed\n");
             cleanup_all(&s);
             return 1;
         }
         s.stream_started = 1;
     } else {
-        MLOGW("encode stub detected (display-only build); skipping HTTP stream\n");
+        MLOGW_M(IPCAM_MAIN_LOG_MODULE,
+                "encode stub detected (display-only build); skipping HTTP stream\n");
     }
 
-    MLOGI("ipcam running. Visit http://<board_ip>:%d/ in a browser.\n",
-          ipcam_param_get_http_port());
+    MLOGI_M(IPCAM_MAIN_LOG_MODULE,
+            "ipcam running. Visit http://<board_ip>:%d/ in a browser.\n",
+            ipcam_param_get_http_port());
     while (g_running) {
         sleep(1);
     }
-    MLOGI("=== shutting down ===\n");
+    MLOGI_M(IPCAM_MAIN_LOG_MODULE, "=== shutting down ===\n");
 
     cleanup_all(&s);
-    MLOGI("=== ipcam exited cleanly ===\n");
+    MLOGI_M(IPCAM_MAIN_LOG_MODULE, "=== ipcam exited cleanly ===\n");
     return 0;
 }
 

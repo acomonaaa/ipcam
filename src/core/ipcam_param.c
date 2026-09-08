@@ -44,6 +44,20 @@ static uint32_t param_crc(const ipcam_param_t *p)
     return crc32_update(0, base + off, sizeof(*p) - off);
 }
 
+/*
+ * packed 4:2:2 每两个像素共享一组色度，采集宽度必须为偶数；同时限制
+ * 到当前 V4L2/缩放链路允许的范围，避免异常配置在 main.c 中放大成超大分配。
+ */
+static int capture_width_valid(uint16_t value)
+{
+    return value >= 2 && value <= 4096 && (value & 1) == 0;
+}
+
+static int capture_height_valid(uint16_t value)
+{
+    return value >= 1 && value <= 4096;
+}
+
 /* 从 compile-time 默认填充（ipcam_config.h） */
 static void load_defaults(ipcam_param_t *p)
 {
@@ -64,6 +78,8 @@ static void load_defaults(ipcam_param_t *p)
 
     p->capture_w = IPCAM_CAPTURE_WIDTH;
     p->capture_h = IPCAM_CAPTURE_HEIGHT;
+    p->out_w = IPCAM_OUTPUT_WIDTH;      /* 0 = 跟随采集分辨率（旁路缩放） */
+    p->out_h = IPCAM_OUTPUT_HEIGHT;
     p->jpeg_quality = IPCAM_JPEG_QUALITY;
     p->target_fps   = IPCAM_TARGET_FPS;
 
@@ -113,6 +129,14 @@ int ipcam_param_init(const char *path)
     if (expected != loaded.crc) {
         MLOGW("param file %s CRC mismatch (got %08x want %08x), using defaults\n",
               s_path, loaded.crc, expected);
+        return 0;
+    }
+
+    /* CRC 正确不代表字段满足当前 packed 4:2:2 约束，旧配置也必须重新校验。 */
+    if (!capture_width_valid(loaded.capture_w) ||
+        !capture_height_valid(loaded.capture_h)) {
+        MLOGW("param file %s has invalid capture size %ux%u, using defaults\n",
+              s_path, loaded.capture_w, loaded.capture_h);
         return 0;
     }
 
@@ -191,6 +215,8 @@ PARAM_STR_GETTER(      wifi_psk,         wifi_psk)
 PARAM_STR_GETTER(      apn,              apn)
 PARAM_GETTER(uint16_t, capture_w,        capture_w)
 PARAM_GETTER(uint16_t, capture_h,        capture_h)
+PARAM_GETTER(uint16_t, out_w,            out_w)
+PARAM_GETTER(uint16_t, out_h,            out_h)
 PARAM_GETTER(uint8_t,  jpeg_quality,     jpeg_quality)
 PARAM_GETTER(uint8_t,  target_fps,       target_fps)
 PARAM_GETTER(uint16_t, http_port,        http_port)
@@ -250,7 +276,7 @@ int ipcam_param_set_apn(const char *apn)
 
 int ipcam_param_set_capture_w(uint16_t v)
 {
-    if (v == 0 || v > 4096) return -1;
+    if (!capture_width_valid(v)) return -1;
     pthread_mutex_lock(&s_mtx);
     s_param.capture_w = v;
     pthread_mutex_unlock(&s_mtx);
@@ -258,9 +284,29 @@ int ipcam_param_set_capture_w(uint16_t v)
 }
 int ipcam_param_set_capture_h(uint16_t v)
 {
-    if (v == 0 || v > 4096) return -1;
+    if (!capture_height_valid(v)) return -1;
     pthread_mutex_lock(&s_mtx);
     s_param.capture_h = v;
+    pthread_mutex_unlock(&s_mtx);
+    return ipcam_param_save();
+}
+/*
+ * 输出宽度必须为偶数：4:2:2 色度按 2 像素一组采样，奇数宽无法整除出色度平面半宽。
+ * 0 = 跟随采集分辨率（编码旁路缩放）；与 capture_w/h 独立设置，重启后生效。
+ */
+int ipcam_param_set_out_w(uint16_t v)
+{
+    if (v != 0 && ((v & 1) || v > 4096)) return -1;
+    pthread_mutex_lock(&s_mtx);
+    s_param.out_w = v;
+    pthread_mutex_unlock(&s_mtx);
+    return ipcam_param_save();
+}
+int ipcam_param_set_out_h(uint16_t v)
+{
+    if (v > 4096) return -1;    /* 0 = 跟随采集分辨率 */
+    pthread_mutex_lock(&s_mtx);
+    s_param.out_h = v;
     pthread_mutex_unlock(&s_mtx);
     return ipcam_param_save();
 }
@@ -351,6 +397,7 @@ int ipcam_param_to_json(char *buf, size_t buf_sz)
         "\"model\":\"%s\",\"swver\":\"%s\","
         "\"net_mode\":%u,\"wifi_ssid\":\"%s\",\"apn\":\"%s\","
         "\"capture_w\":%u,\"capture_h\":%u,"
+        "\"out_w\":%u,\"out_h\":%u,"
         "\"jpeg_quality\":%u,\"target_fps\":%u,"
         "\"http_port\":%u,\"http_bind_local\":%u,"
         "\"log_level\":%u"
@@ -358,6 +405,7 @@ int ipcam_param_to_json(char *buf, size_t buf_sz)
         model_esc, swver_esc,
         p.net_mode, ssid_esc, apn_esc,
         p.capture_w, p.capture_h,
+        p.out_w, p.out_h,
         p.jpeg_quality, p.target_fps,
         p.http_port, p.http_bind_local,
         p.log_level);
@@ -377,6 +425,7 @@ void ipcam_param_dump(void)
     fprintf(stderr, "  wifi_ssid      : %s\n", p.wifi_ssid);
     fprintf(stderr, "  apn            : %s\n", p.apn);
     fprintf(stderr, "  capture        : %ux%u\n", p.capture_w, p.capture_h);
+    fprintf(stderr, "  output         : %ux%u (0=follow capture)\n", p.out_w, p.out_h);
     fprintf(stderr, "  jpeg_quality   : %u\n", p.jpeg_quality);
     fprintf(stderr, "  target_fps     : %u\n", p.target_fps);
     fprintf(stderr, "  http_port      : %u\n", p.http_port);

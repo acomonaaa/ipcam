@@ -12,7 +12,7 @@
  * 多消费者场景请开多个 ring（每个 ring 单 reader），例如 rb_yuyv_display / rb_yuyv_encode。
  *
  * 帧布局：
- *   每个 slot = [ipcam_frame_t header (24B)] [payload bytes]
+ *   每个 slot = [ipcam_frame_t header] [payload bytes]
  *   header.rawData 指向 slot 的 payload 起点
  *   header.size    是 payload 的字节数
  *
@@ -22,15 +22,32 @@
 
 #include <pthread.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #define IPCAM_FRAME_TYPE_I   1   /* MJPEG: 每帧都是 I */
 #define IPCAM_FRAME_TYPE_P   2   /* 预留（H.264 用） */
+
+/*
+ * 可选的来源元数据。core 不依赖 V4L2 类型，只保存跨 ring 传递诊断信息；
+ * 这样 capture 可以把 DMA 帧身份交给 display/encode，而不破坏分层约束。
+ */
+typedef struct ipcam_frame_meta_s {
+    uint64_t source_sequence;       /* V4L2 sequence；非 V4L2 生产者可置 0 */
+    uint32_t source_buffer_index;   /* V4L2 MMAP buffer index */
+    uint32_t source_flags;          /* 来源 buffer flags，便于现场比对 */
+    uint64_t source_timestamp_us;   /* 来源时间戳，单位微秒 */
+    uint32_t source_bytesperline;   /* 来源行跨度 */
+    uint32_t source_frame_bytes;    /* 来源 sizeimage/bytesused 期望值 */
+    uint32_t source_probe_global;
+    uint32_t source_probe_quadrant[4];
+} ipcam_frame_meta_t;
 
 typedef struct ipcam_frame_s {
     void    *rawData;      /* 帧数据指针（指向 slot 内的 payload） */
     size_t   size;         /* 帧字节数 */
     unsigned long seqNo;   /* 单调递增序列号 */
     int      type;         /* IPCAM_FRAME_TYPE_* */
+    ipcam_frame_meta_t meta; /* 来源元数据；旧接口时全为 0 */
 } ipcam_frame_t;
 
 /*
@@ -83,12 +100,20 @@ void ipcam_ring_destroy(ipcam_ring_buffer_t *rb);
  */
 int ipcam_ring_append(ipcam_ring_buffer_t *rb, const void *in_data, size_t in_bytes);
 
+/* 带来源元数据的阻塞写入版本；meta 为 NULL 时等价于旧接口。 */
+int ipcam_ring_append_meta(ipcam_ring_buffer_t *rb, const void *in_data,
+                           size_t in_bytes, const ipcam_frame_meta_t *meta);
+
 /*
  * 生产者非阻塞写入：满则立即返回 -1，不阻塞生产者。
  * 用于实时数据流（如 V4L2 采集线程）——满则丢当前帧，不阻塞采集。
  * 返回 0=成功，-1=已关闭或满。
  */
 int ipcam_ring_try_append(ipcam_ring_buffer_t *rb, const void *in_data, size_t in_bytes);
+
+/* 带来源元数据的非阻塞写入版本；满或关闭时立即返回 -1。 */
+int ipcam_ring_try_append_meta(ipcam_ring_buffer_t *rb, const void *in_data,
+                               size_t in_bytes, const ipcam_frame_meta_t *meta);
 
 /*
  * 消费者取一帧：阻塞直到有可用帧或缓冲被关闭且清空。

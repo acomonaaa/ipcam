@@ -20,6 +20,24 @@ static void init_cond_monotonic(pthread_cond_t *cond)
 static ipcam_slot_t *slot_hdr(char *mem) { return (ipcam_slot_t *)mem; }
 static char *slot_payload(char *mem)     { return mem + IPCAM_SLOT_PAYLOAD_OFF; }
 
+static void ring_fill_header(ipcam_ring_buffer_t *rb, char *mem,
+                             const void *in_data, size_t in_bytes,
+                             const ipcam_frame_meta_t *meta)
+{
+    char *dst = slot_payload(mem);
+    ipcam_slot_t *hdr = slot_hdr(mem);
+
+    memcpy(dst, in_data, in_bytes);
+    hdr->header.rawData = dst;
+    hdr->header.size = in_bytes;
+    hdr->header.seqNo = ++rb->seq_counter;
+    hdr->header.type = IPCAM_FRAME_TYPE_I;
+    if (meta)
+        hdr->header.meta = *meta;
+    else
+        memset(&hdr->header.meta, 0, sizeof(hdr->header.meta));
+}
+
 ipcam_ring_buffer_t *ipcam_ring_create(int depth, size_t slot_bytes)
 {
     if (depth <= 0 || slot_bytes == 0) return NULL;
@@ -72,6 +90,12 @@ void ipcam_ring_destroy(ipcam_ring_buffer_t *rb)
 
 int ipcam_ring_try_append(ipcam_ring_buffer_t *rb, const void *in_data, size_t in_bytes)
 {
+    return ipcam_ring_try_append_meta(rb, in_data, in_bytes, NULL);
+}
+
+int ipcam_ring_try_append_meta(ipcam_ring_buffer_t *rb, const void *in_data,
+                               size_t in_bytes, const ipcam_frame_meta_t *meta)
+{
     if (!rb || !in_data) return -1;
     if (in_bytes > rb->slot_bytes) return -1;
 
@@ -82,14 +106,7 @@ int ipcam_ring_try_append(ipcam_ring_buffer_t *rb, const void *in_data, size_t i
     }
 
     char *mem = rb->slot_mem[rb->write_idx];
-    char *dst = slot_payload(mem);
-    memcpy(dst, in_data, in_bytes);
-
-    ipcam_slot_t *hdr = slot_hdr(mem);
-    hdr->header.rawData = dst;
-    hdr->header.size    = in_bytes;
-    hdr->header.seqNo   = ++rb->seq_counter;
-    hdr->header.type    = IPCAM_FRAME_TYPE_I;
+    ring_fill_header(rb, mem, in_data, in_bytes, meta);
 
     rb->write_idx = (rb->write_idx + 1) % rb->depth;
     rb->count++;
@@ -99,6 +116,12 @@ int ipcam_ring_try_append(ipcam_ring_buffer_t *rb, const void *in_data, size_t i
 }
 
 int ipcam_ring_append(ipcam_ring_buffer_t *rb, const void *in_data, size_t in_bytes)
+{
+    return ipcam_ring_append_meta(rb, in_data, in_bytes, NULL);
+}
+
+int ipcam_ring_append_meta(ipcam_ring_buffer_t *rb, const void *in_data,
+                           size_t in_bytes, const ipcam_frame_meta_t *meta)
 {
     if (!rb || !in_data) return -1;
     if (in_bytes > rb->slot_bytes) return -1;
@@ -113,14 +136,7 @@ int ipcam_ring_append(ipcam_ring_buffer_t *rb, const void *in_data, size_t in_by
     }
 
     char *mem = rb->slot_mem[rb->write_idx];
-    char *dst = slot_payload(mem);
-    memcpy(dst, in_data, in_bytes);
-
-    ipcam_slot_t *hdr = slot_hdr(mem);
-    hdr->header.rawData = dst;
-    hdr->header.size    = in_bytes;
-    hdr->header.seqNo   = ++rb->seq_counter;
-    hdr->header.type    = IPCAM_FRAME_TYPE_I;
+    ring_fill_header(rb, mem, in_data, in_bytes, meta);
 
     rb->write_idx = (rb->write_idx + 1) % rb->depth;
     rb->count++;

@@ -50,6 +50,16 @@ typedef struct ipcam_param_s {
     uint8_t  jpeg_quality;
     uint8_t  target_fps;
 
+    /*
+     * 输出（编码/交付）分辨率：0 = 跟随 capture（旁路缩放）。
+     * 与 capture 独立设置，满足「sensor 有效分辨率不可改、客户要求更高
+     * 输出分辨率规格」的场景（编码前 planar 域插值）。
+     * 注意：这两个字段取自原 reserved 前 4 字节，结构体总大小不变，
+     * 旧配置文件无需作废（旧文件这几字节为 0，恰好等于默认语义）。
+     */
+    uint16_t out_w;
+    uint16_t out_h;
+
     /* http */
     uint16_t http_port;
     uint8_t  http_bind_local;   /* 1 = 绑 127.0.0.1；0 = 0.0.0.0 */
@@ -57,7 +67,7 @@ typedef struct ipcam_param_s {
     /* log */
     uint8_t  log_level;
 
-    uint8_t  reserved[32];
+    uint8_t  reserved[28];  /* 原 32 字节，前 4 字节已划给 out_w/out_h */
 } ipcam_param_t;
 #pragma pack()
 
@@ -77,6 +87,8 @@ const char *ipcam_param_get_wifi_psk(void);
 const char *ipcam_param_get_apn(void);
 uint16_t ipcam_param_get_capture_w(void);
 uint16_t ipcam_param_get_capture_h(void);
+uint16_t ipcam_param_get_out_w(void);       /* 0 = 跟随采集分辨率 */
+uint16_t ipcam_param_get_out_h(void);       /* 0 = 跟随采集分辨率 */
 uint8_t  ipcam_param_get_jpeg_quality(void);
 uint8_t  ipcam_param_get_target_fps(void);
 uint16_t ipcam_param_get_http_port(void);
@@ -90,8 +102,10 @@ int ipcam_param_set_net_mode(uint8_t v);
 int ipcam_param_set_wifi_ssid(const char *ssid);
 int ipcam_param_set_wifi_psk(const char *psk);
 int ipcam_param_set_apn(const char *apn);
-int ipcam_param_set_capture_w(uint16_t v);
-int ipcam_param_set_capture_h(uint16_t v);
+int ipcam_param_set_capture_w(uint16_t v);  /* 偶数；2-4096 */
+int ipcam_param_set_capture_h(uint16_t v);  /* 1-4096 */
+int ipcam_param_set_out_w(uint16_t v);      /* 0 = 跟随；偶数；<=4096 */
+int ipcam_param_set_out_h(uint16_t v);      /* 0 = 跟随；<=4096 */
 int ipcam_param_set_jpeg_quality(uint8_t v);
 int ipcam_param_set_target_fps(uint8_t v);
 int ipcam_param_set_http_port(uint16_t v);

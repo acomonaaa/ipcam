@@ -9,11 +9,84 @@
 DAEMON=/usr/bin/ipcam
 PIDFILE=/var/run/ipcam.pid
 LOGFILE=/var/log/ipcam.log
+CONSOLE_DEV=/dev/console
 PREV=$DAEMON.prev
 WATCHDOG_TIMEOUT=60
+CAMERA_WAIT_TIMEOUT=15
+START_WAIT_TIMEOUT=5
+
+pid_value() {
+    [ -r "$PIDFILE" ] || return 1
+    cat "$PIDFILE" 2>/dev/null
+}
 
 is_running() {
-    [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null
+    local pid
+    pid=$(pid_value) || return 1
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null
+}
+
+ensure_runtime() {
+    # NFS rootfs 的 /var/log、/var/run 可能尚未被基础 rootfs 创建；先准备目录，
+    # 再验证日志文件可写，避免后台启动失败后只留下“started”假象。
+    mkdir -p /var/log /var/run 2>/dev/null || {
+        echo "[S90ipcam] ERROR: cannot create /var/log or /var/run" >&2
+        return 1
+    }
+    if ! : >> "$LOGFILE" 2>/dev/null; then
+        echo "[S90ipcam] ERROR: cannot write $LOGFILE" >&2
+        return 1
+    fi
+    return 0
+}
+
+s90_log() {
+    local message="$*"
+    # 启动脚本诊断同时保留串口提示和文件记录；应用运行日志由启动命令
+    # 直接接到 /dev/console，只有 console 不可用时才回退到 LOGFILE。
+    echo "[S90ipcam] $message" >&2
+    echo "[S90ipcam] $message" >> "$LOGFILE" 2>/dev/null || true
+}
+
+find_csi_node() {
+    local sysfs_node name device
+    for sysfs_node in /sys/class/video4linux/video*; do
+        [ -r "$sysfs_node/name" ] || continue
+        name=$(cat "$sysfs_node/name" 2>/dev/null)
+        case "$name" in
+            *mx6s-csi*)
+                device=/dev/${sysfs_node##*/}
+                if [ -c "$device" ]; then
+                    echo "$device"
+                    return 0
+                fi
+                ;;
+        esac
+    done
+    return 1
+}
+
+wait_for_csi() {
+    local i=0 node
+    # mx6s_capture/ov5640_camera 由 modprobe 加载后，视频节点可能稍晚于模块命令出现；
+    # 这里等待真实的 mx6s-csi，而不是等待任意 video0，避免把 PxP 当作摄像头。
+    while [ "$i" -lt "$CAMERA_WAIT_TIMEOUT" ]; do
+        node=$(find_csi_node)
+        if [ -n "$node" ]; then
+            s90_log "CSI video node ready: $node (mx6s-csi)"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    # 即使摄像头缺失也继续启动应用，让 ipcam 输出完整候选节点诊断并安全退出；
+    # 这样不会因为启动脚本隐藏错误而误判为系统已经正常运行。
+    s90_log "WARN: no mx6s-csi node after ${CAMERA_WAIT_TIMEOUT}s; starting ipcam for diagnostics"
+    return 1
 }
 
 # BusyBox ash 不支持 /dev/tcp；用 wget（板级 BusyBox 通常启用）。
@@ -21,7 +94,7 @@ is_running() {
 probe_healthz() {
     local port=${IPCAM_HTTP_PORT:-8080}
     if ! command -v wget >/dev/null 2>&1; then
-        echo "[S90ipcam] wget not found; cannot probe healthz" >&2
+        s90_log "WARN: wget not found; cannot probe healthz"
         return 1
     fi
     local body
@@ -34,7 +107,7 @@ probe_healthz() {
 
 wait_healthz() {
     local timeout=$1 i=0
-    while [ $i -lt $timeout ]; do
+    while [ "$i" -lt "$timeout" ]; do
         if is_running && probe_healthz; then
             return 0
         fi
@@ -45,8 +118,8 @@ wait_healthz() {
 }
 
 auto_rollback() {
-    [ -f "$PREV" ] || { echo "[S90ipcam] no .prev; nothing to rollback"; return 0; }
-    echo "[S90ipcam] healthz watchdog FAILED, rolling back to $PREV"
+    [ -f "$PREV" ] || { s90_log "no .prev; nothing to rollback"; return 0; }
+    s90_log "healthz watchdog FAILED, rolling back to $PREV"
     if [ -f "$DAEMON" ]; then
         mv "$DAEMON" "$DAEMON.broken"
     fi
@@ -55,78 +128,142 @@ auto_rollback() {
 }
 
 start_once() {
-    [ -c /dev/video0 ] || echo "[S90ipcam] WARN: /dev/video0 not present"
-    [ -c /dev/fb0 ]    || echo "[S90ipcam] WARN: /dev/fb0 not present"
+    local have_video=0 node csi_node="" pid="" i app_output=""
+
+    ensure_runtime || return 1
+    s90_log "starting ipcam ..."
+
+    if [ ! -x "$DAEMON" ]; then
+        s90_log "ERROR: daemon not executable: $DAEMON"
+        return 1
+    fi
 
     if is_running; then
-        echo "[S90ipcam] already running (pid $(cat $PIDFILE))"
+        s90_log "already running (pid $(pid_value))"
         return 0
     fi
 
-    start-stop-daemon -S -b -m -p $PIDFILE -x $DAEMON -- > $LOGFILE 2>&1
-    local pid=$(cat $PIDFILE 2>/dev/null)
-    echo "[S90ipcam] started, pid=$pid, log=$LOGFILE"
+    wait_for_csi || true
+    csi_node=$(find_csi_node 2>/dev/null) || true
+    [ -n "$csi_node" ] || s90_log "WARN: mx6s-csi node is still unavailable"
+
+    # 只作诊断提示，不根据编号选择设备；真正的 capability 和 mx6s-csi 匹配由 ipcam 完成。
+    for node in /dev/video*; do
+        if [ -c "$node" ]; then
+            have_video=1
+            s90_log "video node present: $node"
+        fi
+    done
+    [ "$have_video" -eq 1 ] || s90_log "WARN: no /dev/video* node present"
+    [ -c /dev/fb0 ] || s90_log "WARN: /dev/fb0 not present"
+
+    if ! command -v start-stop-daemon >/dev/null 2>&1; then
+        s90_log "ERROR: start-stop-daemon not found"
+        return 1
+    fi
+
+    # 清理上一次异常退出留下的 pidfile，避免启动检查误读旧 PID。
+    rm -f "$PIDFILE"
+
+    # 不能使用 BusyBox 启动器的后台选项 -b：该选项会把 stdout/stderr 重定向到
+    # /dev/null。应用的结构化日志默认写 stderr，因此优先直接接到串口控制台，
+    # 让 run mybootnet 后无需手工 tail；-m 仍负责写入真实 daemon PID。
+    if [ -c "$CONSOLE_DEV" ] && : > "$CONSOLE_DEV" 2>/dev/null; then
+        app_output="$CONSOLE_DEV"
+        start-stop-daemon -S -m -p "$PIDFILE" -x "$DAEMON" -- \
+            </dev/null >"$CONSOLE_DEV" 2>&1 &
+    else
+        app_output="$LOGFILE"
+        s90_log "WARN: $CONSOLE_DEV unavailable; application output falls back to $LOGFILE"
+        start-stop-daemon -S -m -p "$PIDFILE" -x "$DAEMON" -- \
+            </dev/null >>"$LOGFILE" 2>&1 &
+    fi
+
+    # -m 写 pidfile 与 exec 之间存在很短窗口；轮询并验证 kill -0，避免脚本过早报告成功。
+    i=0
+    while [ "$i" -lt "$START_WAIT_TIMEOUT" ]; do
+        pid=$(pid_value 2>/dev/null) || pid=""
+        if [ -n "$pid" ] && is_running; then
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    if ! is_running; then
+        s90_log "ERROR: ipcam process not running; check serial console or $LOGFILE"
+        return 1
+    fi
+    s90_log "started, pid=$pid, output=$app_output, diagnostics=$LOGFILE"
 
     # Watchdog：仅在 .prev 存在（即刚做过 commit）才等待 + rollback
     if [ -f "$PREV" ]; then
-        echo "[S90ipcam] .prev detected (post-OTA); waiting for healthz..."
-        if wait_healthz $WATCHDOG_TIMEOUT; then
-            echo "[S90ipcam] healthz OK; new version activated"
-            rm -f $DAEMON.broken "$PREV"
+        s90_log ".prev detected (post-OTA); waiting for healthz..."
+        if wait_healthz "$WATCHDOG_TIMEOUT"; then
+            s90_log "healthz OK; new version activated"
+            rm -f "$DAEMON.broken" "$PREV"
         else
-            echo "[S90ipcam] healthz timeout (${WATCHDOG_TIMEOUT}s); killing and rolling back"
+            s90_log "healthz timeout (${WATCHDOG_TIMEOUT}s); killing and rolling back"
             if [ -n "$pid" ]; then kill "$pid" 2>/dev/null; fi
             sleep 1
-            is_running && kill -9 "$pid" 2>/dev/null
+            if [ -n "$pid" ] && is_running; then kill -9 "$pid" 2>/dev/null; fi
             auto_rollback
-            $0 start
+            "$0" start
         fi
     else
-        # 普通启动：不 watchdog，让 init 流程继续
-        sleep 2  # 给 ipcam 一点启动时间
+        # 普通启动：不 watchdog，让 init 流程继续；短暂等待便于发现 exec/初始化错误。
+        sleep 2
         if ! is_running; then
-            echo "[S90ipcam] process not running after 2s; check $LOGFILE"
+            s90_log "ERROR: process not running after 2s; check serial console or $LOGFILE"
             return 1
         fi
     fi
 }
 
-case "$1" in
-  start)
-    echo "[S90ipcam] starting ipcam ..."
-    start_once
-    ;;
-  stop)
-    echo "[S90ipcam] stopping ipcam ..."
-    if [ -f $PIDFILE ]; then
-        kill "$(cat $PIDFILE)" 2>/dev/null || true
+stop_once() {
+    local pid i
+    ensure_runtime || true
+    s90_log "stopping ipcam ..."
+    pid=$(pid_value 2>/dev/null) || pid=""
+    if [ -n "$pid" ] && is_running; then
+        kill "$pid" 2>/dev/null || true
         for i in 1 2 3 4 5; do
             sleep 1
             is_running || break
         done
-        rm -f $PIDFILE
     fi
+    rm -f "$PIDFILE"
     killall ipcam 2>/dev/null || true
+    s90_log "ipcam stopped"
+}
+
+case "$1" in
+  start)
+    start_once
+    ;;
+  stop)
+    stop_once
     ;;
   restart)
-    $0 stop
+    "$0" stop
     sleep 1
-    $0 start
+    "$0" start
     ;;
   status)
+    ensure_runtime || true
     if is_running; then
-        echo "[S90ipcam] running, pid=$(cat $PIDFILE)"
+        s90_log "running, pid=$(pid_value)"
     else
-        echo "[S90ipcam] stopped"
+        s90_log "stopped"
     fi
     ;;
   rollback)
-    echo "[S90ipcam] manual rollback"
+    ensure_runtime || true
+    s90_log "manual rollback"
     auto_rollback
-    $0 start
+    "$0" start
     ;;
   *)
-    echo "Usage: $0 {start|stop|restart|status|rollback}"
+    echo "Usage: $0 {start|stop|restart|status|rollback}" >&2
     exit 1
     ;;
 esac

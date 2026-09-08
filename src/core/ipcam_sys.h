@@ -31,7 +31,8 @@
         v1 = (lib_name##_VERSION >> 16) & 0xff;                          \
         v2 = (lib_name##_VERSION >> 8)  & 0xff;                          \
         v3 = (lib_name##_VERSION)       & 0xff;                          \
-        MLOGI(#lib_name " ver: %x.%x.%x_%s (build: %s %s)\n",           \
+        /* 启动版本信息归入 SYS 模块，保持 BCF2 按模块筛日志的习惯。 */    \
+        MLOGI_M("SYS ", #lib_name " ver: %x.%x.%x_%s (build: %s %s)\n", \
               v1, v2, v3, LIBIPCAM_GIT_INFO, __DATE__, __TIME__);        \
     } while (0)
 
