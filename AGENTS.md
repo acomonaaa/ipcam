@@ -120,12 +120,19 @@ if (string_has_unsafe_chars(ssid)) return -1;
 - 安装前缀：项目内 `./output/`（不是 `../output/`）。
 - 网络模式 / APN / 绑定：编译期默认在 `config/ipcam_config.h`，运行时经 `/api/config` 修改后需重启。**不存在** `camctl net`。
 
+### Windows 下修改 Linux 项目（强制）
+
+- 当 Agent 当前运行环境为 Windows，而项目目标环境为 Linux（包括嵌入式 Linux）时，只做代码修改及必要的中文注释、文档和变更记录更新，不在 Windows 上进行编译或依赖编译的测试。
+- 不为验证本次修改而安装或配置编译工具链，也不绕道 WSL、容器或远程 Linux 执行编译；除非用户另有明确要求，编译验证留待用户切换到 Linux 环境后进行。
+- 修改完成后，检查差异，仅提交本次任务相关文件，并推送到 GitHub；本条视为该场景下执行 `git commit` / `git push` 的持续授权，不得夹带用户已有的无关改动。
+- 最终回复必须说明修改与 GitHub 提交结果，明确标注“未进行编译验证”，并提醒用户：“请切换到 Linux 环境进行编译和验证。”不得将未验证的修改描述为已通过测试；提交或推送失败时须如实说明。
+
 ## 安全与范围
 
 - 改动危险面（OTA、reboot、远程绑定）须明确说明；触及 OTA 时优先要求 SHA256。
 - 禁止提交二进制、`*.o`、`thirdparts/.../install` 构建产物（见 `.gitignore`）。
 - 未经用户要求，不要改 `.cursor/plans/` 下的计划文件。
-- **仅在用户明确要求时**才执行 `git commit` / `git push`。
+- 仅在用户明确要求或符合上文“Windows 下修改 Linux 项目”的持续授权时执行 `git commit` / `git push`。
 
 ## 修改 4G 时
 
@@ -218,7 +225,7 @@ BREAKING CHANGE: 暂存文件固定为 <bin>.new，自定义安装前缀需同�
 1. **原子化提交**：一次提交只做一件事。
 2. **分支命名**：`type/简短描述` 或 `type/issue号-简短描述`，例如 `fix/param-crc`、`feat/l610-ppp`。
 3. **PR**：单一职责；标题与描述用中文写清变更、原因、验证方式；建议 **Squash and Merge**。
-4. 用户未明确要求时：不要擅自 commit / push / 开 PR。
+4. commit / push 需用户明确要求或符合上文“Windows 下修改 Linux 项目”的持续授权；开 PR 仍需用户明确要求。
 
 ---
 
