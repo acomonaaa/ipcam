@@ -26,11 +26,11 @@
  *
  * 同时并发客户端上限 = IPCAM_HTTP_MAX_CLIENTS（默认 8）。
  *
- * shutdown 顺序（main.c cleanup_all 负责 ring_close）：
- *   1) running=0，shutdown+close listen_fd
+ * shutdown 顺序（共享 JPEG ring 由 main.c cleanup_all 负责关闭）：
+ *   1) service_running=0，shutdown+close listen_fd
  *   2) join accept_loop
  *   3) shutdown client fd，由客户端线程最终 close
- *   4) close JPEG ring，等待 detached client 线程 drain
+ *   4) 等待 detached client 线程 drain
  *   5) 确认 client_cnt=0 后再销毁同步对象
  */
 #define IPCAM_MAX_TRACKED_CLIENTS 32

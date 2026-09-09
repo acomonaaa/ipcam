@@ -308,9 +308,16 @@ static int stage_from_path(const char *src_path, const char *expected_sha256_hex
 
     /* 4) 拷贝后再次校验：大小 + SHA256（防 copy 中途失败留下的截断文件） */
     struct stat st2;
-    if (stat(IPCAM_OTA_PATH_NEW, &st2) < 0 || st2.st_size != st.st_size) {
-        char msg[128]; snprintf(msg, sizeof(msg), ".new size mismatch (src=%ld dst=%ld)",
-                               (long)st.st_size, st2.st_size);
+    int stat2_rc = stat(IPCAM_OTA_PATH_NEW, &st2);
+    if (stat2_rc < 0 || st2.st_size != st.st_size) {
+        char msg[128];
+        if (stat2_rc < 0) {
+            snprintf(msg, sizeof(msg), ".new stat failed: %s", strerror(errno));
+        } else {
+            /* _FILE_OFFSET_BITS=64 下 off_t 可能是 long long，格式必须匹配。 */
+            snprintf(msg, sizeof(msg), ".new size mismatch (src=%lld dst=%lld)",
+                     (long long)st.st_size, (long long)st2.st_size);
+        }
         set_state(IPCAM_OTA_STATE_FAILED, msg);
         unlink(IPCAM_OTA_PATH_NEW);
         return -1;

@@ -39,6 +39,7 @@ typedef struct avi_segment_s {
     uint64_t start_ns;
     uint64_t frame_count;
     uint64_t bytes_written;
+    uint64_t container_bytes; /* 含 AVI 头、chunk 头和 padding 的实际累计大小 */
     uint64_t drop_base;
     unsigned char *last_jpeg; /* 用于固定时间轴的缺帧重复，不借用 ring 槽内存 */
     size_t last_jpeg_size;
@@ -54,7 +55,7 @@ static int avi_payload_fits(const avi_segment_t *seg, size_t size)
 {
     if (!seg || size > UINT32_MAX) return 0;
     uint64_t chunk_bytes = 8ULL + (uint64_t)size + (size & 1U);
-    uint64_t projected = seg->bytes_written + chunk_bytes +
+    uint64_t projected = seg->container_bytes + chunk_bytes +
                          8ULL + ((uint64_t)seg->index_count + 1ULL) * 16ULL + 4096ULL;
     return projected <= IPCAM_RECORD_MAX_SEGMENT_BYTES;
 }
@@ -130,12 +131,22 @@ static void status_error(ipcam_record_ctx_t *ctx, const char *message)
     pthread_mutex_unlock(&ctx->mtx);
 }
 
-/* 同时检查目录身份和剩余空间，防止 SD 掉挂后落到根文件系统。 */
-static int storage_check(const char *root, char *error, size_t error_sz)
+/*
+ * 只探测目录是否位于独立挂载设备，并读取该设备空间；挂载判断与录像、
+ * 拍照、HTTP 状态共用，避免状态接口把根文件系统误报成 SD 卡空间。
+ */
+static int storage_probe(const char *root, int *mounted,
+                         uint64_t *available_bytes, char *error, size_t error_sz)
 {
     struct stat st_root, st_parent;
     struct statvfs vfs;
     char parent[256];
+    if (mounted) *mounted = 0;
+    if (available_bytes) *available_bytes = 0;
+    if (!root || !*root) {
+        snprintf(error, error_sz, "存储路径为空");
+        return -1;
+    }
     int parent_len = snprintf(parent, sizeof(parent), "%s/..", root);
     if (parent_len < 0 || (size_t)parent_len >= sizeof(parent)) {
         snprintf(error, error_sz, "存储路径过长");
@@ -150,8 +161,23 @@ static int storage_check(const char *root, char *error, size_t error_sz)
         snprintf(error, error_sz, "存储目录未挂载: %s", root);
         return -1;
     }
-    if (statvfs(root, &vfs) != 0 ||
-        (uint64_t)vfs.f_bavail * vfs.f_frsize <= IPCAM_RECORD_RESERVE_BYTES) {
+    if (mounted) *mounted = 1;
+    if (statvfs(root, &vfs) != 0) {
+        snprintf(error, error_sz, "无法读取存储空间: %s", root);
+        return -1;
+    }
+    if (available_bytes)
+        *available_bytes = (uint64_t)vfs.f_bavail * vfs.f_frsize;
+    return 0;
+}
+
+/* 同时检查目录身份和剩余空间，防止 SD 掉挂后落到根文件系统。 */
+static int storage_check(const char *root, char *error, size_t error_sz)
+{
+    uint64_t available = 0;
+    if (storage_probe(root, NULL, &available, error, error_sz) != 0)
+        return -1;
+    if (available <= IPCAM_RECORD_RESERVE_BYTES) {
         snprintf(error, error_sz, "存储空间不足");
         return -1;
     }
@@ -162,9 +188,10 @@ static int storage_check(const char *root, char *error, size_t error_sz)
  * 防止文件尾部 idx1 被截断后仍改名为看似完整的 .avi。 */
 static int storage_has_room(const char *root, uint64_t extra_bytes)
 {
-    struct statvfs vfs;
-    if (statvfs(root, &vfs) != 0) return 0;
-    uint64_t available = (uint64_t)vfs.f_bavail * vfs.f_frsize;
+    uint64_t available = 0;
+    char ignored_error[1];
+    if (storage_probe(root, NULL, &available, ignored_error,
+                      sizeof(ignored_error)) != 0) return 0;
     return available > IPCAM_RECORD_RESERVE_BYTES + extra_bytes;
 }
 
@@ -214,6 +241,9 @@ static int avi_write_header_full(avi_segment_t *seg, int width, int height, int 
     if (write_fourcc(fp, "LIST")) return -1;
     seg->movi_size_pos = ftello(fp); if (seg->movi_size_pos < 0 || write_u32le(fp, 0) || write_fourcc(fp, "movi")) return -1;
     seg->movi_data_start = ftello(fp);
+    if (seg->movi_data_start < 0) return -1;
+    /* 从文件头起计数，后续限制才能覆盖头部和每个 chunk 的容器开销。 */
+    seg->container_bytes = (uint64_t)seg->movi_data_start;
     return 0;
 }
 
@@ -312,6 +342,7 @@ static int avi_append_payload(avi_segment_t *seg, const void *data, size_t size)
     seg->index_count++;
     seg->frame_count++;
     seg->bytes_written += size;
+    seg->container_bytes += 8ULL + (uint64_t)size + (size & 1U);
     return 0;
 }
 
@@ -643,6 +674,19 @@ void ipcam_record_get_status(ipcam_record_ctx_t *ctx, ipcam_record_status_t *out
 {
     if (!ctx || !out) return;
     pthread_mutex_lock(&ctx->mtx); *out = ctx->status; pthread_mutex_unlock(&ctx->mtx);
+}
+
+/*
+ * 状态接口只报告挂载后的 SD 空间；这里不要求满足录像预留阈值，
+ * 让 GUI 能区分“已挂载但空间不足”和“目录落在根文件系统”。
+ */
+int ipcam_record_get_storage_status(ipcam_record_ctx_t *ctx,
+                                    int *mounted, uint64_t *available_bytes)
+{
+    if (!ctx) return -1;
+    char error[128];
+    return storage_probe(ctx->storage_root, mounted, available_bytes,
+                         error, sizeof(error));
 }
 
 /* 复制含活动段的写入统计；文件收尾失败时仍能看到已写入的工作量。 */

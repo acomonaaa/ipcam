@@ -34,9 +34,21 @@
 
 typedef struct ipcam_stream_client_arg_s {
     int                   cfd;
+    int                   slot;
     ipcam_ring_buffer_t  *jpeg_rb;
     ipcam_stream_ctx_t   *ctx;
 } ipcam_stream_client_arg_t;
+
+/*
+ * stream_start_ex 成功初始化的三个同步对象必须成组销毁；统一收口失败
+ * 路径，避免新增条件变量后某个 bind/listen 分支遗漏清理。
+ */
+static void stream_destroy_sync(ipcam_stream_ctx_t *ctx)
+{
+    pthread_cond_destroy(&ctx->client_cond);
+    pthread_mutex_destroy(&ctx->ring_mtx);
+    pthread_mutex_destroy(&ctx->client_mtx);
+}
 
 static ssize_t safe_write(int fd, const void *buf, size_t len)
 {
@@ -112,7 +124,8 @@ static void serve_status(int fd, ipcam_ring_buffer_t *jpeg_rb,
                   "\"backlight_percent\":%u,\"light_percent\":%u,"
                   "\"record_state\":%d,\"record_segment\":%u,"
                   "\"config_generation\":%u,\"network_link\":%d,"
-                  "\"network_ip\":\"%s\",\"storage_available\":%llu,"
+                  "\"network_ip\":\"%s\",\"storage_mounted\":%u,"
+                  "\"storage_available\":%llu,"
                   "\"jpeg_live_dropped\":%llu,\"jpeg_record_dropped\":%llu,"
                   "\"capture_frames\":%llu,\"capture_drop_display\":%llu,"
                   "\"capture_drop_encode\":%llu}\n",
@@ -129,6 +142,7 @@ static void serve_status(int fd, ipcam_ring_buffer_t *jpeg_rb,
                  have_control ? cst.config_generation : ipcam_param_get_generation(),
                  have_control ? cst.network_link : 0,
                  have_control ? cst.network_ip : "",
+                 have_control ? cst.storage_mounted : 0,
                  (unsigned long long)(have_control ? cst.storage_available_bytes : 0),
                  (unsigned long long)(have_control ? cst.jpeg_live_dropped : 0),
                  (unsigned long long)(have_control ? cst.jpeg_record_dropped : 0),
@@ -820,18 +834,35 @@ static void serve_version(int fd)
     safe_write(fd, json, (size_t)n);
 }
 
-/* === /healthz (GET) → 用于 init.d 回滚看门狗 === */
-static void serve_healthz(int fd)
+/*
+ * === /healthz (GET) → 用于 init.d 回滚看门狗 ===
+ *
+ * 进程还活着不等于媒体链路仍能产出；watchdog 需要把共享 JPEG ring
+ * 已关闭这一终态报告为失败，避免编码线程退出后设备继续被判定为健康。
+ */
+static void serve_healthz(int fd, ipcam_stream_ctx_t *ctx)
 {
-    const char *body = "{\"ok\":true}\n";
+    int running = ctx && ctx->running && *ctx->running;
+    int closed = !ctx || !ctx->jpeg_rb || ipcam_ring_is_closed(ctx->jpeg_rb);
+    int queue_count = ctx && ctx->jpeg_rb ? ipcam_ring_count(ctx->jpeg_rb) : 0;
+    int ok = running && !closed;
+    char body[160];
+    int body_len = snprintf(body, sizeof(body),
+                            "{\"ok\":%s,\"running\":%s,\"jpeg_queue\":%d}\n",
+                            ok ? "true" : "false",
+                            running ? "true" : "false",
+                            queue_count);
+    if (body_len < 0 || body_len >= (int)sizeof(body)) return;
     char hdr[256];
     int hn = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 200 OK\r\n"
+        "HTTP/1.1 %s\r\n"
         "Content-Type: application/json\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n\r\n", strlen(body));
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n\r\n",
+        ok ? "200 OK" : "503 Service Unavailable", body_len);
+    if (hn < 0 || hn >= (int)sizeof(hdr)) return;
     safe_write(fd, hdr, (size_t)hn);
-    safe_write(fd, body, strlen(body));
+    safe_write(fd, body, (size_t)body_len);
 }
 
 /* === /api/ota (GET) === */
@@ -957,7 +988,6 @@ static void handle_client(int fd, ipcam_ring_buffer_t *jpeg_rb, ipcam_stream_ctx
 
     int req_len = read_http_request(fd, req, sizeof(req));
     if (req_len <= 0) {
-        close(fd);
         return;
     }
 
@@ -1001,7 +1031,7 @@ static void handle_client(int fd, ipcam_ring_buffer_t *jpeg_rb, ipcam_stream_ctx
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/version") == 0) {
         serve_version(fd);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/healthz") == 0) {
-        serve_healthz(fd);
+        serve_healthz(fd, ctx);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/ota") == 0) {
         serve_ota_status(fd);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/ota") == 0) {
@@ -1059,17 +1089,24 @@ static void handle_client(int fd, ipcam_ring_buffer_t *jpeg_rb, ipcam_stream_ctx
         safe_write(fd, m, strlen(m));
     }
 
-    close(fd);
 }
 
 static void *client_thread(void *arg)
 {
     ipcam_stream_client_arg_t *a = arg;
+    ipcam_stream_ctx_t *ctx = a->ctx;
     handle_client(a->cfd, a->jpeg_rb, a->ctx);
 
-    pthread_mutex_lock(&a->ctx->client_mtx);
-    a->ctx->client_cnt--;
-    pthread_mutex_unlock(&a->ctx->client_mtx);
+    /* fd 的最终 close 由拥有它的客户端线程执行；stop 侧只 shutdown，
+     * 避免 fd 号码被复用后出现双重 close。 */
+    close(a->cfd);
+
+    pthread_mutex_lock(&ctx->client_mtx);
+    if (a->slot >= 0 && a->slot < IPCAM_MAX_TRACKED_CLIENTS)
+        ctx->client_fds[a->slot] = -1;
+    if (ctx->client_cnt > 0) ctx->client_cnt--;
+    pthread_cond_broadcast(&ctx->client_cond);
+    pthread_mutex_unlock(&ctx->client_mtx);
 
     free(a);
     return NULL;
@@ -1078,16 +1115,39 @@ static void *client_thread(void *arg)
 static int acquire_client_slot(ipcam_stream_ctx_t *ctx)
 {
     pthread_mutex_lock(&ctx->client_mtx);
-    int max_clients = IPCAM_MAX_TRACKED_CLIENTS;  /* 受 client_threads[] 容量限制 */
+    int max_clients = IPCAM_MAX_TRACKED_CLIENTS;  /* 受 client_fds[] 固定槽位容量限制 */
     const char *e = getenv("IPCAM_HTTP_MAX_CLIENTS");
     if (e && *e) {
         int v = atoi(e);
         if (v > 0 && v <= IPCAM_MAX_TRACKED_CLIENTS) max_clients = v;
     }
-    int ok = ctx->client_cnt < max_clients;
-    if (ok) ctx->client_cnt++;
+    int slot = -1;
+    if (ctx->client_cnt < max_clients) {
+        for (int i = 0; i < IPCAM_MAX_TRACKED_CLIENTS; i++) {
+            if (ctx->client_fds[i] == -1) {
+                /* -2 表示槽位已预留但真实 fd 尚未写入，避免 stop
+                 * 与 accept_loop 在交接窗口重复使用同一槽位。 */
+                ctx->client_fds[i] = -2;
+                ctx->client_cnt++;
+                slot = i;
+                break;
+            }
+        }
+    }
     pthread_mutex_unlock(&ctx->client_mtx);
-    return ok ? 0 : -1;
+    return slot;
+}
+
+/* 线程创建失败或客户端尚未启动时释放预留槽位；-2 槽位没有 fd 可关闭。 */
+static void release_client_slot(ipcam_stream_ctx_t *ctx, int slot)
+{
+    if (slot < 0 || slot >= IPCAM_MAX_TRACKED_CLIENTS) return;
+    pthread_mutex_lock(&ctx->client_mtx);
+    if (ctx->client_fds[slot] >= 0) close(ctx->client_fds[slot]);
+    ctx->client_fds[slot] = -1;
+    if (ctx->client_cnt > 0) ctx->client_cnt--;
+    pthread_cond_broadcast(&ctx->client_cond);
+    pthread_mutex_unlock(&ctx->client_mtx);
 }
 
 static void *accept_loop(void *arg)
@@ -1106,7 +1166,8 @@ static void *accept_loop(void *arg)
             continue;
         }
 
-        if (acquire_client_slot(ctx) != 0) {
+        int slot = acquire_client_slot(ctx);
+        if (slot < 0) {
             char ipbuf[32];
             inet_ntop(AF_INET, &cli_addr.sin_addr, ipbuf, sizeof(ipbuf));
             MLOGW("reject client %s:%d (max reached)\n",
@@ -1117,18 +1178,23 @@ static void *accept_loop(void *arg)
             continue;
         }
 
+        pthread_mutex_lock(&ctx->client_mtx);
+        ctx->client_fds[slot] = cfd;
+        int active_clients = ctx->client_cnt;
+        pthread_mutex_unlock(&ctx->client_mtx);
+
         char ipbuf[32];
         inet_ntop(AF_INET, &cli_addr.sin_addr, ipbuf, sizeof(ipbuf));
         MLOGI("client %s:%d connected (active=%d)\n",
-              ipbuf, ntohs(cli_addr.sin_port), ctx->client_cnt);
+              ipbuf, ntohs(cli_addr.sin_port), active_clients);
 
         ipcam_stream_client_arg_t *a = malloc(sizeof(*a));
         if (!a) {
-            close(cfd);
-            pthread_mutex_lock(&ctx->client_mtx); ctx->client_cnt--; pthread_mutex_unlock(&ctx->client_mtx);
+            release_client_slot(ctx, slot);
             continue;
         }
         a->cfd = cfd;
+        a->slot = slot;
         a->jpeg_rb = ctx->jpeg_rb;
         a->ctx = ctx;
 
@@ -1139,12 +1205,11 @@ static void *accept_loop(void *arg)
         pthread_t t;
         if (pthread_create(&t, NULL, client_thread, a) != 0) {
             MLOGE("pthread_create client\n");
-            close(cfd);
             free(a);
-            pthread_mutex_lock(&ctx->client_mtx); ctx->client_cnt--; pthread_mutex_unlock(&ctx->client_mtx);
+            release_client_slot(ctx, slot);
             continue;
         }
-        /* 分离客户端线程，结束后由系统回收；stop 侧轮询 client_cnt 等待排空 */
+        /* 分离客户端线程，结束后通过条件变量通知 stop 侧完成排空。 */
         pthread_detach(t);
     }
     return NULL;
@@ -1169,9 +1234,21 @@ int ipcam_stream_start_ex(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
     ctx->service_running = 1;
     ctx->port = ipcam_param_get_http_port();  /* BCF2 风格：port 从 param 取 */
     ctx->listen_fd = -1;
-    pthread_mutex_init(&ctx->client_mtx, NULL);
-    pthread_mutex_init(&ctx->ring_mtx, NULL);
-    for (int i = 0; i < IPCAM_MAX_TRACKED_CLIENTS; i++) ctx->client_threads[i] = 0;
+    if (pthread_mutex_init(&ctx->client_mtx, NULL) != 0) return -1;
+    if (pthread_mutex_init(&ctx->ring_mtx, NULL) != 0) {
+        pthread_mutex_destroy(&ctx->client_mtx);
+        return -1;
+    }
+    if (pthread_cond_init(&ctx->client_cond, NULL) != 0) {
+        pthread_mutex_destroy(&ctx->ring_mtx);
+        pthread_mutex_destroy(&ctx->client_mtx);
+        return -1;
+    }
+    /*
+     * client_fds[] 的空槽统一用 -1 表示；当前并发上限由 client_cnt 维护，
+     * 但仍需把槽位设为明确的无效 fd，避免后续回收逻辑把 0 误当成连接。
+     */
+    for (int i = 0; i < IPCAM_MAX_TRACKED_CLIENTS; i++) ctx->client_fds[i] = -1;
 
     /* 默认绑 127.0.0.1；IPCAM_HTTP_BIND 可覆盖（"0.0.0.0" 暴露给全网） */
     const char *bind_ip = getenv("IPCAM_HTTP_BIND");
@@ -1182,8 +1259,7 @@ int ipcam_stream_start_ex(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
     ctx->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (ctx->listen_fd < 0) {
         MLOGE("socket: %s\n", strerror(errno));
-        pthread_mutex_destroy(&ctx->ring_mtx);
-        pthread_mutex_destroy(&ctx->client_mtx);
+        stream_destroy_sync(ctx);
         return -1;
     }
     int yes = 1;
@@ -1199,24 +1275,21 @@ int ipcam_stream_start_ex(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
         MLOGE("invalid bind ip: %s\n", bind_ip);
         close(ctx->listen_fd);
         ctx->listen_fd = -1;
-        pthread_mutex_destroy(&ctx->ring_mtx);
-        pthread_mutex_destroy(&ctx->client_mtx);
+        stream_destroy_sync(ctx);
         return -1;
     }
     if (bind(ctx->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         MLOGE("bind %s:%d: %s\n", bind_ip, ctx->port, strerror(errno));
         close(ctx->listen_fd);
         ctx->listen_fd = -1;
-        pthread_mutex_destroy(&ctx->ring_mtx);
-        pthread_mutex_destroy(&ctx->client_mtx);
+        stream_destroy_sync(ctx);
         return -1;
     }
     if (listen(ctx->listen_fd, BACKLOG) < 0) {
         MLOGE("listen: %s\n", strerror(errno));
         close(ctx->listen_fd);
         ctx->listen_fd = -1;
-        pthread_mutex_destroy(&ctx->ring_mtx);
-        pthread_mutex_destroy(&ctx->client_mtx);
+        stream_destroy_sync(ctx);
         return -1;
     }
     MLOGI("HTTP MJPEG server listening on %s:%d (max_clients=%d)\n",
@@ -1226,8 +1299,7 @@ int ipcam_stream_start_ex(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
         MLOGE("pthread_create accept\n");
         close(ctx->listen_fd);
         ctx->listen_fd = -1;
-        pthread_mutex_destroy(&ctx->ring_mtx);
-        pthread_mutex_destroy(&ctx->client_mtx);
+        stream_destroy_sync(ctx);
         return -1;
     }
     return 0;
@@ -1281,18 +1353,16 @@ void ipcam_stream_stop(ipcam_stream_ctx_t *ctx)
         ctx->thread = 0;
     }
 
-    /* 客户端线程已 detach；ring 关闭后它们会退出，此处等待 client_cnt 降为 0 */
-    unsigned waited = 0;
-    for (;;) {
-        pthread_mutex_lock(&ctx->client_mtx);
-        int n = ctx->client_cnt;
-        pthread_mutex_unlock(&ctx->client_mtx);
-        if (n <= 0) break;
-        if (++waited % 50 == 0)
-            MLOGW("waiting for %d HTTP client(s) to drain\n", n);
-        usleep(100 * 1000);
+    /* 共享 JPEG ring 由 main cleanup 统一关闭；HTTP stop 只唤醒自身网络 I/O，
+     * 避免停止直播服务时连带阻断编码、预览或其它 ring 观察者。 */
+    pthread_mutex_lock(&ctx->client_mtx);
+    for (int i = 0; i < IPCAM_MAX_TRACKED_CLIENTS; i++) {
+        if (ctx->client_fds[i] >= 0) shutdown(ctx->client_fds[i], SHUT_RDWR);
     }
+    while (ctx->client_cnt > 0) {
+        pthread_cond_wait(&ctx->client_cond, &ctx->client_mtx);
+    }
+    pthread_mutex_unlock(&ctx->client_mtx);
 
-    pthread_mutex_destroy(&ctx->ring_mtx);
-    pthread_mutex_destroy(&ctx->client_mtx);
+    stream_destroy_sync(ctx);
 }

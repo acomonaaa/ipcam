@@ -125,6 +125,8 @@ SKIP_TJ_CHECK=1 ./scripts/build.sh ipcam-display-only
 make DEBUG=1                       # -O0 -g3 调试构建
 make CROSS_COMPILE=arm-linux-gnueabihf-   # 显式工具链
 make CROSS_COMPILE=                # 用本机 gcc（仅用于主机端开发自测）
+make test-host                     # 编译并运行主机侧 ring/媒体生命周期测试
+make -B test-host SANITIZE=1       # 使用 ASan/UBSan 强制重编并运行测试
 make clean                        # 清理所有产物
 make install                      # 安装到项目内 ./output/
 ```
@@ -167,7 +169,7 @@ OTA 看门狗（`S90ipcam`）依赖 BusyBox **`wget`** 探测 `http://127.0.0.1:
 | 启动 | `/etc/init.d/S90ipcam start` | `/var/log/ipcam.log` 显示 capture/display/stream 三个线程 start |
 | LCD 显示 | 插入 OV5640 到 CSI 插座 | LCD 上看到实时画面（无撕裂、≥15 fps@640×480）|
 | 局域网推流 | 浏览器访问 `http://<board_ip>:8080/` | 看到实时 MJPEG 流，延迟 < 1 秒 |
-| 4G 推流 | 接 4G 模组到 usbotg2；`curl -d 'net_mode=1' http://127.0.0.1:8080/api/config` 后重启 daemon，浏览器通过 4G IP 访问 | 同上，但出网走 ppp0 |
+| 4G 推流 | 接 4G 模组到 usbotg2；可用 `IPCAM_4G_AT_DEV` 和 `IPCAM_4G_PPP_PEER` 覆盖 AT 设备与 PPP profile，再通过 `curl -d 'net_mode=1' http://127.0.0.1:8080/api/config` 重启 daemon | 同上，但出网走 ppp0 |
 | API 状态 | `curl http://<board_ip>:8080/api/status` | 返回 JSON：model/swver/capture/ring_count 等 |
 | 配置修改 | `curl -X POST -d 'jpeg_quality=80' http://<board_ip>:8080/api/config` | 立即生效 |
 | 拍照 | `curl -X POST http://<board_ip>:8080/api/photo` | 返回 SD 卡正式文件路径；`/snapshot.jpg` 仍是在线快照 |

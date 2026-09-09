@@ -145,10 +145,16 @@ static int current_port(int listen_fd)
 static void wait_for_clients(ipcam_stream_ctx_t *ctx, int expected)
 {
     for (int i = 0; i < 100; i++) {
-        if (ctx->client_cnt >= expected) return;
+        pthread_mutex_lock(&ctx->client_mtx);
+        int count = ctx->client_cnt;
+        pthread_mutex_unlock(&ctx->client_mtx);
+        if (count >= expected) return;
         usleep(10 * 1000);
     }
-    assert(ctx->client_cnt >= expected);
+    pthread_mutex_lock(&ctx->client_mtx);
+    int count = ctx->client_cnt;
+    pthread_mutex_unlock(&ctx->client_mtx);
+    assert(count >= expected);
 }
 
 static void test_stop_wakes_waiting_clients(void)
@@ -175,14 +181,13 @@ static void test_stop_wakes_waiting_clients(void)
     }
     wait_for_clients(&ctx, 3);
 
-    /*
-     * 三个客户端都在 ring_get 等待帧；stop 必须通过 ring_close 和
-     * shutdown 同时唤醒它们，并在返回前把 client_cnt 降到零。
-     */
+    /* 三个客户端都在等待网络/最新帧；stop 必须 shutdown 它们的 fd，
+     * 并在返回前把 client_cnt 降到零，但不能关闭仍由其它服务共享的 ring。 */
     ipcam_stream_stop(&ctx);
     assert(ctx.listen_fd == -1);
     assert(ctx.client_cnt == 0);
-    assert(ipcam_ring_is_closed(rb) == 1);
+    assert(running == 1);
+    assert(ipcam_ring_is_closed(rb) == 0);
     for (size_t i = 0; i < sizeof(clients) / sizeof(clients[0]); i++) close(clients[i]);
     ipcam_ring_destroy(rb);
 }

@@ -63,6 +63,7 @@ typedef struct ipcam_control_status_s {
     int jpeg_record_frames;
     int network_link;
     char network_ip[64];
+    uint8_t storage_mounted;
     uint64_t storage_available_bytes;
     uint32_t capture_fps; /* 驱动报告的采集帧率；0 表示驱动未返回有效值 */
     uint32_t output_fps;  /* 依据目标/软件选帧推导的输出上限，实测值见 metrics 日志 */

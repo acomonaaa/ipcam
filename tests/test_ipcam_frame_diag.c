@@ -45,22 +45,26 @@ static void test_ring_metadata_roundtrip(void)
 
     assert(rb != NULL);
     memset(&meta, 0, sizeof(meta));
-    meta.source_sequence = 1234;
-    meta.source_buffer_index = 2;
-    meta.source_bytesperline = 1280;
-    meta.source_frame_bytes = 614400;
-    meta.source_probe_global = 0x12345678U;
-    meta.source_probe_quadrant[0] = 0xaabbccddU;
+    /* 元数据直接对应当前 ring 帧头，验证采集时间、几何/格式和配置代次
+     * 会随 payload 一起往返；不依赖已删除的 source_* 诊断字段。 */
+    meta.monotonic_ns = 123456789ULL;
+    meta.width = 640;
+    meta.height = 480;
+    meta.stride = 1280;
+    meta.pixel_format = 0x56595559U; /* V4L2_PIX_FMT_YUYV */
+    meta.config_generation = 7;
 
     assert(ipcam_ring_try_append_meta(rb, payload, sizeof(payload), &meta) == 0);
     assert(ipcam_ring_get(rb, &frame) == 0);
     assert(frame.seqNo == 1);
     assert(frame.size == sizeof(payload));
     assert(memcmp(frame.rawData, payload, sizeof(payload)) == 0);
-    assert(frame.meta.source_sequence == meta.source_sequence);
-    assert(frame.meta.source_buffer_index == meta.source_buffer_index);
-    assert(frame.meta.source_probe_global == meta.source_probe_global);
-    assert(frame.meta.source_probe_quadrant[0] == meta.source_probe_quadrant[0]);
+    assert(frame.monotonic_ns == meta.monotonic_ns);
+    assert(frame.width == meta.width);
+    assert(frame.height == meta.height);
+    assert(frame.stride == meta.stride);
+    assert(frame.pixel_format == meta.pixel_format);
+    assert(frame.config_generation == meta.config_generation);
     ipcam_ring_release(rb);
     ipcam_ring_destroy(rb);
 }

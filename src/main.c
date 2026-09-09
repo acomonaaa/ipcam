@@ -193,8 +193,9 @@ static void on_touch_report(const ipcam_touch_point_t *points, int count, void *
 static uint64_t read_rss_bytes(void)
 {
     FILE *fp = fopen("/proc/self/statm", "r");
+    unsigned long total_pages = 0;
     unsigned long resident = 0;
-    if (!fp || fscanf(fp, "%*lu %lu", &resident) != 1) {
+    if (!fp || fscanf(fp, "%lu %lu", &total_pages, &resident) != 2) {
         if (fp) fclose(fp);
         return 0;
     }
@@ -276,7 +277,12 @@ static int run_daemon(void)
     s.net_is_4g = (nmode == IPCAM_NET_MODE_4G);
     if (nmode == IPCAM_NET_MODE_4G || nmode == IPCAM_NET_MODE_WIFI) {
         if (s.net_is_4g) {
-            ipcam_net_4g_init(&s.net4g, ipcam_param_get_apn(), "/dev/ttyUSB2");
+            const char *at_dev = getenv("IPCAM_4G_AT_DEV");
+            const char *ppp_peer = getenv("IPCAM_4G_PPP_PEER");
+            if (!at_dev || !*at_dev) at_dev = IPCAM_4G_AT_DEV;
+            if (!ppp_peer || !*ppp_peer) ppp_peer = IPCAM_4G_PPP_PEER;
+            MLOGI("4G config at_dev=%s ppp_peer=%s\n", at_dev, ppp_peer);
+            ipcam_net_4g_init(&s.net4g, ipcam_param_get_apn(), at_dev, ppp_peer);
             if (ipcam_net_4g_start(&s.net4g) == 0) s.net_started = 1;
             else MLOGW("4G start failed, continuing in local-only mode\n");
         } else {

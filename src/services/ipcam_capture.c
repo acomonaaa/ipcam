@@ -409,8 +409,10 @@ int ipcam_capture_start(ipcam_capture_ctx_t *ctx,
      * 环槽，驱动若返回带 padding 或更高尺寸时会把帧静默丢掉；现在在
      * 启动阶段明确失败，让上层报告“硬件能力不匹配”，避免伪装成直播正常。
      */
-    size_t min_frame_bytes = (size_t)(ctx->bytes_per_line ? ctx->bytes_per_line : ctx->width * 2) *
-                             (size_t)ctx->height;
+    /* 两个分支先统一为 size_t，避免 32 位 ARM 上有符号宽度参与条件表达式。 */
+    size_t bytes_per_line = ctx->bytes_per_line ? (size_t)ctx->bytes_per_line :
+                              (size_t)ctx->width * 2U;
+    size_t min_frame_bytes = bytes_per_line * (size_t)ctx->height;
     /* ring 槽还必须能容纳驱动声明的 sizeimage；只按 stride*height
      * 校验会在 bytesused 带额外尾部时静默丢帧。 */
     size_t required_capacity = min_frame_bytes;

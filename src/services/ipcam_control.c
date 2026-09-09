@@ -16,7 +16,6 @@
 #include <linux/input.h>
 #include <netinet/in.h>
 #include <sys/ioctl.h>
-#include <sys/statvfs.h>
 
 /*
  * 首版只把 640×480@15 作为对外能力。驱动即使声称支持更多档位，
@@ -90,8 +89,9 @@ static ipcam_control_result_t *find_result_locked(ipcam_control_ctx_t *ctx,
     return NULL;
 }
 
-/* 读取有线网卡和 SD 卡空间；失败只报告不可用，不伪造在线/有空间状态。 */
-static void fill_link_storage(ipcam_control_status_t *status)
+/* 读取有线网卡和 SD 卡状态；存储探测复用录像服务的挂载身份检查。 */
+static void fill_link_storage(ipcam_control_status_t *status,
+                              ipcam_record_ctx_t *recorder)
 {
     const char *iface = getenv("IPCAM_NET_IFACE");
     if (!iface || !*iface) iface = "eth0";
@@ -108,11 +108,14 @@ static void fill_link_storage(ipcam_control_status_t *status)
         }
         freeifaddrs(list);
     }
-    const char *root = getenv("IPCAM_STORAGE_ROOT");
-    if (!root || !*root) root = IPCAM_STORAGE_ROOT;
-    struct statvfs vfs;
-    if (statvfs(root, &vfs) == 0)
-        status->storage_available_bytes = (uint64_t)vfs.f_bavail * vfs.f_frsize;
+    if (recorder) {
+        int mounted = 0;
+        uint64_t available = 0;
+        int probe_rc = ipcam_record_get_storage_status(recorder, &mounted, &available);
+        status->storage_mounted = mounted ? 1 : 0;
+        if (probe_rc == 0)
+            status->storage_available_bytes = available;
+    }
 }
 
 /* 统一填写成功/失败状态，避免不同命令入口返回含义不一致。 */
@@ -398,7 +401,7 @@ int ipcam_control_get_status(ipcam_control_ctx_t *ctx,
         ipcam_capture_get_stats(ctx->capture, &out->capture_frames,
                                 &out->capture_dropped_display,
                                 &out->capture_dropped_encode);
-    fill_link_storage(out);
+    fill_link_storage(out, ctx->recorder);
     return 0;
 }
 

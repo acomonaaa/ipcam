@@ -85,6 +85,15 @@
 #define IPCAM_4G_APN           "cmnet"
 #endif
 
+/* 4G 设备和 PPP profile 可由环境变量 IPCAM_4G_AT_DEV/PEER 覆盖；
+ * 宏只保留现有部署的兼容默认值，不再把板级路径散落在业务代码中。 */
+#ifndef IPCAM_4G_AT_DEV
+#define IPCAM_4G_AT_DEV        "/dev/ttyUSB2"
+#endif
+#ifndef IPCAM_4G_PPP_PEER
+#define IPCAM_4G_PPP_PEER      "quectel"
+#endif
+
 /* WiFi SSID/PWD（运行时可改；编译期仅供默认） */
 #ifndef IPCAM_WIFI_SSID
 #define IPCAM_WIFI_SSID        ""

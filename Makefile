@@ -11,7 +11,7 @@
 #    make DEBUG=1               # 调试构建
 #    make CROSS_COMPILE=arm-linux-gnueabihf-
 #    make CROSS_COMPILE=         # 用本机 gcc（仅用于主机端开发自测）
-#    make clean / install / uninstall
+#    make clean / install / uninstall / test-host
 
 ROOT      := $(shell pwd)
 PREFIX   ?= $(ROOT)/output
@@ -69,7 +69,7 @@ BIN  := ipcam
 # argv[0] 多调用入口的软软链接
 LINKS := camver camctl
 
-.PHONY: all clean install uninstall ipcam-display-only
+.PHONY: all clean install uninstall ipcam-display-only test-host
 
 all: $(BIN)
 
@@ -84,6 +84,41 @@ $(BIN): $(OBJS)
 ipcam-display-only: CFLAGS := $(OPT) $(WARN) -std=gnu99 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -pthread $(INCLUDES)
 ipcam-display-only: LDFLAGS := -pthread -lm
 ipcam-display-only: $(BIN)
+
+# 主机测试不依赖 ARM 工具链或板端设备；产物放到 /tmp，避免污染工作树。
+HOST_CC ?= gcc
+TEST_BUILD_DIR ?= /tmp/ipcam-test-build
+TEST_SANITIZE_FLAGS :=
+ifeq ($(SANITIZE),1)
+TEST_SANITIZE_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer
+endif
+TEST_CFLAGS := -std=gnu99 -Wall -Wextra -Werror -Werror=implicit-function-declaration \
+               -pthread -I$(ROOT)/config -I$(ROOT)/src -I$(ROOT)/src/core \
+               -I$(ROOT)/src/services $(TEST_SANITIZE_FLAGS)
+TEST_LDFLAGS := -pthread $(TEST_SANITIZE_FLAGS)
+
+TEST_SCALE_BIN := $(TEST_BUILD_DIR)/test_ipcam_scale
+TEST_FRAME_BIN := $(TEST_BUILD_DIR)/test_ipcam_frame_diag
+TEST_STREAM_BIN := $(TEST_BUILD_DIR)/test_ipcam_stream_lifecycle
+
+test-host: $(TEST_SCALE_BIN) $(TEST_FRAME_BIN) $(TEST_STREAM_BIN)
+	@$(TEST_SCALE_BIN)
+	@$(TEST_FRAME_BIN)
+	@$(TEST_STREAM_BIN)
+
+$(TEST_BUILD_DIR):
+	mkdir -p $@
+
+$(TEST_SCALE_BIN): tests/test_ipcam_scale.c src/core/ipcam_scale.c | $(TEST_BUILD_DIR)
+	$(HOST_CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
+
+$(TEST_FRAME_BIN): tests/test_ipcam_frame_diag.c src/core/ipcam_frame_diag.c \
+                   src/core/ipcam_ringbuffer.c | $(TEST_BUILD_DIR)
+	$(HOST_CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
+
+$(TEST_STREAM_BIN): tests/test_ipcam_stream_lifecycle.c tests/test_ipcam_stream_stubs.c \
+                    src/services/ipcam_stream.c src/core/ipcam_ringbuffer.c | $(TEST_BUILD_DIR)
+	$(HOST_CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
 
 install: $(BIN)
 	install -d $(PREFIX)/usr/bin

@@ -24,10 +24,10 @@
  * 注：本实现是简化版"够用即可"。生产环境请用 quectel-CM（含 QMI WWAN）。
  *
  * 流程：
- *   1) 打开 /dev/ttyUSB2，termios 115200 8N1 + blocking，发 AT
+ *   1) 打开配置的 AT 设备，termios 115200 8N1 + blocking，发 AT
  *   2) select() 等 OK/ERROR，超时 timeout_ms
  *   3) AT+CFUN=1, AT+CGDCONT=1,"IP","<apn>"
- *   4) fork+exec pppd call quectel
+ *   4) fork+exec pppd call <configured-peer>
  *   5) 周期性查 default route dev ppp0
  */
 
@@ -152,12 +152,17 @@ static int has_default_route(const char *ifname)
     return found;
 }
 
-int ipcam_net_4g_init(ipcam_net_4g_ctx_t *ctx, const char *apn, const char *at_dev)
+int ipcam_net_4g_init(ipcam_net_4g_ctx_t *ctx, const char *apn,
+                      const char *at_dev, const char *ppp_peer)
 {
     memset(ctx, 0, sizeof(*ctx));
     if (apn) strncpy(ctx->apn, apn, sizeof(ctx->apn) - 1);
-    if (at_dev) strncpy(ctx->at_dev, at_dev, sizeof(ctx->at_dev) - 1);
-    else snprintf(ctx->at_dev, sizeof(ctx->at_dev), "/dev/ttyUSB2");
+    if (at_dev) snprintf(ctx->at_dev, sizeof(ctx->at_dev), "%s", at_dev);
+    else snprintf(ctx->at_dev, sizeof(ctx->at_dev), "%s", IPCAM_4G_AT_DEV);
+    /* 环境覆盖值可能来自启动脚本；snprintf 保证截断后仍有 NUL 结尾，
+     * 避免异常长配置把后续 execlp 参数读出数组边界。 */
+    if (ppp_peer) snprintf(ctx->ppp_peer, sizeof(ctx->ppp_peer), "%s", ppp_peer);
+    else snprintf(ctx->ppp_peer, sizeof(ctx->ppp_peer), "%s", IPCAM_4G_PPP_PEER);
     ctx->pppd_pid = -1;
     return 0;
 }
@@ -183,7 +188,7 @@ int ipcam_net_4g_start(ipcam_net_4g_ctx_t *ctx)
     }
     if (pid == 0) {
         /* 子进程：exec pppd；exec 失败直接退出（parent 通过 waitpid 看到非 0 status） */
-        execlp("pppd", "pppd", "call", "quectel", "-detach", (char *)NULL);
+        execlp("pppd", "pppd", "call", ctx->ppp_peer, "-detach", (char *)NULL);
         _exit(127);
     }
 

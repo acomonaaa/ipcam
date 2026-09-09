@@ -148,6 +148,12 @@ void ipcam_ring_release(ipcam_ring_buffer_t *rb);
 /* 标记缓冲关闭；唤醒所有阻塞线程 */
 void ipcam_ring_close(ipcam_ring_buffer_t *rb);
 
+/*
+ * 查询缓冲是否已经关闭；状态读取与 count 使用同一把锁，供 healthz
+ * 区分“暂时没有帧”和“生产者链路已经停止”。
+ */
+int ipcam_ring_is_closed(const ipcam_ring_buffer_t *rb);
+
 /* 当前帧数（仅供统计） */
 int ipcam_ring_count(ipcam_ring_buffer_t *rb);
 size_t ipcam_ring_capacity(const ipcam_ring_buffer_t *rb);

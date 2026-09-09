@@ -71,6 +71,9 @@ int ipcam_record_request_stop(ipcam_record_ctx_t *ctx);
 /* 保存录像队列中的下一张最新 JPEG；与录像并行，不切换摄像头规格。 */
 int ipcam_record_save_photo(ipcam_record_ctx_t *ctx, char *path_out, size_t path_sz);
 void ipcam_record_get_status(ipcam_record_ctx_t *ctx, ipcam_record_status_t *out);
+/* 查询与录像/拍照相同的挂载身份和可用空间；未挂载时空间返回 0。 */
+int ipcam_record_get_storage_status(ipcam_record_ctx_t *ctx,
+                                    int *mounted, uint64_t *available_bytes);
 /* 读取当前录像线程已写入的帧/字节累计值，包含尚未完成收尾的活动段。 */
 void ipcam_record_get_metrics(ipcam_record_ctx_t *ctx, uint64_t *frames,
                               uint64_t *bytes);
