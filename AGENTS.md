@@ -296,3 +296,1856 @@ changes/YYYY-MM-DD-简短中文标题.md
 1. 分析并修改**代码**，**同步写好详细中文注释**（见上文「中文注释」）  
 2. **立即**按模板新增/更新 `changes/` 记录，并更新索引（纯文档改动跳过本步）  
 3. 用户要求提交时：代码提交须纳入对应记录文件；commit message 遵循上文约定式提交（中文 subject）  
+
+
+---
+
+# 附录：pen.dev → LVGL 设计转码规范
+
+## 1. Purpose
+
+This repository uses an **AI-first embedded GUI development workflow** for:
+
+- NXP i.MX6ULL
+- Embedded Linux
+- LVGL 9
+- Windows development host
+- Ubuntu virtual machine accessed through SSH
+- pen.dev as the primary GUI design tool
+- AI Agent as the primary design/code assistant
+
+The standard workflow is:
+
+```text
+Requirements
+    ↓
+AI discussion
+    ↓
+pen.dev design through MCP
+    ↓
+Human design review
+    ↓
+Approved .pen design
+    ↓
+AI converts design to LVGL 9 C code
+    ↓
+PC / Ubuntu LVGL Simulator
+    ↓
+Simulator validation
+    ↓
+ARM cross compilation
+    ↓
+i.MX6ULL deployment
+    ↓
+Board validation
+    ↓
+Performance optimization
+```
+
+All AI agents working in this repository MUST follow the rules in this document.
+
+---
+
+# 2. Target Platform
+
+Default target:
+
+```text
+SoC:            NXP i.MX6ULL
+CPU:            ARM Cortex-A7
+GPU:            None
+OS:             Embedded Linux
+GUI Framework:  LVGL 9
+Display:        LCD
+Typical Size:   800x480
+Typical Format: RGB565
+Input:          Linux evdev
+Display Backend:
+                framebuffer and/or DRM/KMS
+```
+
+The i.MX6ULL has limited CPU and graphics performance.
+
+Therefore all GUI implementations MUST prioritize:
+
+- low CPU usage;
+- low memory usage;
+- low redraw cost;
+- fast startup;
+- predictable performance;
+- long-term stability;
+- touch responsiveness.
+
+The agent MUST NOT design the UI as if the target were a desktop GPU system.
+
+---
+
+# 3. Development Environment
+
+Expected development topology:
+
+```text
+Windows
+│
+├── AI Agent
+├── pen.dev
+├── MCP
+├── IDE
+└── SSH
+     │
+     ▼
+Ubuntu Virtual Machine
+│
+├── Git repository
+├── LVGL
+├── LVGL Simulator
+├── CMake / Make
+├── ARM cross compiler
+├── Buildroot / Yocto if required
+└── deployment scripts
+     │
+     ▼
+i.MX6ULL
+│
+├── Embedded Linux
+├── LCD
+├── Touchscreen
+├── framebuffer / DRM
+└── evdev
+```
+
+The Ubuntu VM SHOULD be treated as the primary compilation environment.
+
+The Windows host SHOULD primarily be used for:
+
+- pen.dev;
+- AI interaction;
+- MCP;
+- editing;
+- design review;
+- SSH access.
+
+---
+
+# 4. Design Source of Truth
+
+The approved `.pen` file is the **single source of truth for GUI visual design**.
+
+Recommended location:
+
+```text
+design/
+└── hmi.pen
+```
+
+The `.pen` file owns:
+
+- screen structure;
+- widget hierarchy;
+- layout;
+- dimensions;
+- spacing;
+- colors;
+- typography;
+- visual states;
+- navigation;
+- icons;
+- component appearance.
+
+The LVGL C implementation MUST reflect the approved `.pen` design.
+
+---
+
+# 5. Design Drift Is Not Allowed
+
+The following changes MUST normally be made in the `.pen` design first:
+
+- widget position;
+- widget size;
+- spacing;
+- colors;
+- font sizes;
+- component structure;
+- navigation structure;
+- visual states;
+- icon placement;
+- visual hierarchy.
+
+The agent MUST NOT permanently make a design change only in C code.
+
+Bad workflow:
+
+```text
+pen.dev design
+      ↓
+LVGL C
+
+Developer moves button manually in C
+
+      ↓
+
+.pen and C no longer match
+```
+
+Correct workflow:
+
+```text
+Change requested
+      ↓
+Modify .pen
+      ↓
+Review
+      ↓
+Update LVGL implementation
+```
+
+Temporary board-side experiments are allowed when debugging.
+
+If a temporary implementation change becomes permanent, the design MUST be updated accordingly.
+
+---
+
+# 6. Mandatory GUI Development Pipeline
+
+Every new screen or major visual feature MUST follow:
+
+```text
+REQUIREMENTS
+    ↓
+DESIGN SPEC
+    ↓
+PEN DESIGN
+    ↓
+HUMAN REVIEW
+    ↓
+DESIGN APPROVED
+    ↓
+LVGL IMPLEMENTATION
+    ↓
+SIMULATOR BUILD
+    ↓
+SIMULATOR VALIDATION
+    ↓
+CROSS BUILD
+    ↓
+BOARD DEPLOYMENT
+    ↓
+BOARD VALIDATION
+```
+
+Do not skip stages without a technical reason.
+
+---
+
+# 7. Stage 1 — Requirements Discussion
+
+Before modifying pen.dev or LVGL code, the agent SHOULD understand:
+
+- target resolution;
+- required screens;
+- navigation model;
+- displayed values;
+- user actions;
+- touch behavior;
+- alarm states;
+- error states;
+- offline states;
+- loading states;
+- disabled states;
+- data update frequency;
+- real-time chart requirements;
+- hardware limitations.
+
+For substantial GUI features, the agent SHOULD first produce a short design specification.
+
+Example:
+
+```text
+Display: 800x480
+
+Header:
+height 48px
+
+Sidebar:
+width 128px
+
+Footer:
+height 32px
+
+Content:
+remaining area
+
+Spacing:
+8 / 12 / 16 / 24px
+
+Touch target:
+minimum approximately 44-48px
+```
+
+---
+
+# 8. Stage 2 — pen.dev Design
+
+When pen.dev MCP access is available, the AI SHOULD use it to create or modify the GUI.
+
+The AI MAY:
+
+- create screens;
+- create components;
+- adjust layout;
+- modify text;
+- modify colors;
+- modify spacing;
+- add icons;
+- create navigation structures;
+- create visual states.
+
+The agent MUST NOT claim that pen.dev was modified unless the MCP/tool operation actually succeeded.
+
+If MCP is unavailable, the agent MUST NOT fabricate a design result.
+
+---
+
+# 9. Stage 3 — Human Review
+
+The human developer reviews the design before implementation.
+
+Possible outcomes:
+
+```text
+Rejected
+    ↓
+AI modifies .pen
+    ↓
+Review again
+```
+
+or:
+
+```text
+Approved
+    ↓
+LVGL implementation begins
+```
+
+For a newly designed screen, the agent SHOULD NOT treat it as final until approval is given.
+
+Small implementation fixes that do not change visual behavior do not require renewed approval.
+
+---
+
+# 10. Stage 4 — Convert Design to LVGL
+
+After design approval, the AI converts the `.pen` design into maintainable LVGL 9 C code.
+
+The conversion MUST NOT simply generate one giant source file.
+
+The implementation SHOULD preserve:
+
+- component hierarchy;
+- spacing;
+- colors;
+- sizes;
+- alignment;
+- typography;
+- interaction states.
+
+The agent SHOULD translate design concepts into appropriate LVGL concepts.
+
+Examples:
+
+```text
+Design flex layout
+      ↓
+LVGL Flex
+
+Design grid layout
+      ↓
+LVGL Grid
+
+Reusable card
+      ↓
+Reusable LVGL component
+
+Shared visual rules
+      ↓
+Reusable lv_style_t
+```
+
+---
+
+# 11. Recommended Repository Structure
+
+Preferred structure:
+
+```text
+project/
+│
+├── AGENTS.md
+├── CMakeLists.txt
+│
+├── design/
+│   ├── hmi.pen
+│   └── design-notes.md
+│
+├── src/
+│   │
+│   ├── main.c
+│   │
+│   ├── ui/
+│   │   │
+│   │   ├── ui.c
+│   │   ├── ui.h
+│   │   │
+│   │   ├── screens/
+│   │   │   ├── screen_home.c
+│   │   │   ├── screen_home.h
+│   │   │   ├── screen_control.c
+│   │   │   ├── screen_control.h
+│   │   │   ├── screen_alarm.c
+│   │   │   ├── screen_alarm.h
+│   │   │   ├── screen_settings.c
+│   │   │   └── screen_settings.h
+│   │   │
+│   │   ├── components/
+│   │   │   ├── status_card.c
+│   │   │   ├── status_card.h
+│   │   │   ├── nav_button.c
+│   │   │   ├── nav_button.h
+│   │   │   ├── status_bar.c
+│   │   │   └── status_bar.h
+│   │   │
+│   │   ├── styles/
+│   │   │   ├── ui_styles.c
+│   │   │   └── ui_styles.h
+│   │   │
+│   │   └── assets/
+│   │       ├── ui_images.c
+│   │       ├── ui_images.h
+│   │       ├── ui_fonts.c
+│   │       └── ui_fonts.h
+│   │
+│   ├── ui_logic/
+│   │   ├── ui_actions.c
+│   │   ├── ui_actions.h
+│   │   ├── ui_data.c
+│   │   └── ui_data.h
+│   │
+│   ├── app/
+│   │   ├── device.c
+│   │   ├── device.h
+│   │   ├── sensor.c
+│   │   ├── sensor.h
+│   │   ├── uart.c
+│   │   ├── uart.h
+│   │   ├── network.c
+│   │   ├── network.h
+│   │   ├── database.c
+│   │   └── database.h
+│   │
+│   └── platform/
+│       ├── lv_port_disp.c
+│       ├── lv_port_disp.h
+│       ├── lv_port_indev.c
+│       └── lv_port_indev.h
+│
+├── simulator/
+│
+├── scripts/
+│
+└── tests/
+```
+
+If an existing repository already uses another sensible structure, preserve it.
+
+Do not perform unnecessary large-scale restructuring.
+
+---
+
+# 12. Never Generate a Giant `ui.c`
+
+The agent MUST NOT create one monolithic file containing:
+
+- every screen;
+- every widget;
+- every style;
+- all callbacks;
+- UART code;
+- network code;
+- database code;
+- threading code.
+
+Bad:
+
+```text
+ui.c
+12000 lines
+```
+
+Preferred:
+
+```text
+screen_home.c
+screen_alarm.c
+status_card.c
+nav_button.c
+ui_styles.c
+ui_actions.c
+```
+
+Each file SHOULD have one clear responsibility.
+
+---
+
+# 13. UI Layer Responsibilities
+
+`src/ui/` SHOULD contain only GUI-related concerns.
+
+Examples:
+
+- widget creation;
+- layout;
+- style;
+- visual states;
+- screen creation;
+- reusable components;
+- image assets;
+- fonts.
+
+The UI layer MUST NOT directly implement:
+
+- serial protocol;
+- TCP protocol;
+- SQLite queries;
+- blocking file I/O;
+- device discovery;
+- sensor drivers.
+
+---
+
+# 14. UI Logic Layer
+
+`src/ui_logic/` acts as the bridge between UI and application logic.
+
+Example:
+
+```text
+LVGL button
+    ↓
+ui_action_start_device()
+    ↓
+device_request_start()
+    ↓
+UART subsystem
+```
+
+Preferred callback:
+
+```c
+static void on_start_clicked(lv_event_t *e)
+{
+    (void)e;
+
+    ui_action_start_device();
+}
+```
+
+Then:
+
+```c
+void ui_action_start_device(void)
+{
+    device_request_start();
+}
+```
+
+Do NOT write this directly inside the LVGL callback:
+
+```c
+int fd = open("/dev/ttymxc2", O_RDWR);
+
+write(fd, command, sizeof(command));
+```
+
+---
+
+# 15. Business Logic Layer
+
+The `app/` layer owns:
+
+- device state;
+- sensors;
+- UART;
+- networking;
+- database;
+- protocol handling;
+- application state machines.
+
+Example:
+
+```text
+UI
+ ↓
+ui_actions
+ ↓
+device
+ ↓
+uart
+ ↓
+hardware
+```
+
+The business layer SHOULD be testable independently of LVGL whenever practical.
+
+---
+
+# 16. Platform Layer
+
+`platform/` owns platform-specific integration such as:
+
+- LVGL display backend;
+- framebuffer;
+- DRM/KMS;
+- evdev;
+- touchscreen;
+- Linux input devices.
+
+Examples:
+
+```text
+lv_port_disp.c
+lv_port_indev.c
+```
+
+The screen implementation MUST NOT depend directly on `/dev/fb0` or `/dev/input/eventX`.
+
+---
+
+# 17. LVGL Version
+
+This repository targets:
+
+```text
+LVGL 9
+```
+
+The agent MUST:
+
+- use LVGL 9 APIs;
+- inspect the actual LVGL version when uncertain;
+- compile after API changes;
+- avoid mixing LVGL 8 and LVGL 9 code.
+
+The agent MUST NOT invent LVGL APIs based only on memory.
+
+If API behavior is uncertain, inspect:
+
+- local LVGL headers;
+- repository examples;
+- installed documentation.
+
+---
+
+# 18. Naming Convention
+
+Use semantic names.
+
+Good:
+
+```text
+screen_home
+screen_alarm
+screen_settings
+
+btn_start
+btn_stop
+btn_reset
+
+label_temperature
+label_pressure
+label_flow
+
+chart_realtime
+
+card_temperature
+
+status_network
+status_uart
+```
+
+Bad:
+
+```text
+obj1
+obj2
+button4
+label7
+screen3
+container5
+```
+
+Preferred C function naming:
+
+```c
+ui_screen_home_create();
+ui_screen_home_destroy();
+
+ui_status_card_create();
+
+ui_update_temperature();
+
+ui_action_start_device();
+
+device_start();
+
+uart_send_command();
+```
+
+---
+
+# 19. Component Reuse
+
+Repeated UI elements MUST be implemented as reusable components.
+
+Examples:
+
+```text
+status card
+navigation button
+alarm row
+parameter row
+status indicator
+dialog
+numeric value card
+```
+
+Do not duplicate nearly identical LVGL widget construction across screens.
+
+For example:
+
+```c
+ui_status_card_create(parent, ...);
+```
+
+is preferred over copying the same 30 lines four times.
+
+---
+
+# 20. Style Reuse
+
+Shared styles SHOULD use reusable `lv_style_t`.
+
+Avoid configuring identical style properties individually on every object.
+
+Preferred:
+
+```text
+style_card
+style_nav_button
+style_title
+style_value
+style_alarm
+```
+
+Benefits:
+
+- smaller code;
+- easier maintenance;
+- consistent design;
+- easier AI modifications;
+- less risk of visual drift.
+
+---
+
+# 21. i.MX6ULL Performance Rules
+
+The target has no GPU.
+
+Therefore the agent MUST optimize for software rendering.
+
+## Avoid
+
+The agent SHOULD avoid or minimize:
+
+- blur;
+- complex shadows;
+- large shadows;
+- large transparent overlays;
+- unnecessary alpha blending;
+- large gradients;
+- full-screen animations;
+- continuous full-screen transitions;
+- frequent image scaling;
+- frequent image rotation;
+- oversized image resources;
+- unnecessary redraws;
+- excessive widget count;
+- excessive nested containers.
+
+## Prefer
+
+The agent SHOULD prefer:
+
+- flat visual design;
+- solid colors;
+- simple borders;
+- small-radius corners;
+- reusable styles;
+- Flex layout;
+- Grid layout;
+- partial redraw;
+- moderate animation;
+- simple state transitions;
+- static assets sized close to final display size.
+
+---
+
+# 22. Forbidden GPU Assumptions
+
+The agent MUST NOT assume hardware OpenGL ES acceleration is available on i.MX6ULL.
+
+Do not introduce GPU-specific rendering requirements unless the hardware target changes.
+
+The design SHOULD remain functional with LVGL software rendering.
+
+---
+
+# 23. Animation Rules
+
+Animations are allowed but MUST be conservative.
+
+Acceptable examples:
+
+```text
+button press feedback
+small progress animation
+short page fade
+small indicator movement
+temporary notification
+```
+
+Avoid:
+
+```text
+continuous background animation
+full-screen 60 FPS transitions
+large transparency animation
+large-scale zoom
+continuous rotating graphics
+```
+
+Animation MUST NOT interfere with touch responsiveness.
+
+---
+
+# 24. Touch UI Rules
+
+The UI is intended for physical touchscreens.
+
+Interactive elements SHOULD have adequate touch targets.
+
+Typical recommendation:
+
+```text
+minimum height:
+approximately 44-48px
+```
+
+Avoid:
+
+- tiny text buttons;
+- tightly packed controls;
+- small icons as the only click target.
+
+Touch targets MAY be larger than their visible graphics.
+
+---
+
+# 25. Font Rules
+
+Fonts can consume significant memory.
+
+The agent SHOULD:
+
+- use as few font sizes as practical;
+- avoid embedding unnecessary characters;
+- subset Chinese fonts where practical;
+- avoid embedding multiple complete CJK font sets;
+- reuse font resources.
+
+Suggested UI hierarchy:
+
+```text
+small:
+14px
+
+normal:
+16px
+
+section:
+18-20px
+
+large value:
+24-32px
+```
+
+Exact values MUST follow the approved design.
+
+---
+
+# 26. Image Resource Rules
+
+Images SHOULD be prepared specifically for the target.
+
+Prefer:
+
+- correct target dimensions;
+- appropriate LVGL-compatible formats;
+- compressed resources where supported;
+- RGB565-compatible assets when appropriate.
+
+Avoid relying on runtime scaling for large images.
+
+The agent SHOULD consider:
+
+```text
+flash/storage cost
+RAM cost
+decode cost
+rendering cost
+```
+
+before adding large assets.
+
+---
+
+# 27. Chart Rules
+
+Real-time charts can be expensive.
+
+The agent SHOULD:
+
+- limit visible points;
+- limit update frequency;
+- avoid full-screen charts unless required;
+- avoid unnecessarily high sampling rates;
+- update only when new data exists.
+
+For example:
+
+```text
+sensor collection:
+100 Hz
+```
+
+does NOT imply:
+
+```text
+GUI redraw:
+100 Hz
+```
+
+A GUI update of approximately:
+
+```text
+5-20 Hz
+```
+
+may be sufficient depending on the product.
+
+---
+
+# 28. LVGL Thread Safety
+
+LVGL MUST be treated as single-thread-owned unless the project explicitly implements a safe LVGL synchronization model.
+
+Worker threads MUST NOT casually call LVGL APIs.
+
+Bad:
+
+```text
+UART thread
+   ↓
+lv_label_set_text()
+```
+
+Preferred:
+
+```text
+UART thread
+   ↓
+update application data
+   ↓
+send message/event
+   ↓
+GUI thread
+   ↓
+lv_label_set_text()
+```
+
+The agent MUST understand the project's existing threading model before updating UI from worker threads.
+
+---
+
+# 29. Blocking Operations
+
+LVGL event callbacks MUST NOT perform long blocking operations.
+
+Do not block the UI thread with:
+
+- long serial reads;
+- network requests;
+- database scans;
+- file copies;
+- sleep();
+- hardware timeout waits.
+
+Instead:
+
+```text
+UI event
+   ↓
+submit request
+   ↓
+worker thread
+   ↓
+result
+   ↓
+GUI update
+```
+
+---
+
+# 30. UI Data Model
+
+The UI SHOULD consume structured application state.
+
+Example:
+
+```c
+typedef struct {
+    float temperature;
+    float pressure;
+    float flow;
+
+    bool network_online;
+    bool uart_online;
+    bool device_running;
+} app_status_t;
+```
+
+Then:
+
+```text
+hardware
+   ↓
+app_status_t
+   ↓
+ui_data
+   ↓
+LVGL widgets
+```
+
+Avoid scattering unrelated global variables throughout screen source files.
+
+---
+
+# 31. Simulator Is Mandatory
+
+UI code SHOULD be tested on PC before board deployment.
+
+Recommended:
+
+```text
+Ubuntu VM
+   ↓
+LVGL
+   ↓
+SDL2
+   ↓
+800x480 simulator window
+```
+
+The simulator is used to check:
+
+- build success;
+- crashes;
+- page layout;
+- navigation;
+- label rendering;
+- component reuse;
+- callback behavior;
+- mock sensor data;
+- chart behavior.
+
+---
+
+# 32. Simulator Validation Checklist
+
+Before cross-compiling, verify:
+
+- [ ] Simulator builds successfully
+- [ ] Application starts
+- [ ] Correct resolution is used
+- [ ] Home screen renders
+- [ ] No obvious overlap
+- [ ] No major clipping
+- [ ] Navigation works
+- [ ] Buttons trigger expected callbacks
+- [ ] Dynamic labels update
+- [ ] Charts update
+- [ ] Error states render
+- [ ] Offline states render
+- [ ] No immediate crash
+- [ ] No obvious memory corruption
+- [ ] Design closely matches approved `.pen`
+
+If the simulator fails, the normal workflow MUST return to implementation/debugging before board deployment.
+
+---
+
+# 33. Cross Compilation
+
+After simulator validation passes:
+
+```text
+native simulator build
+        ↓
+cross compilation
+        ↓
+ARM executable
+```
+
+The agent MUST use the repository-defined toolchain when available.
+
+Do not replace an existing toolchain casually.
+
+Possible toolchains include:
+
+```text
+arm-linux-gnueabihf-gcc
+Yocto SDK
+Buildroot SDK
+vendor SDK
+```
+
+The agent MUST distinguish:
+
+```text
+host compiler
+```
+
+from:
+
+```text
+target compiler
+```
+
+---
+
+# 34. Board Deployment
+
+Typical deployment may use:
+
+```text
+scp
+ssh
+rsync
+NFS
+```
+
+The agent SHOULD use existing project scripts if available.
+
+Do not invent a new deployment method when a working deployment workflow already exists.
+
+---
+
+# 35. Board Validation
+
+Board testing MUST validate what the simulator cannot.
+
+Check:
+
+- [ ] LCD output
+- [ ] color correctness
+- [ ] RGB565 appearance
+- [ ] touchscreen input
+- [ ] touch coordinate mapping
+- [ ] button hit areas
+- [ ] scrolling
+- [ ] page transitions
+- [ ] CPU usage
+- [ ] RAM usage
+- [ ] UI responsiveness
+- [ ] chart performance
+- [ ] startup time
+- [ ] UART interaction
+- [ ] network interaction
+- [ ] long-running stability
+
+---
+
+# 36. Performance Validation
+
+The agent SHOULD measure instead of guessing.
+
+Useful Linux tools may include:
+
+```text
+top
+htop
+ps
+free
+time
+pidstat
+strace
+perf
+```
+
+Availability depends on the target root filesystem.
+
+The agent SHOULD look for:
+
+- CPU saturation;
+- memory growth;
+- blocking syscalls;
+- excessive wakeups;
+- excessive redraw;
+- runaway threads.
+
+---
+
+# 37. Performance Optimization Rule
+
+If the board performs poorly:
+
+```text
+Board issue
+    ↓
+Measure
+    ↓
+Identify cause
+    ↓
+Optimize implementation
+```
+
+Do NOT immediately degrade the entire design without evidence.
+
+Examples of implementation-level optimization:
+
+- reduce redraw frequency;
+- cache formatted strings;
+- lower chart refresh rate;
+- reduce chart points;
+- reduce image size;
+- remove unnecessary transparency;
+- avoid recreating widgets;
+- reuse styles;
+- avoid repeated allocation.
+
+---
+
+# 38. When Performance Changes the Design
+
+If a performance optimization changes:
+
+- layout;
+- appearance;
+- animation;
+- spacing;
+- visual hierarchy;
+
+then the `.pen` design MUST be updated.
+
+The implementation and design MUST converge again.
+
+---
+
+# 39. Error Handling
+
+Hardware and communication failures are normal.
+
+The GUI SHOULD represent states such as:
+
+```text
+Disconnected
+Connecting
+Connected
+Timeout
+Error
+Unavailable
+```
+
+The application MUST NOT assume:
+
+- UART is always present;
+- network is always available;
+- sensor data is always valid;
+- database always succeeds.
+
+GUI error presentation SHOULD be meaningful to the user.
+
+---
+
+# 40. Logging
+
+Business and hardware layers SHOULD provide useful logging.
+
+Example:
+
+```text
+[UART] opened /dev/ttymxc2
+[DEVICE] start request sent
+[NET] disconnected
+[DB] failed to open database
+```
+
+Avoid flooding logs from high-frequency GUI events.
+
+Logging SHOULD help diagnose board behavior without significantly affecting performance.
+
+---
+
+# 41. Generated Code Policy
+
+If the AI generates LVGL files from `.pen`, generated and manually maintained code SHOULD remain clearly separated.
+
+Example:
+
+```text
+src/ui/
+    generated visual implementation
+
+src/ui_logic/
+    manually maintained behavior
+```
+
+The agent SHOULD avoid regenerating files that contain hand-written business logic.
+
+When regeneration is necessary, preserve manual extensions through clear interfaces.
+
+---
+
+# 42. AI Modification Boundaries
+
+The agent MAY autonomously modify:
+
+```text
+src/ui/
+src/ui_logic/
+src/app/
+simulator/
+tests/
+build files
+```
+
+when required by the task.
+
+The agent SHOULD be conservative when modifying:
+
+```text
+bootloader
+kernel
+device tree
+Buildroot configuration
+Yocto layers
+production deployment
+```
+
+unless the task explicitly requires those areas.
+
+Do not modify unrelated subsystems merely to make a GUI task easier.
+
+---
+
+# 43. AI Must Inspect Before Editing
+
+Before making significant changes, inspect:
+
+- repository structure;
+- build system;
+- LVGL version;
+- existing coding conventions;
+- simulator configuration;
+- cross-toolchain configuration;
+- current screen implementation;
+- design files.
+
+Do not assume the project matches this template exactly.
+
+---
+
+# 44. AI Must Build After Changes
+
+After meaningful code changes, the agent SHOULD run the smallest relevant build.
+
+Preferred progression:
+
+```text
+affected target
+    ↓
+simulator
+    ↓
+full native build
+    ↓
+cross build
+```
+
+Compilation errors SHOULD be fixed before declaring completion.
+
+---
+
+# 45. Do Not Hide Build Failures
+
+If a build fails, report the actual failure.
+
+Do NOT claim:
+
+```text
+Build successful
+```
+
+unless it actually succeeded.
+
+If an environmental dependency prevents compilation, clearly state the limitation.
+
+---
+
+# 46. Git Workflow
+
+The `.pen` design SHOULD be committed to Git with the source code.
+
+Recommended:
+
+```text
+design/hmi.pen
+src/ui/
+src/ui_logic/
+src/app/
+```
+
+Commit design and implementation changes together when they belong to the same feature.
+
+Example:
+
+```text
+feat(ui): add device status dashboard
+```
+
+A commit SHOULD ideally contain:
+
+```text
+approved design change
++
+LVGL implementation
++
+associated logic
+```
+
+---
+
+# 47. Do Not Commit Build Artifacts
+
+Unless the repository explicitly requires them, do not commit:
+
+```text
+build/
+*.o
+temporary simulator binaries
+core dumps
+temporary screenshots
+IDE caches
+```
+
+Generated production assets MAY be committed when required by the build architecture.
+
+---
+
+# 48. Design Notes
+
+For important UI decisions, maintain:
+
+```text
+design/design-notes.md
+```
+
+Useful information includes:
+
+- resolution;
+- color system;
+- spacing system;
+- font hierarchy;
+- reusable components;
+- performance limitations;
+- navigation rules.
+
+This provides context to AI agents without requiring visual inference every time.
+
+---
+
+# 49. Recommended Design Constraints for i.MX6ULL
+
+Default design guidance:
+
+```text
+Resolution:
+800x480
+
+Grid:
+8px
+
+Spacing:
+8 / 12 / 16 / 24px
+
+Button height:
+44-52px
+
+Corner radius:
+4-8px
+
+Visual style:
+mostly flat
+
+Animations:
+short and limited
+
+Transparency:
+minimal
+
+Shadows:
+minimal or none
+```
+
+These are guidelines, not mandatory values if the approved design specifies otherwise.
+
+---
+
+# 50. Recommended Prompt Context for Design-to-LVGL
+
+When converting `.pen` design to LVGL, use constraints equivalent to:
+
+```text
+Target platform:
+NXP i.MX6ULL
+
+CPU:
+ARM Cortex-A7
+
+GPU:
+None
+
+Operating system:
+Embedded Linux
+
+GUI:
+LVGL 9
+
+Display:
+800x480
+
+Typical color format:
+RGB565
+
+Implementation requirements:
+
+- use LVGL 9 APIs;
+- prefer Flex and Grid;
+- reuse styles;
+- reuse components;
+- minimize dynamic allocation;
+- avoid blur;
+- avoid expensive shadows;
+- minimize alpha blending;
+- avoid GPU-specific APIs;
+- minimize redraw area;
+- avoid unnecessary full-screen animations;
+- keep event callbacks lightweight;
+- separate UI and business logic;
+- keep hardware access outside screen files.
+```
+
+---
+
+# 51. Interaction State Requirements
+
+Important controls SHOULD consider:
+
+```text
+normal
+pressed
+disabled
+active
+error
+offline
+loading
+```
+
+AI agents SHOULD not design only the ideal normal state.
+
+Industrial interfaces must clearly represent abnormal conditions.
+
+---
+
+# 52. Screen Lifecycle
+
+Avoid continuously recreating expensive screens without reason.
+
+The chosen lifecycle strategy SHOULD be explicit.
+
+Possible strategies:
+
+```text
+create once and reuse
+```
+
+or:
+
+```text
+create on entry
+destroy on exit
+```
+
+Choose based on memory and performance constraints.
+
+Do not mix lifecycle models unpredictably.
+
+---
+
+# 53. Memory Discipline
+
+i.MX6ULL resources are limited.
+
+Avoid:
+
+- unnecessary large global buffers;
+- repeated heap allocation in high-frequency paths;
+- memory leaks during screen navigation;
+- repeated creation without deletion;
+- unnecessarily large image buffers.
+
+The agent SHOULD consider memory ownership when creating custom LVGL components.
+
+---
+
+# 54. String Formatting
+
+Avoid repeated expensive formatting when unnecessary.
+
+Prefer bounded APIs such as:
+
+```c
+snprintf()
+```
+
+Do not use unsafe unbounded string operations.
+
+Sensor values SHOULD be validated before presentation.
+
+---
+
+# 55. Real-Time Data Updates
+
+GUI refresh rate MUST be decoupled from hardware sampling rate.
+
+Example:
+
+```text
+sensor:
+100 samples/sec
+
+application:
+100 updates/sec
+
+GUI:
+10 updates/sec
+```
+
+This is usually preferable to repainting at sensor frequency.
+
+---
+
+# 56. Hardware Mocking
+
+The simulator SHOULD support mock data when practical.
+
+For example:
+
+```text
+SIMULATOR
+   ↓
+mock temperature
+mock pressure
+mock device state
+```
+
+instead of requiring real hardware for every GUI test.
+
+The same UI data interface SHOULD ideally support:
+
+```text
+mock backend
+```
+
+and:
+
+```text
+real backend
+```
+
+---
+
+# 57. Build Configuration
+
+Host simulator and target build SHOULD share as much application/UI source as practical.
+
+Preferred:
+
+```text
+                   shared UI
+                      │
+         ┌────────────┴────────────┐
+         │                         │
+    simulator backend        Linux target backend
+         │                         │
+        SDL2                framebuffer / DRM
+```
+
+Avoid maintaining two different GUI implementations.
+
+---
+
+# 58. Completion Criteria
+
+A GUI feature is considered complete only when applicable items pass:
+
+## Design
+
+- [ ] requirements understood
+- [ ] design created/updated in pen.dev
+- [ ] `.pen` stored correctly
+- [ ] design reviewed
+- [ ] design approved
+
+## Code
+
+- [ ] LVGL 9 code implemented
+- [ ] code is componentized
+- [ ] no giant UI file
+- [ ] styles reused
+- [ ] UI/business layers separated
+- [ ] callbacks remain lightweight
+
+## Simulator
+
+- [ ] native build succeeds
+- [ ] simulator starts
+- [ ] screen renders correctly
+- [ ] navigation works
+- [ ] interactions work
+- [ ] representative data displays
+
+## Target
+
+- [ ] cross build succeeds
+- [ ] board application starts
+- [ ] LCD output works
+- [ ] touch works
+- [ ] no serious visual mismatch
+- [ ] CPU usage acceptable
+- [ ] memory usage acceptable
+- [ ] UI remains responsive
+
+---
+
+# 59. Agent Response Format
+
+After completing substantial work, the AI SHOULD report:
+
+```text
+Changed:
+- ...
+
+Validated:
+- ...
+
+Not validated:
+- ...
+
+Design impact:
+- none / .pen updated
+
+Target impact:
+- ...
+
+Remaining issues:
+- ...
+```
+
+Do not produce long generic explanations when a concise engineering summary is sufficient.
+
+---
+
+# 60. Core Principles
+
+All agents MUST follow these principles:
+
+## Principle 1
+
+```text
+.pen is the visual source of truth.
+```
+
+## Principle 2
+
+```text
+Design first.
+Implementation second.
+```
+
+## Principle 3
+
+```text
+LVGL UI and business logic remain separated.
+```
+
+## Principle 4
+
+```text
+Simulator before board.
+```
+
+## Principle 5
+
+```text
+Measure performance on the real i.MX6ULL.
+```
+
+## Principle 6
+
+```text
+Do not optimize for desktop hardware.
+```
+
+## Principle 7
+
+```text
+Do not allow C implementation and .pen design to silently diverge.
+```
+
+## Principle 8
+
+```text
+Prefer maintainable components over generated monolithic code.
+```
+
+## Principle 9
+
+```text
+AI may automate implementation, but hardware validation remains mandatory.
+```
+
+## Principle 10
+
+```text
+The final product must remain stable, responsive, and maintainable on i.MX6ULL.
+```
