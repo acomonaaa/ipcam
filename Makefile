@@ -41,11 +41,14 @@ INCLUDES := -I$(ROOT)/config \
             -I$(ROOT)/src/core \
             -I$(ROOT)/src/services
 
-CFLAGS  := $(OPT) $(WARN) -std=gnu99 -D_GNU_SOURCE -pthread $(TJ_CFLAGS) $(INCLUDES)
-LDFLAGS := -pthread $(TJ_LDFLAGS)
+# 32 位 ARM 仍需支持接近 3 GiB 的 AVI 段，启用 glibc 大文件接口。
+CFLAGS  := $(OPT) $(WARN) -std=gnu99 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -pthread $(TJ_CFLAGS) $(INCLUDES)
+# 触摸双指距离计算使用 libm；display-only 也要保持同一手势实现可链接。
+LDFLAGS := -pthread $(TJ_LDFLAGS) -lm
 
 # 源文件：默认从 src/services/*.c 通配，但排除 encode 主源 + stub
 # （encode 由 ENCODE_SRC 按 target 选定其中一个）
+# 录像、控制、熄屏和触摸服务随 wildcard 自动纳入，只有编码真源/空壳需要互斥选择。
 SRCS_SERVICES_WILDCARD := $(wildcard src/services/*.c)
 SRCS_SERVICES := $(filter-out src/services/ipcam_encode.c src/services/ipcam_encode_stub.c, $(SRCS_SERVICES_WILDCARD))
 
@@ -78,8 +81,8 @@ $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # ipcam-display-only：保留 stub 编码器，不需要 libjpeg-turbo
-ipcam-display-only: CFLAGS := $(OPT) $(WARN) -std=gnu99 -D_GNU_SOURCE -pthread $(INCLUDES)
-ipcam-display-only: LDFLAGS := -pthread
+ipcam-display-only: CFLAGS := $(OPT) $(WARN) -std=gnu99 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -pthread $(INCLUDES)
+ipcam-display-only: LDFLAGS := -pthread -lm
 ipcam-display-only: $(BIN)
 
 install: $(BIN)

@@ -31,25 +31,12 @@
 
 #define MAX_PATH 64
 #define MAX_REQ  2048
-#define IPCAM_STREAM_LOG_MODULE "HTTP"
 
 typedef struct ipcam_stream_client_arg_s {
     int                   cfd;
-    int                   slot;
     ipcam_ring_buffer_t  *jpeg_rb;
     ipcam_stream_ctx_t   *ctx;
 } ipcam_stream_client_arg_t;
-
-static void stream_destroy_sync(ipcam_stream_ctx_t *ctx)
-{
-    /*
-     * 调用者必须先确认 accept/client 线程都已退出；同步对象一旦销毁，
-     * 任何仍持有 ctx 的线程都会进入未定义行为，因此这里不负责等待。
-     */
-    pthread_cond_destroy(&ctx->client_cond);
-    pthread_mutex_destroy(&ctx->ring_mtx);
-    pthread_mutex_destroy(&ctx->client_mtx);
-}
 
 static ssize_t safe_write(int fd, const void *buf, size_t len)
 {
@@ -91,29 +78,63 @@ static void serve_index(int fd)
     safe_write(fd, serve_index_body, strlen(serve_index_body));
 }
 
-static void serve_status(int fd, ipcam_ring_buffer_t *jpeg_rb)
+/* 汇总控制器快照并返回实际帧参数、网络、存储和队列统计。 */
+static void serve_status(int fd, ipcam_ring_buffer_t *jpeg_rb,
+                         ipcam_record_ctx_t *rec,
+                         ipcam_control_ctx_t *control)
 {
     int cnt = jpeg_rb ? ipcam_ring_count(jpeg_rb) : 0;
-    char json[512];
-    int n = ipcam_param_to_json(json, sizeof(json) - 64);
-    if (n < 0) n = 0;
-    /* 在 param JSON 后追加 ring_count 字段 */
-    char buf[640];
+    ipcam_record_status_t rst;
+    memset(&rst, 0, sizeof(rst));
+    if (rec) ipcam_record_get_status(rec, &rst);
+    ipcam_control_status_t cst;
+    memset(&cst, 0, sizeof(cst));
+    int have_control = control && ipcam_control_get_status(control, &cst) == 0;
+    if (have_control) {
+        rst = cst.record;
+        cnt = cst.jpeg_live_frames;
+    }
+    uint16_t status_w = have_control ? cst.video.width : ipcam_param_get_capture_w();
+    uint16_t status_h = have_control ? cst.video.height : ipcam_param_get_capture_h();
+    uint8_t status_target_fps = have_control ? cst.video.target_fps : ipcam_param_get_target_fps();
+    uint32_t status_capture_fps = have_control ? cst.capture_fps : 0;
+    uint32_t status_output_fps = have_control ? cst.output_fps : 0;
+    uint8_t status_q = have_control ? cst.video.jpeg_quality : ipcam_param_get_jpeg_quality();
+    /* 状态响应从同一控制器读取，避免把编译期配置当作实际生效值。 */
+    char buf[1024];
     int m = snprintf(buf, sizeof(buf),
-                     "{\"ring_count\":%d,%.*s",
-                     cnt, n > 0 ? (int)(strchr(json, '{') - json + 1) : 0, json);
-    (void)m;
-    /* 上面的拼接不够稳；直接重新 snprintf 一次完整 */
-    m = snprintf(buf, sizeof(buf),
                  "{\"ring_count\":%d,"
                  "\"model\":\"%s\",\"swver\":\"%s\","
                  "\"net_mode\":%u,\"capture_w\":%u,\"capture_h\":%u,"
-                 "\"jpeg_q\":%u,\"http_port\":%u}\n",
+                  "\"target_fps\":%u,\"capture_fps\":%u,\"output_fps\":%u,"
+                  "\"actual_fps\":%u,\"jpeg_q\":%u,\"http_port\":%u,"
+                  "\"preview_enabled\":%u,\"mirror_h\":%u,\"mirror_v\":%u,"
+                  "\"backlight_percent\":%u,\"light_percent\":%u,"
+                  "\"record_state\":%d,\"record_segment\":%u,"
+                  "\"config_generation\":%u,\"network_link\":%d,"
+                  "\"network_ip\":\"%s\",\"storage_available\":%llu,"
+                  "\"jpeg_live_dropped\":%llu,\"jpeg_record_dropped\":%llu,"
+                  "\"capture_frames\":%llu,\"capture_drop_display\":%llu,"
+                  "\"capture_drop_encode\":%llu}\n",
                  cnt,
                  ipcam_param_get_model(), ipcam_param_get_swver(),
-                 ipcam_param_get_net_mode(),
-                 ipcam_param_get_capture_w(), ipcam_param_get_capture_h(),
-                 ipcam_param_get_jpeg_quality(), ipcam_param_get_http_port());
+                 ipcam_param_get_net_mode(), status_w, status_h,
+                 status_target_fps, status_capture_fps, status_output_fps,
+                 status_capture_fps, status_q, ipcam_param_get_http_port(),
+                 ipcam_param_get_preview_enabled(), ipcam_param_get_mirror_horizontal(),
+                 ipcam_param_get_mirror_vertical(),
+                 have_control ? cst.backlight_percent : ipcam_param_get_backlight_percent(),
+                 have_control ? cst.light_percent : 0,
+                 (int)rst.state, rst.segment_no,
+                 have_control ? cst.config_generation : ipcam_param_get_generation(),
+                 have_control ? cst.network_link : 0,
+                 have_control ? cst.network_ip : "",
+                 (unsigned long long)(have_control ? cst.storage_available_bytes : 0),
+                 (unsigned long long)(have_control ? cst.jpeg_live_dropped : 0),
+                 (unsigned long long)(have_control ? cst.jpeg_record_dropped : 0),
+                 (unsigned long long)(have_control ? cst.capture_frames : 0),
+                 (unsigned long long)(have_control ? cst.capture_dropped_display : 0),
+                 (unsigned long long)(have_control ? cst.capture_dropped_encode : 0));
     if (m < 0 || m >= (int)sizeof(buf)) {
         const char *err = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
         safe_write(fd, err, strlen(err));
@@ -131,7 +152,6 @@ static void serve_status(int fd, ipcam_ring_buffer_t *jpeg_rb)
     if (hn < 0 || hn >= (int)sizeof(hdr)) return;
     safe_write(fd, hdr, (size_t)hn);
     safe_write(fd, buf, (size_t)m);
-    (void)json;
 }
 
 /*
@@ -162,7 +182,12 @@ static void serve_config_get(int fd)
  * 也接受 JSON body（首选；简化为 key":"value 对）。
  * 简化：仅接受 application/x-www-form-urlencoded 与裸 key=value 串。
  */
-static void serve_config_post(int fd, const char *body, size_t body_len)
+/* 解析配置请求；媒体字段必须进入统一控制队列，网络字段保留旧语义。 */
+static void serve_config_post(int fd, const char *body, size_t body_len,
+                              ipcam_record_ctx_t *rec,
+                              ipcam_display_ctx_t *display,
+                              ipcam_screen_ctx_t *screen,
+                              ipcam_control_ctx_t *control)
 {
     int changes = 0, errors = 0;
     char *work = strndup(body, body_len);
@@ -200,33 +225,109 @@ static void serve_config_post(int fd, const char *body, size_t body_len)
         *w = '\0';
 
         int rc = -1;
+        if (rec && (!strcmp(key, "capture_w") || !strcmp(key, "capture_h") ||
+                    !strcmp(key, "target_fps") || !strcmp(key, "mirror_horizontal") ||
+                    !strcmp(key, "mirror_vertical"))) {
+            ipcam_record_status_t rst;
+            ipcam_record_get_status(rec, &rst);
+            if (rst.state == IPCAM_RECORD_STARTING || rst.state == IPCAM_RECORD_RECORDING ||
+                rst.state == IPCAM_RECORD_STOPPING) {
+                MLOGW("config_post: %s rejected while recording\n", key);
+                errors++;
+                continue;
+            }
+        }
+        /* 媒体相关字段统一走控制队列；网络字段仍沿用原有参数入口。 */
+        if (control && (!strcmp(key, "capture_w") || !strcmp(key, "capture_h") ||
+                        !strcmp(key, "target_fps") || !strcmp(key, "jpeg_quality") ||
+                        !strcmp(key, "mirror_horizontal") || !strcmp(key, "mirror_vertical") ||
+                        !strcmp(key, "preview_enabled") || !strcmp(key, "backlight_percent") ||
+                        !strcmp(key, "screen_timeout_min"))) {
+            ipcam_control_command_t cmd;
+            memset(&cmd, 0, sizeof(cmd));
+            if (!strcmp(key, "capture_w")) {
+                cmd.type = IPCAM_CONTROL_SET_VIDEO;
+                cmd.video.width = (uint16_t)atoi(val);
+                cmd.video.height = ipcam_param_get_capture_h();
+                cmd.video.target_fps = ipcam_param_get_target_fps();
+                cmd.video.jpeg_quality = ipcam_param_get_jpeg_quality();
+            } else if (!strcmp(key, "capture_h")) {
+                cmd.type = IPCAM_CONTROL_SET_VIDEO;
+                cmd.video.width = ipcam_param_get_capture_w();
+                cmd.video.height = (uint16_t)atoi(val);
+                cmd.video.target_fps = ipcam_param_get_target_fps();
+                cmd.video.jpeg_quality = ipcam_param_get_jpeg_quality();
+            } else if (!strcmp(key, "target_fps") || !strcmp(key, "jpeg_quality")) {
+                cmd.type = IPCAM_CONTROL_SET_VIDEO;
+                cmd.video.width = ipcam_param_get_capture_w();
+                cmd.video.height = ipcam_param_get_capture_h();
+                cmd.video.target_fps = !strcmp(key, "target_fps") ?
+                                       (uint8_t)atoi(val) : ipcam_param_get_target_fps();
+                cmd.video.jpeg_quality = !strcmp(key, "jpeg_quality") ?
+                                         (uint8_t)atoi(val) : ipcam_param_get_jpeg_quality();
+            } else if (!strcmp(key, "mirror_horizontal") || !strcmp(key, "mirror_vertical")) {
+                cmd.type = IPCAM_CONTROL_SET_MIRROR;
+                cmd.mirror_horizontal = !strcmp(key, "mirror_horizontal") ?
+                                        atoi(val) : ipcam_param_get_mirror_horizontal();
+                cmd.mirror_vertical = !strcmp(key, "mirror_vertical") ?
+                                      atoi(val) : ipcam_param_get_mirror_vertical();
+            } else if (!strcmp(key, "preview_enabled")) {
+                cmd.type = IPCAM_CONTROL_SET_PREVIEW; cmd.enabled = atoi(val) ? 1 : 0;
+            } else if (!strcmp(key, "backlight_percent")) {
+                cmd.type = IPCAM_CONTROL_SET_BACKLIGHT; cmd.percent = atoi(val);
+            } else {
+                cmd.type = IPCAM_CONTROL_SET_SCREEN_TIMEOUT; cmd.timeout_min = atoi(val);
+            }
+            uint64_t request_id = 0;
+            ipcam_control_result_t result;
+            memset(&result, 0, sizeof(result));
+            rc = ipcam_control_submit_command(control, &cmd, &request_id);
+            if (rc == 0 && ipcam_control_get_command_result(control, request_id, &result) == 0)
+                rc = result.state == IPCAM_CONTROL_RESULT_DONE ? 0 : -1;
+            if (rc == 0) {
+                MLOGI("config_post: %s = %s (control request=%llu)\n",
+                      key, val, (unsigned long long)request_id);
+                changes++;
+            } else {
+                MLOGW("config_post: %s = %s rejected by control queue\n", key, val);
+                errors++;
+            }
+            continue;
+        }
         if      (!strcmp(key, "wifi_ssid"))    rc = ipcam_param_set_wifi_ssid(val);
         else if (!strcmp(key, "wifi_psk"))     rc = ipcam_param_set_wifi_psk(val);
         else if (!strcmp(key, "apn"))          rc = ipcam_param_set_apn(val);
         else if (!strcmp(key, "net_mode"))     rc = ipcam_param_set_net_mode((uint8_t)atoi(val));
         else if (!strcmp(key, "capture_w"))    rc = ipcam_param_set_capture_w((uint16_t)atoi(val));
         else if (!strcmp(key, "capture_h"))    rc = ipcam_param_set_capture_h((uint16_t)atoi(val));
-        else if (!strcmp(key, "out_w"))        rc = ipcam_param_set_out_w((uint16_t)atoi(val));
-        else if (!strcmp(key, "out_h"))        rc = ipcam_param_set_out_h((uint16_t)atoi(val));
         else if (!strcmp(key, "jpeg_quality")) rc = ipcam_param_set_jpeg_quality((uint8_t)atoi(val));
         else if (!strcmp(key, "target_fps"))   rc = ipcam_param_set_target_fps((uint8_t)atoi(val));
         else if (!strcmp(key, "http_port"))    rc = ipcam_param_set_http_port((uint16_t)atoi(val));
         else if (!strcmp(key, "log_level"))    rc = ipcam_param_set_log_level((uint8_t)atoi(val));
         else if (!strcmp(key, "http_bind_local")) rc = ipcam_param_set_http_bind_local((uint8_t)atoi(val));
-        else {
-            MLOGW_M(IPCAM_STREAM_LOG_MODULE,
-                    "config_post: unknown key '%s'\n", key);
-            errors++;
-            continue;
+        else if (!strcmp(key, "mirror_horizontal")) rc = ipcam_param_set_mirror_horizontal((uint8_t)atoi(val));
+        else if (!strcmp(key, "mirror_vertical")) rc = ipcam_param_set_mirror_vertical((uint8_t)atoi(val));
+        else if (!strcmp(key, "preview_enabled")) rc = ipcam_param_set_preview_enabled((uint8_t)atoi(val));
+        else if (!strcmp(key, "backlight_percent")) rc = ipcam_param_set_backlight_percent((uint8_t)atoi(val));
+        else if (!strcmp(key, "screen_timeout_min")) rc = ipcam_param_set_screen_timeout_min((uint8_t)atoi(val));
+        else { MLOGW("config_post: unknown key '%s'\n", key); errors++; continue; }
+
+        if (rc == 0 && !strcmp(key, "backlight_percent") && display &&
+            getenv("IPCAM_BACKLIGHT_PATH") &&
+            ipcam_display_set_backlight_percent((int)atoi(val)) != 0) {
+            MLOGW("config_post: backlight hardware rejected\n");
+            rc = -1;
         }
+        if (rc == 0 && screen && !strcmp(key, "backlight_percent"))
+            ipcam_screen_update(screen, (int)atoi(val), ipcam_param_get_screen_timeout_min());
+        if (rc == 0 && screen && !strcmp(key, "screen_timeout_min"))
+            ipcam_screen_update(screen, ipcam_param_get_backlight_percent(), (int)atoi(val));
 
         if (rc == 0) {
-            MLOGI_M(IPCAM_STREAM_LOG_MODULE,
-                    "config_post: %s = %s (saved)\n", key, val);
+            MLOGI("config_post: %s = %s (saved)\n", key, val);
             changes++;
         } else {
-            MLOGW_M(IPCAM_STREAM_LOG_MODULE,
-                    "config_post: %s = %s rejected\n", key, val);
+            MLOGW("config_post: %s = %s rejected\n", key, val);
             errors++;
         }
     }
@@ -244,6 +345,256 @@ static void serve_config_post(int fd, const char *body, size_t body_len)
                       "\r\n", n);
     safe_write(fd, hdr, (size_t)hn);
     safe_write(fd, body_out, (size_t)n);
+}
+
+/* 输出实测能力；硬件节点缺失时明确给出 touch/backlight=false。 */
+static void serve_capabilities(int fd, ipcam_control_ctx_t *control)
+{
+    ipcam_control_capabilities_t caps;
+    memset(&caps, 0, sizeof(caps));
+    if (!control || ipcam_control_get_capabilities(control, &caps) != 0) {
+        const char *e = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+        safe_write(fd, e, strlen(e));
+        return;
+    }
+    char body[512];
+    int n = snprintf(body, sizeof(body),
+        "{\"video\":[{\"width\":%u,\"height\":%u,\"fps\":[%u]}],"
+        "\"jpeg_quality\":{\"min\":%u,\"max\":%u},"
+        "\"mirror\":{\"horizontal\":%s,\"vertical\":%s},"
+        "\"preview_zoom\":{\"min\":%.1f,\"max\":%.1f},"
+        "\"record\":{\"format\":\"mjpeg-avi\",\"segment_seconds\":%u},"
+        "\"touch_points\":%u,\"backlight\":%s,\"light\":%s}\n",
+        caps.video[0].width, caps.video[0].height, caps.video[0].target_fps,
+        caps.jpeg_quality_min, caps.jpeg_quality_max,
+        caps.mirror_horizontal ? "true" : "false", caps.mirror_vertical ? "true" : "false",
+        caps.preview_zoom_min, caps.preview_zoom_max, caps.record_segment_seconds,
+        caps.touch_points, caps.backlight ? "true" : "false",
+        caps.light ? "true" : "false");
+    if (n < 0 || n >= (int)sizeof(body)) return;
+    char hdr[256];
+    int hn = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        "Content-Length: %d\r\nConnection: close\r\n\r\n", n);
+    safe_write(fd, hdr, (size_t)hn); safe_write(fd, body, (size_t)n);
+}
+
+/* 返回录像状态机、分段、重复帧与收尾错误。 */
+static void serve_record_status(int fd, ipcam_record_ctx_t *rec,
+                                ipcam_control_ctx_t *control)
+{
+    ipcam_record_status_t st;
+    memset(&st, 0, sizeof(st));
+    if (rec) ipcam_record_get_status(rec, &st);
+    if (control) {
+        ipcam_control_status_t cst;
+        if (ipcam_control_get_status(control, &cst) == 0) st = cst.record;
+    }
+    char body[640];
+    int n = snprintf(body, sizeof(body),
+        "{\"state\":%d,\"segment_no\":%u,\"frame_count\":%llu,"
+        "\"repeated_frames\":%llu,\"bytes_written\":%llu,"
+        "\"elapsed_ms\":%llu,\"current_file\":\"%s\",\"error\":\"%s\"}\n",
+        (int)st.state, st.segment_no,
+        (unsigned long long)st.frame_count,
+        (unsigned long long)st.repeated_frames,
+        (unsigned long long)st.bytes_written,
+        (unsigned long long)st.elapsed_ms,
+        st.current_file, st.last_error);
+    if (n < 0 || n >= (int)sizeof(body)) n = 0;
+    char hdr[256];
+    int hn = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        "Content-Length: %d\r\nConnection: close\r\n\r\n", n);
+    safe_write(fd, hdr, (size_t)hn); safe_write(fd, body, (size_t)n);
+}
+
+/* 将 start/stop 转为统一控制命令，返回 request_id 供异步状态查询。 */
+static void serve_record_post(int fd, ipcam_record_ctx_t *rec,
+                              ipcam_control_ctx_t *control,
+                              const char *body, size_t body_len)
+{
+    if (!rec) {
+        const char *m = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+        safe_write(fd, m, strlen(m)); return;
+    }
+    char *work = strndup(body, body_len);
+    if (!work) return;
+    char action[32] = "";
+    for (char *p = strtok(work, "&"); p; p = strtok(NULL, "&")) {
+        char *eq = strchr(p, '='); if (!eq) continue; *eq = '\0';
+        if (!strcmp(p, "action")) snprintf(action, sizeof(action), "%s", eq + 1);
+    }
+    int rc = -1;
+    uint64_t request_id = 0;
+    if (control) {
+        ipcam_control_command_t cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = !strcmp(action, "start") ? IPCAM_CONTROL_RECORD_START :
+                   !strcmp(action, "stop") ? IPCAM_CONTROL_RECORD_STOP : 0;
+        if (cmd.type) rc = ipcam_control_submit_command(control, &cmd, &request_id);
+    } else {
+        rc = !strcmp(action, "start") ? ipcam_record_request_start(rec) :
+             !strcmp(action, "stop") ? ipcam_record_request_stop(rec) : -1;
+    }
+    free(work);
+    const char *status = rc == 0 ? "200 OK" : "409 Conflict";
+    char out[160]; int n = snprintf(out, sizeof(out), "{\"ok\":%s,\"request_id\":%llu}\n",
+                                    rc == 0 ? "true" : "false",
+                                    (unsigned long long)request_id);
+    char hdr[256]; int hn = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+        status, n);
+    safe_write(fd, hdr, (size_t)hn); safe_write(fd, out, (size_t)n);
+}
+
+/* 独立拍照命令不复用 snapshot 下载语义，完成 SD 落盘后返回路径。 */
+static void serve_photo_post(int fd, ipcam_record_ctx_t *rec,
+                             ipcam_control_ctx_t *control)
+{
+    char path[256] = "";
+    int rc = -1;
+    uint64_t request_id = 0;
+    if (control) {
+        ipcam_control_command_t cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = IPCAM_CONTROL_PHOTO;
+        rc = ipcam_control_submit_command(control, &cmd, &request_id);
+        if (rc == 0) {
+            ipcam_control_result_t result;
+            if (ipcam_control_get_command_result(control, request_id, &result) == 0) {
+                snprintf(path, sizeof(path), "%s", result.path);
+                rc = result.state == IPCAM_CONTROL_RESULT_DONE ? 0 : -1;
+            }
+        }
+    } else {
+        rc = rec ? ipcam_record_save_photo(rec, path, sizeof(path)) : -1;
+    }
+    char body[384];
+    int n = snprintf(body, sizeof(body), "{\"ok\":%s,\"request_id\":%llu,\"path\":\"%s\"}\n",
+                     rc == 0 ? "true" : "false",
+                     (unsigned long long)request_id, path);
+    char hdr[256];
+    int hn = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+        rc == 0 ? "200 OK" : "409 Conflict", n);
+    safe_write(fd, hdr, (size_t)hn); safe_write(fd, body, (size_t)n);
+}
+
+/* 解析 GUI/调试控制表单，并把媒体操作交给统一控制队列。 */
+static void serve_control_post(int fd, ipcam_stream_ctx_t *ctx,
+                               const char *body, size_t body_len)
+{
+    char *work = strndup(body, body_len);
+    char command[32] = "";
+    int enabled = -1;
+    int mirror_h = -1, mirror_v = -1;
+    float zoom = 1.0f, center_x = 0.5f, center_y = 0.5f;
+    int percent = -1, timeout_min = -1;
+    if (work) {
+        for (char *p = strtok(work, "&"); p; p = strtok(NULL, "&")) {
+            char *eq = strchr(p, '='); if (!eq) continue; *eq = '\0';
+            if (!strcmp(p, "command")) snprintf(command, sizeof(command), "%s", eq + 1);
+            else if (!strcmp(p, "enabled")) enabled = atoi(eq + 1) ? 1 : 0;
+            else if (!strcmp(p, "mirror_horizontal")) mirror_h = atoi(eq + 1) ? 1 : 0;
+            else if (!strcmp(p, "mirror_vertical")) mirror_v = atoi(eq + 1) ? 1 : 0;
+            else if (!strcmp(p, "zoom")) zoom = (float)atof(eq + 1);
+            else if (!strcmp(p, "center_x")) center_x = (float)atof(eq + 1);
+            else if (!strcmp(p, "center_y")) center_y = (float)atof(eq + 1);
+            else if (!strcmp(p, "percent")) percent = atoi(eq + 1);
+            else if (!strcmp(p, "timeout_min")) timeout_min = atoi(eq + 1);
+        }
+        free(work);
+    }
+    int rc = -1;
+    uint64_t request_id = 0;
+    ipcam_control_result_t result;
+    memset(&result, 0, sizeof(result));
+    if (ctx->control) {
+        ipcam_control_command_t cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        if (!strcmp(command, "preview") && enabled >= 0) {
+            cmd.type = IPCAM_CONTROL_SET_PREVIEW;
+            cmd.enabled = enabled;
+        } else if (!strcmp(command, "view")) {
+            cmd.type = IPCAM_CONTROL_SET_VIEW;
+            cmd.enabled = enabled < 0 ? 1 : enabled;
+            cmd.zoom = zoom; cmd.center_x = center_x; cmd.center_y = center_y;
+        } else if (!strcmp(command, "mirror") && mirror_h >= 0 && mirror_v >= 0) {
+            cmd.type = IPCAM_CONTROL_SET_MIRROR;
+            cmd.mirror_horizontal = mirror_h; cmd.mirror_vertical = mirror_v;
+        } else if (!strcmp(command, "backlight") && percent >= 0) {
+            cmd.type = IPCAM_CONTROL_SET_BACKLIGHT; cmd.percent = percent;
+        } else if (!strcmp(command, "light") && percent >= 0) {
+            cmd.type = IPCAM_CONTROL_SET_LIGHT; cmd.percent = percent;
+        } else if (!strcmp(command, "screen_timeout") && timeout_min >= 0) {
+            cmd.type = IPCAM_CONTROL_SET_SCREEN_TIMEOUT; cmd.timeout_min = timeout_min;
+        } else if (!strcmp(command, "record_start")) {
+            cmd.type = IPCAM_CONTROL_RECORD_START;
+        } else if (!strcmp(command, "record_stop")) {
+            cmd.type = IPCAM_CONTROL_RECORD_STOP;
+        } else if (!strcmp(command, "photo")) {
+            cmd.type = IPCAM_CONTROL_PHOTO;
+        }
+        if (cmd.type) {
+            rc = ipcam_control_submit_command(ctx->control, &cmd, &request_id);
+            if (rc == 0 && ipcam_control_get_command_result(ctx->control, request_id, &result) == 0)
+                rc = result.state == IPCAM_CONTROL_RESULT_DONE ? 0 : -1;
+        }
+    } else if (!strcmp(command, "preview") && ctx->display && enabled >= 0) {
+        int old_enabled; float old_zoom, old_x, old_y;
+        ipcam_display_get_view(ctx->display, &old_enabled, &old_zoom, &old_x, &old_y);
+        rc = ipcam_param_set_preview_enabled((uint8_t)enabled);
+        if (rc == 0) rc = ipcam_display_set_view(ctx->display, enabled, old_zoom, old_x, old_y);
+    } else if (!strcmp(command, "view") && ctx->display) {
+        rc = ipcam_display_set_view(ctx->display, enabled < 0 ? 1 : enabled,
+                                    zoom, center_x, center_y);
+    } else if (!strcmp(command, "record_start") && ctx->recorder) {
+        rc = ipcam_record_request_start(ctx->recorder);
+    } else if (!strcmp(command, "record_stop") && ctx->recorder) {
+        rc = ipcam_record_request_stop(ctx->recorder);
+    } else if (!strcmp(command, "photo") && ctx->recorder) {
+        rc = ipcam_record_save_photo(ctx->recorder, NULL, 0);
+    }
+    char out[384]; int n = snprintf(out, sizeof(out),
+        "{\"ok\":%s,\"request_id\":%llu,\"message\":\"%s\",\"path\":\"%s\"}\n",
+        rc == 0 ? "true" : "false", (unsigned long long)request_id,
+        result.message, result.path);
+    char hdr[256]; int hn = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+        rc == 0 ? "200 OK" : "409 Conflict", n);
+    safe_write(fd, hdr, (size_t)hn); safe_write(fd, out, (size_t)n);
+}
+
+/* 查询统一控制队列的请求结果：GET /api/control/result?id=<request_id>。 */
+static void serve_control_result(int fd, ipcam_control_ctx_t *control,
+                                 const char *path)
+{
+    const char *q = strchr(path, '?');
+    uint64_t request_id = 0;
+    if (q) {
+        const char *id = strstr(q + 1, "id=");
+        if (id) request_id = strtoull(id + 3, NULL, 10);
+    }
+    ipcam_control_result_t result;
+    memset(&result, 0, sizeof(result));
+    int rc = control ? ipcam_control_get_command_result(control, request_id, &result) : -1;
+    if (rc != 0) {
+        const char *m = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        safe_write(fd, m, strlen(m));
+        return;
+    }
+    char body[512];
+    int n = snprintf(body, sizeof(body),
+        "{\"request_id\":%llu,\"state\":%d,\"persisted\":%d,"
+        "\"error_code\":%d,\"message\":\"%s\",\"path\":\"%s\"}\n",
+        (unsigned long long)result.request_id, (int)result.state,
+        result.persisted, result.error_code, result.message, result.path);
+    char hdr[256];
+    int hn = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        "Content-Length: %d\r\nConnection: close\r\n\r\n", n);
+    safe_write(fd, hdr, (size_t)hn); safe_write(fd, body, (size_t)n);
 }
 
 static int read_http_request(int fd, char *buf, size_t buf_sz)
@@ -302,35 +653,24 @@ static int read_http_body(int fd, const char *req, int req_len,
 
 static void serve_snapshot(int fd, ipcam_ring_buffer_t *jpeg_rb, pthread_mutex_t *ring_mtx)
 {
-    ipcam_frame_t f;
-    unsigned char *local = NULL;
-    size_t local_cap = 0;
-    size_t frame_size = 0;
-
-    pthread_mutex_lock(ring_mtx);
-    int got = ipcam_ring_get(jpeg_rb, &f);
-    if (got != 0) {
-        pthread_mutex_unlock(ring_mtx);
+    (void)ring_mtx;
+    /* 编码环槽上限目前由 main 按能力值分配；用 1 MiB 上限避免网络线程
+     * 把 ring 槽指针带出生命周期，同时拒绝异常大的压缩帧。 */
+    size_t local_cap = ipcam_ring_capacity(jpeg_rb);
+    unsigned char *local = local_cap ? malloc(local_cap) : NULL;
+    if (!local) {
         const char *e = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
         safe_write(fd, e, strlen(e));
         return;
     }
-
-    /* 拷贝到本地 buffer，脱离 ring */
-    if (f.size > local_cap) {
-        unsigned char *nb = realloc(local, f.size);
-        if (!nb) {
-            ipcam_ring_release(jpeg_rb);
-            pthread_mutex_unlock(ring_mtx);
-            return;
-        }
-        local = nb;
-        local_cap = f.size;
+    ipcam_frame_t f;
+    if (ipcam_ring_copy_latest(jpeg_rb, local, local_cap, &f, 0) != 0) {
+        free(local);
+        const char *e = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+        safe_write(fd, e, strlen(e));
+        return;
     }
-    if (f.size > 0 && f.rawData) memcpy(local, f.rawData, f.size);
-    frame_size = f.size;
-    ipcam_ring_release(jpeg_rb);
-    pthread_mutex_unlock(ring_mtx);
+    size_t frame_size = f.size;
 
     /* 现在独立写 socket（ring 已 release，encode 可继续） */
     char header[256];
@@ -351,7 +691,8 @@ static void serve_snapshot(int fd, ipcam_ring_buffer_t *jpeg_rb, pthread_mutex_t
 }
 
 static void serve_stream(int fd, ipcam_ring_buffer_t *jpeg_rb, pthread_mutex_t *ring_mtx,
-                         volatile sig_atomic_t *running, unsigned long sid)
+                         volatile sig_atomic_t *running,
+                         volatile sig_atomic_t *service_running)
 {
     const char *hdr =
         "HTTP/1.1 200 OK\r\n"
@@ -360,57 +701,27 @@ static void serve_stream(int fd, ipcam_ring_buffer_t *jpeg_rb, pthread_mutex_t *
         "Connection: close\r\n"
         "\r\n";
 
-    if (safe_write(fd, hdr, strlen(hdr)) < 0) {
-        MLOGW_M(IPCAM_STREAM_LOG_MODULE,
-                "stream header write failed sid=%lu\n", sid);
-        return;
-    }
+    if (safe_write(fd, hdr, strlen(hdr)) < 0) return;
 
-    /*
-     * 关键：ring_mtx 只保护 ring_get+ring_release，不在网络 I/O 期间持有。
-     * 否则一个慢客户端会阻塞所有其它 reader（包括 snapshot 和其它 stream）。
-     *
-     * 流程：
-     *   1) 短持锁：get frame + memcpy 到本地缓冲（避免 race）
-     *   2) 释放锁：encode 线程可以继续写下一帧
-     *   3) 无锁：safe_write 把本地缓冲写到 socket（最多 SO_SNDTIMEO 秒）
-     */
-    unsigned char *local = NULL;
-    size_t local_cap = 0;
-    unsigned long frames = 0, report_frames = 0;
-    struct timeval t0, last_report, now;
-    gettimeofday(&t0, NULL);
-    last_report = t0;
+    /* 每个客户端只复制“最新帧”，不消费共享 ring。
+     * 这样慢客户端会自然跳帧，也不会阻塞其它客户端或编码线程。 */
+    (void)ring_mtx;
+    size_t local_cap = ipcam_ring_capacity(jpeg_rb);
+    unsigned char *local = local_cap ? malloc(local_cap) : NULL;
+    if (!local) return;
+    unsigned long last_seq = 0;
 
-    while (*running) {
+    /* 既要响应进程退出，也要响应只停止 HTTP 服务的局部生命周期；
+     * 旧实现只检查 running，main 关闭直播时会因客户端仍在等待新帧而无法收敛。 */
+    while (*running && (!service_running || *service_running)) {
         ipcam_frame_t f;
-        pthread_mutex_lock(ring_mtx);
-        int gr = ipcam_ring_get(jpeg_rb, &f);
+        int gr = ipcam_ring_copy_latest(jpeg_rb, local, local_cap, &f, last_seq);
         if (gr != 0) {
-            pthread_mutex_unlock(ring_mtx);
-            usleep(50 * 1000);
+            usleep(gr < 0 ? 50 * 1000 : 10 * 1000);
             continue;
         }
-
-        /* 拷贝到本地 buffer（脱离 ring） */
-        if (f.size > local_cap) {
-            unsigned char *nb = realloc(local, f.size);
-            if (!nb) {
-                MLOGW_M(IPCAM_STREAM_LOG_MODULE,
-                        "stream buffer realloc failed sid=%lu bytes=%zu\n",
-                        sid, f.size);
-                ipcam_ring_release(jpeg_rb);
-                pthread_mutex_unlock(ring_mtx);
-                usleep(50 * 1000);
-                continue;
-            }
-            local = nb;
-            local_cap = f.size;
-        }
-        if (f.size > 0 && f.rawData) memcpy(local, f.rawData, f.size);
+        last_seq = f.seqNo;
         size_t frame_size = f.size;
-        ipcam_ring_release(jpeg_rb);
-        pthread_mutex_unlock(ring_mtx);
 
         /* 现在独立写 socket（ring 已 release，encode 可继续） */
         char part_hdr[256];
@@ -424,47 +735,12 @@ static void serve_stream(int fd, ipcam_ring_buffer_t *jpeg_rb, pthread_mutex_t *
         if (safe_write(fd, part_hdr, (size_t)hn) < 0) goto cleanup;
         if (frame_size > 0 && safe_write(fd, local, frame_size) < 0) goto cleanup;
         if (safe_write(fd, "\r\n", 2) < 0) goto cleanup;
-
-        frames++;
-        /* 首个 JPEG 到达客户端时记录实际序号和大小，便于区分“服务已监听”和“已出图”。 */
-        if (frames == 1) {
-            MLOGI_M(IPCAM_STREAM_LOG_MODULE,
-                    "stream first frame sid=%lu seq=%lu bytes=%zu\n",
-                    sid, f.seqNo, frame_size);
-        }
-
-        /* 慢客户端或网络异常时，周期统计能显示该会话是否持续收到 JPEG。 */
-        gettimeofday(&now, NULL);
-        double report_sec = (now.tv_sec - last_report.tv_sec) +
-                            (now.tv_usec - last_report.tv_usec) / 1e6;
-        if (report_sec >= 5.0) {
-            unsigned long interval_frames = frames - report_frames;
-            MLOGI_M(IPCAM_STREAM_LOG_MODULE,
-                    "stream stats sid=%lu interval=%.1fs fps=%.1f frames=%lu rb=%d\n",
-                    sid, report_sec,
-                    report_sec > 0 ? interval_frames / report_sec : 0,
-                    frames, ipcam_ring_count(jpeg_rb));
-            last_report = now;
-            report_frames = frames;
-        }
         continue;
 cleanup:
-        gettimeofday(&now, NULL);
-        double sec = (now.tv_sec - t0.tv_sec) +
-                     (now.tv_usec - t0.tv_usec) / 1e6;
-        MLOGI_M(IPCAM_STREAM_LOG_MODULE,
-                "stream worker exit sid=%lu frames=%lu avg_fps=%.1f\n",
-                sid, frames, sec > 0 ? frames / sec : 0);
         free(local);
         return;
     }
 
-    gettimeofday(&now, NULL);
-    double sec = (now.tv_sec - t0.tv_sec) +
-                 (now.tv_usec - t0.tv_usec) / 1e6;
-    MLOGI_M(IPCAM_STREAM_LOG_MODULE,
-            "stream worker exit sid=%lu frames=%lu avg_fps=%.1f\n",
-            sid, frames, sec > 0 ? frames / sec : 0);
     free(local);
 }
 
@@ -545,29 +821,17 @@ static void serve_version(int fd)
 }
 
 /* === /healthz (GET) → 用于 init.d 回滚看门狗 === */
-static void serve_healthz(int fd, ipcam_stream_ctx_t *ctx)
+static void serve_healthz(int fd)
 {
-    int running = ctx && ctx->running && *ctx->running;
-    int closed = !ctx || !ctx->jpeg_rb || ipcam_ring_is_closed(ctx->jpeg_rb);
-    int queue_count = (ctx && ctx->jpeg_rb) ? ipcam_ring_count(ctx->jpeg_rb) : 0;
-    int ok = running && !closed;
-    char body[160];
-    int body_len = snprintf(body, sizeof(body),
-                            "{\"ok\":%s,\"running\":%s,\"jpeg_queue\":%d}\n",
-                            ok ? "true" : "false",
-                            running ? "true" : "false",
-                            queue_count);
-    if (body_len < 0 || body_len >= (int)sizeof(body)) return;
+    const char *body = "{\"ok\":true}\n";
     char hdr[256];
     int hn = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 %s\r\n"
+        "HTTP/1.1 200 OK\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: %zu\r\n"
-        "Connection: close\r\n\r\n",
-        ok ? "200 OK" : "503 Service Unavailable", (size_t)body_len);
-    if (hn < 0 || hn >= (int)sizeof(hdr)) return;
+        "Connection: close\r\n\r\n", strlen(body));
     safe_write(fd, hdr, (size_t)hn);
-    safe_write(fd, body, (size_t)body_len);
+    safe_write(fd, body, strlen(body));
 }
 
 /* === /api/ota (GET) === */
@@ -642,8 +906,7 @@ static void serve_ota_post(int fd, const char *body, size_t body_len)
         return;
     }
 
-    MLOGI_M(IPCAM_STREAM_LOG_MODULE,
-            "api POST /api/ota url=%s sha256=%s\n", url, sha);
+    MLOGI("api POST /api/ota url=%s sha256=%s\n", url, sha);
     ipcam_ota_result_t r;
     memset(&r, 0, sizeof(r));
     int rc = ipcam_ota_from_url(url, sha[0] ? sha : NULL, &r);
@@ -694,6 +957,7 @@ static void handle_client(int fd, ipcam_ring_buffer_t *jpeg_rb, ipcam_stream_ctx
 
     int req_len = read_http_request(fd, req, sizeof(req));
     if (req_len <= 0) {
+        close(fd);
         return;
     }
 
@@ -714,21 +978,30 @@ static void handle_client(int fd, ipcam_ring_buffer_t *jpeg_rb, ipcam_stream_ctx
         serve_index(fd);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/stream.mjpg") == 0) {
         unsigned long sid = next_session_id();
-        MLOGI_M(IPCAM_STREAM_LOG_MODULE,
-                "stream session start sid=%lu path=%s\n", sid, path);
-        serve_stream(fd, jpeg_rb, &ctx->ring_mtx, ctx->running, sid);
-        MLOGI_M(IPCAM_STREAM_LOG_MODULE, "stream session end   sid=%lu\n", sid);
+        MLOGI("stream session start sid=%lu path=%s\n", sid, path);
+        serve_stream(fd, jpeg_rb, &ctx->ring_mtx, ctx->running,
+                     &ctx->service_running);
+        MLOGI("stream session end   sid=%lu\n", sid);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/snapshot.jpg") == 0) {
         serve_snapshot(fd, jpeg_rb, &ctx->ring_mtx);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/status") == 0) {
-        serve_status(fd, jpeg_rb);
+        serve_status(fd, jpeg_rb, ctx->recorder, ctx->control);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/capabilities") == 0) {
+        serve_capabilities(fd, ctx->control);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/record") == 0) {
+        serve_record_status(fd, ctx->recorder, ctx->control);
+    } else if (strcmp(method, "GET") == 0 &&
+               strncmp(path, "/api/control/result", strlen("/api/control/result")) == 0 &&
+               (path[strlen("/api/control/result")] == '\0' ||
+                path[strlen("/api/control/result")] == '?')) {
+        serve_control_result(fd, ctx->control, path);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/config") == 0) {
-        MLOGI_M(IPCAM_STREAM_LOG_MODULE, "api GET /api/config\n");
+        MLOGI("api GET /api/config\n");
         serve_config_get(fd);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/version") == 0) {
         serve_version(fd);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/healthz") == 0) {
-        serve_healthz(fd, ctx);
+        serve_healthz(fd);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/ota") == 0) {
         serve_ota_status(fd);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/ota") == 0) {
@@ -745,6 +1018,18 @@ static void handle_client(int fd, ipcam_ring_buffer_t *jpeg_rb, ipcam_stream_ctx
         }
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/reboot") == 0) {
         serve_reboot_post(fd);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/photo") == 0) {
+        serve_photo_post(fd, ctx->recorder, ctx->control);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/control") == 0) {
+        int content_len = get_content_length(req);
+        char *body = NULL;
+        if (read_http_body(fd, req, req_len, content_len, &body) != 0) {
+            const char *m = "HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n";
+            safe_write(fd, m, strlen(m));
+        } else {
+            serve_control_post(fd, ctx, body, (size_t)content_len);
+            free(body);
+        }
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/config") == 0) {
         int content_len = get_content_length(req);
         char *body = NULL;
@@ -754,9 +1039,19 @@ static void handle_client(int fd, ipcam_ring_buffer_t *jpeg_rb, ipcam_stream_ctx
                 : "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
             safe_write(fd, m, strlen(m));
         } else {
-            MLOGI_M(IPCAM_STREAM_LOG_MODULE,
-                    "api POST /api/config (%d bytes)\n", content_len);
-            serve_config_post(fd, body, (size_t)content_len);
+            MLOGI("api POST /api/config (%d bytes)\n", content_len);
+            serve_config_post(fd, body, (size_t)content_len, ctx->recorder, ctx->display,
+                              ctx->screen, ctx->control);
+            free(body);
+        }
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/record") == 0) {
+        int content_len = get_content_length(req);
+        char *body = NULL;
+        if (read_http_body(fd, req, req_len, content_len, &body) != 0) {
+            const char *m = "HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n";
+            safe_write(fd, m, strlen(m));
+        } else {
+            serve_record_post(fd, ctx->recorder, ctx->control, body, (size_t)content_len);
             free(body);
         }
     } else {
@@ -764,27 +1059,17 @@ static void handle_client(int fd, ipcam_ring_buffer_t *jpeg_rb, ipcam_stream_ctx
         safe_write(fd, m, strlen(m));
     }
 
+    close(fd);
 }
 
 static void *client_thread(void *arg)
 {
     ipcam_stream_client_arg_t *a = arg;
-    ipcam_stream_ctx_t *ctx = a->ctx;
     handle_client(a->cfd, a->jpeg_rb, a->ctx);
 
-    /*
-     * socket 的最终 close 由拥有该 fd 的客户端线程执行；stop 只做
-     * shutdown 来唤醒网络 I/O，避免两个线程同时 close 后 fd 号码被复用。
-     */
-    close(a->cfd);
-
-    pthread_mutex_lock(&ctx->client_mtx);
-    if (a->slot >= 0 && a->slot < IPCAM_MAX_TRACKED_CLIENTS) {
-        ctx->client_fds[a->slot] = -1;
-    }
-    if (ctx->client_cnt > 0) ctx->client_cnt--;
-    pthread_cond_broadcast(&ctx->client_cond);
-    pthread_mutex_unlock(&ctx->client_mtx);
+    pthread_mutex_lock(&a->ctx->client_mtx);
+    a->ctx->client_cnt--;
+    pthread_mutex_unlock(&a->ctx->client_mtx);
 
     free(a);
     return NULL;
@@ -793,62 +1078,38 @@ static void *client_thread(void *arg)
 static int acquire_client_slot(ipcam_stream_ctx_t *ctx)
 {
     pthread_mutex_lock(&ctx->client_mtx);
-    int max_clients = IPCAM_MAX_TRACKED_CLIENTS;  /* 受 client_fds[] 容量限制 */
+    int max_clients = IPCAM_MAX_TRACKED_CLIENTS;  /* 受 client_threads[] 容量限制 */
     const char *e = getenv("IPCAM_HTTP_MAX_CLIENTS");
     if (e && *e) {
         int v = atoi(e);
         if (v > 0 && v <= IPCAM_MAX_TRACKED_CLIENTS) max_clients = v;
     }
-    int slot = -1;
-    if (ctx->client_cnt < max_clients) {
-        for (int i = 0; i < IPCAM_MAX_TRACKED_CLIENTS; i++) {
-            if (ctx->client_fds[i] == -1) {
-                /* -2 表示已预留但尚未把真实 fd 写入槽位。 */
-                ctx->client_fds[i] = -2;
-                ctx->client_cnt++;
-                slot = i;
-                break;
-            }
-        }
-    }
+    int ok = ctx->client_cnt < max_clients;
+    if (ok) ctx->client_cnt++;
     pthread_mutex_unlock(&ctx->client_mtx);
-    return slot;
-}
-
-static void release_client_slot(ipcam_stream_ctx_t *ctx, int slot)
-{
-    if (slot < 0 || slot >= IPCAM_MAX_TRACKED_CLIENTS) return;
-
-    pthread_mutex_lock(&ctx->client_mtx);
-    if (ctx->client_fds[slot] >= 0) close(ctx->client_fds[slot]);
-    ctx->client_fds[slot] = -1;
-    if (ctx->client_cnt > 0) ctx->client_cnt--;
-    pthread_cond_broadcast(&ctx->client_cond);
-    pthread_mutex_unlock(&ctx->client_mtx);
+    return ok ? 0 : -1;
 }
 
 static void *accept_loop(void *arg)
 {
     ipcam_stream_ctx_t *ctx = arg;
 
-    while (*ctx->running) {
+    while (*ctx->running && ctx->service_running) {
         struct sockaddr_in cli_addr;
         socklen_t addrlen = sizeof(cli_addr);
         int cfd = accept(ctx->listen_fd, (struct sockaddr *)&cli_addr, &addrlen);
         if (cfd < 0) {
             if (errno == EINTR) continue;
-            if (!*ctx->running) break;
-            MLOGE_M(IPCAM_STREAM_LOG_MODULE, "accept: %s\n", strerror(errno));
+            if (!*ctx->running || !ctx->service_running) break;
+            MLOGE("accept: %s\n", strerror(errno));
             usleep(100 * 1000);
             continue;
         }
 
-        int slot = acquire_client_slot(ctx);
-        if (slot < 0) {
+        if (acquire_client_slot(ctx) != 0) {
             char ipbuf[32];
             inet_ntop(AF_INET, &cli_addr.sin_addr, ipbuf, sizeof(ipbuf));
-            MLOGW_M(IPCAM_STREAM_LOG_MODULE,
-                  "reject client %s:%d (max reached)\n",
+            MLOGW("reject client %s:%d (max reached)\n",
                   ipbuf, ntohs(cli_addr.sin_port));
             const char *m = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
             safe_write(cfd, m, strlen(m));
@@ -856,24 +1117,18 @@ static void *accept_loop(void *arg)
             continue;
         }
 
-        pthread_mutex_lock(&ctx->client_mtx);
-        ctx->client_fds[slot] = cfd;
-        int active_clients = ctx->client_cnt;
-        pthread_mutex_unlock(&ctx->client_mtx);
-
         char ipbuf[32];
         inet_ntop(AF_INET, &cli_addr.sin_addr, ipbuf, sizeof(ipbuf));
-        MLOGI_M(IPCAM_STREAM_LOG_MODULE,
-              "client %s:%d connected (active=%d)\n",
-              ipbuf, ntohs(cli_addr.sin_port), active_clients);
+        MLOGI("client %s:%d connected (active=%d)\n",
+              ipbuf, ntohs(cli_addr.sin_port), ctx->client_cnt);
 
         ipcam_stream_client_arg_t *a = malloc(sizeof(*a));
         if (!a) {
-            release_client_slot(ctx, slot);
+            close(cfd);
+            pthread_mutex_lock(&ctx->client_mtx); ctx->client_cnt--; pthread_mutex_unlock(&ctx->client_mtx);
             continue;
         }
         a->cfd = cfd;
-        a->slot = slot;
         a->jpeg_rb = ctx->jpeg_rb;
         a->ctx = ctx;
 
@@ -883,40 +1138,40 @@ static void *accept_loop(void *arg)
 
         pthread_t t;
         if (pthread_create(&t, NULL, client_thread, a) != 0) {
-            MLOGE_M(IPCAM_STREAM_LOG_MODULE, "pthread_create client\n");
+            MLOGE("pthread_create client\n");
+            close(cfd);
             free(a);
-            release_client_slot(ctx, slot);
+            pthread_mutex_lock(&ctx->client_mtx); ctx->client_cnt--; pthread_mutex_unlock(&ctx->client_mtx);
             continue;
         }
-        /*
-         * 客户端线程继续使用 detached 模式，但 stop 会先 shutdown 所有
-         * 客户端 fd，再用条件变量等到 client_cnt=0，保证 ctx 和锁销毁时
-         * 不再有客户端线程访问它们。
-         */
+        /* 分离客户端线程，结束后由系统回收；stop 侧轮询 client_cnt 等待排空 */
         pthread_detach(t);
     }
     return NULL;
 }
 
-int ipcam_stream_start(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
-                       volatile sig_atomic_t *running)
+/* 创建监听线程；control 在创建前注入，避免首个 HTTP 客户端绕过控制队列。 */
+int ipcam_stream_start_ex(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
+                          volatile sig_atomic_t *running,
+                          ipcam_control_ctx_t *control)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->jpeg_rb = jpeg_rb;
+    ctx->control = control;
+    /* 启动 accept 线程前复制可选服务引用，避免首个客户端抢在 main 的
+     * setter 之后访问时看到空 recorder/display。后续 setter 仅用于兼容旧调用方。 */
+    if (control) {
+        ctx->recorder = control->recorder;
+        ctx->display = control->display;
+        ctx->screen = control->screen;
+    }
     ctx->running = running;
+    ctx->service_running = 1;
     ctx->port = ipcam_param_get_http_port();  /* BCF2 风格：port 从 param 取 */
     ctx->listen_fd = -1;
-    if (pthread_mutex_init(&ctx->client_mtx, NULL) != 0) return -1;
-    if (pthread_mutex_init(&ctx->ring_mtx, NULL) != 0) {
-        pthread_mutex_destroy(&ctx->client_mtx);
-        return -1;
-    }
-    if (pthread_cond_init(&ctx->client_cond, NULL) != 0) {
-        pthread_mutex_destroy(&ctx->ring_mtx);
-        pthread_mutex_destroy(&ctx->client_mtx);
-        return -1;
-    }
-    for (int i = 0; i < IPCAM_MAX_TRACKED_CLIENTS; i++) ctx->client_fds[i] = -1;
+    pthread_mutex_init(&ctx->client_mtx, NULL);
+    pthread_mutex_init(&ctx->ring_mtx, NULL);
+    for (int i = 0; i < IPCAM_MAX_TRACKED_CLIENTS; i++) ctx->client_threads[i] = 0;
 
     /* 默认绑 127.0.0.1；IPCAM_HTTP_BIND 可覆盖（"0.0.0.0" 暴露给全网） */
     const char *bind_ip = getenv("IPCAM_HTTP_BIND");
@@ -926,8 +1181,9 @@ int ipcam_stream_start(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
 
     ctx->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (ctx->listen_fd < 0) {
-        MLOGE_M(IPCAM_STREAM_LOG_MODULE, "socket: %s\n", strerror(errno));
-        stream_destroy_sync(ctx);
+        MLOGE("socket: %s\n", strerror(errno));
+        pthread_mutex_destroy(&ctx->ring_mtx);
+        pthread_mutex_destroy(&ctx->client_mtx);
         return -1;
     }
     int yes = 1;
@@ -940,46 +1196,79 @@ int ipcam_stream_start(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
     addr.sin_family = AF_INET;
     addr.sin_port = htons(ctx->port);
     if (inet_pton(AF_INET, bind_ip, &addr.sin_addr) != 1) {
-        MLOGE_M(IPCAM_STREAM_LOG_MODULE, "invalid bind ip: %s\n", bind_ip);
+        MLOGE("invalid bind ip: %s\n", bind_ip);
         close(ctx->listen_fd);
         ctx->listen_fd = -1;
-        stream_destroy_sync(ctx);
+        pthread_mutex_destroy(&ctx->ring_mtx);
+        pthread_mutex_destroy(&ctx->client_mtx);
         return -1;
     }
     if (bind(ctx->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        MLOGE_M(IPCAM_STREAM_LOG_MODULE,
-              "bind %s:%d: %s\n", bind_ip, ctx->port, strerror(errno));
+        MLOGE("bind %s:%d: %s\n", bind_ip, ctx->port, strerror(errno));
         close(ctx->listen_fd);
         ctx->listen_fd = -1;
-        stream_destroy_sync(ctx);
+        pthread_mutex_destroy(&ctx->ring_mtx);
+        pthread_mutex_destroy(&ctx->client_mtx);
         return -1;
     }
     if (listen(ctx->listen_fd, BACKLOG) < 0) {
-        MLOGE_M(IPCAM_STREAM_LOG_MODULE, "listen: %s\n", strerror(errno));
+        MLOGE("listen: %s\n", strerror(errno));
         close(ctx->listen_fd);
         ctx->listen_fd = -1;
-        stream_destroy_sync(ctx);
+        pthread_mutex_destroy(&ctx->ring_mtx);
+        pthread_mutex_destroy(&ctx->client_mtx);
         return -1;
     }
-    MLOGI_M(IPCAM_STREAM_LOG_MODULE,
-          "HTTP MJPEG server listening on %s:%d (max_clients=%d)\n",
+    MLOGI("HTTP MJPEG server listening on %s:%d (max_clients=%d)\n",
           bind_ip, ctx->port, IPCAM_MAX_TRACKED_CLIENTS);
 
     if (pthread_create(&ctx->thread, NULL, accept_loop, ctx) != 0) {
-        MLOGE_M(IPCAM_STREAM_LOG_MODULE, "pthread_create accept\n");
+        MLOGE("pthread_create accept\n");
         close(ctx->listen_fd);
         ctx->listen_fd = -1;
-        stream_destroy_sync(ctx);
+        pthread_mutex_destroy(&ctx->ring_mtx);
+        pthread_mutex_destroy(&ctx->client_mtx);
         return -1;
     }
     return 0;
 }
 
+/* 兼容旧调用方：不注入控制器时仍可只启动直播。 */
+int ipcam_stream_start(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
+                       volatile sig_atomic_t *running)
+{
+    return ipcam_stream_start_ex(ctx, jpeg_rb, running, NULL);
+}
+
+/* 兼容旧启动流程注入录像服务；HTTP 线程只读取该引用，不接管录像生命周期。 */
+void ipcam_stream_set_recorder(ipcam_stream_ctx_t *ctx, ipcam_record_ctx_t *recorder)
+{
+    if (ctx) ctx->recorder = recorder;
+}
+
+/* HTTP 只保存控制器引用，实际校验与状态变更统一交给控制队列。 */
+void ipcam_stream_set_control(ipcam_stream_ctx_t *ctx, ipcam_control_ctx_t *control)
+{
+    if (ctx) ctx->control = control;
+}
+
+/* 注入本地显示引用，供视口和预览状态查询；不会直接操作 framebuffer。 */
+void ipcam_stream_set_display(ipcam_stream_ctx_t *ctx, ipcam_display_ctx_t *display)
+{
+    if (ctx) ctx->display = display;
+}
+
+/* 注入熄屏服务引用，配置入口可据此同步背光计时状态。 */
+void ipcam_stream_set_screen(ipcam_stream_ctx_t *ctx, ipcam_screen_ctx_t *screen)
+{
+    if (ctx) ctx->screen = screen;
+}
+
 void ipcam_stream_stop(ipcam_stream_ctx_t *ctx)
 {
     if (!ctx) return;
-    if (ctx->running) *ctx->running = 0;
-
+    /* 只关闭 HTTP 服务；采集、编码和录像由各自的生命周期管理。 */
+    ctx->service_running = 0;
     /* 关 listen_fd 让 accept() 立刻失败退出 */
     if (ctx->listen_fd >= 0) {
         shutdown(ctx->listen_fd, SHUT_RDWR);
@@ -992,28 +1281,18 @@ void ipcam_stream_stop(ipcam_stream_ctx_t *ctx)
         ctx->thread = 0;
     }
 
-    /*
-     * detached 线程没有 join 句柄，因此先 shutdown 它们的 socket，
-     * 再无超时等待计数归零。超时后直接销毁锁会让客户端收尾路径访问
-     * 已失效的 ctx；条件变量等待保证销毁同步对象前线程已经退出。
-     */
-    pthread_mutex_lock(&ctx->client_mtx);
-    for (int i = 0; i < IPCAM_MAX_TRACKED_CLIENTS; i++) {
-        if (ctx->client_fds[i] >= 0) shutdown(ctx->client_fds[i], SHUT_RDWR);
+    /* 客户端线程已 detach；ring 关闭后它们会退出，此处等待 client_cnt 降为 0 */
+    unsigned waited = 0;
+    for (;;) {
+        pthread_mutex_lock(&ctx->client_mtx);
+        int n = ctx->client_cnt;
+        pthread_mutex_unlock(&ctx->client_mtx);
+        if (n <= 0) break;
+        if (++waited % 50 == 0)
+            MLOGW("waiting for %d HTTP client(s) to drain\n", n);
+        usleep(100 * 1000);
     }
-    pthread_mutex_unlock(&ctx->client_mtx);
 
-    /*
-     * ring_close 唤醒正在等待下一帧的 client；main.c 可能已经提前关闭，
-     * 这里重复调用是幂等的，且发生在 accept loop 停止、客户端 fd 已 shutdown 之后。
-     */
-    if (ctx->jpeg_rb) ipcam_ring_close(ctx->jpeg_rb);
-
-    pthread_mutex_lock(&ctx->client_mtx);
-    while (ctx->client_cnt > 0) {
-        pthread_cond_wait(&ctx->client_cond, &ctx->client_mtx);
-    }
-    pthread_mutex_unlock(&ctx->client_mtx);
-
-    stream_destroy_sync(ctx);
+    pthread_mutex_destroy(&ctx->ring_mtx);
+    pthread_mutex_destroy(&ctx->client_mtx);
 }

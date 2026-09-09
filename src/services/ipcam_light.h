@@ -1,43 +1,21 @@
 #ifndef IPCAM_LIGHT_H
 #define IPCAM_LIGHT_H
 
-#include <stdint.h>
+/*
+ * 板级补光适配层。
+ *
+ * 板端实际可能使用 LED class 的 brightness 节点，也可能由其它驱动导出
+ * 一个可写的亮度节点；本模块只接受环境变量 IPCAM_LIGHT_PATH 指定的节点，
+ * 不猜测 GPIO 编号。补光属于临时状态，不写入 ipcam_param。
+ */
 
-#define IPCAM_LIGHT_ENDPOINT_MAX 192
+/* 返回当前板级补光节点是否可写。 */
+int ipcam_light_available(void);
 
-typedef enum ipcam_light_backend_e {
-    IPCAM_LIGHT_BACKEND_NONE = 0,
-    IPCAM_LIGHT_BACKEND_V4L2,
-    IPCAM_LIGHT_BACKEND_SYSFS
-} ipcam_light_backend_t;
+/* 写入 0～100 的补光百分比；只有写入并关闭成功才更新内存状态。 */
+int ipcam_light_set_percent(int percent);
 
-typedef struct ipcam_light_ctx_s {
-    int video_fd;                    /* 借用 capture 的摄像头 fd，不在此处关闭 */
-    int sysfs_fd;                    /* 可选 LED class brightness fd */
-    int auto_enabled;
-    int state_on;
-    ipcam_light_backend_t backend;
-    char endpoint[IPCAM_LIGHT_ENDPOINT_MAX];
-    unsigned int dark_streak;
-    unsigned int bright_streak;
-    uint64_t last_transition_us;      /* 上次成功切换或失败重试时间 */
-    unsigned long set_errors;
-} ipcam_light_ctx_t;
-
-/* 初始化控制后端；未发现安全后端时返回 0，但状态保持不可用。 */
-int ipcam_light_init(ipcam_light_ctx_t *ctx, int video_fd);
-
-/* 用一帧的平均亮度驱动带滞回和去抖的自动点灯状态机。 */
-void ipcam_light_update(ipcam_light_ctx_t *ctx, unsigned int average_y,
-                        uint64_t now_us);
-
-/* 退出采集前强制关灯，避免应用异常停止后白光持续点亮。 */
-void ipcam_light_force_off(ipcam_light_ctx_t *ctx);
-
-/* 释放可选的 LED class fd，并保证灯关闭。 */
-void ipcam_light_deinit(ipcam_light_ctx_t *ctx);
-
-const char *ipcam_light_backend_name(const ipcam_light_ctx_t *ctx);
-const char *ipcam_light_state_name(const ipcam_light_ctx_t *ctx);
+/* 返回最近一次成功写入的补光百分比，默认 0（开机关闭补光）。 */
+int ipcam_light_get_percent(void);
 
 #endif /* IPCAM_LIGHT_H */
