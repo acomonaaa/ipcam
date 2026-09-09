@@ -1,7 +1,6 @@
 #define _GNU_SOURCE
 #include "ipcam_display.h"
 #include "ipcam_log.h"
-#include "ipcam_param.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -13,7 +12,6 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/time.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include "ipcam_config.h"
@@ -39,23 +37,17 @@ static inline unsigned short yuyv_to_rgb565(int y, int u, int v)
  * 用 finfo.line_length 作 stride；fb_bpp 必须 = 16。
  * src_w 必须 >= 2（YUYV 是 4:2:2 packed，每两像素一个 Cb/Cr）。
  */
-/* 依据视口和独立翻转选样，只写目标 framebuffer 区域，不改网络/录像帧。 */
 static void yuyv_to_rgb565_scaled(const unsigned char *src, int sw, int sh,
                                   unsigned short *dst, int dw, int dh,
-                                  int dst_stride_pixels,
-                                  size_t src_stride,
-                                  int crop_x, int crop_y, int crop_w, int crop_h,
-                                  int mirror_h, int mirror_v)
+                                  int dst_stride_pixels)
 {
     if (sw < 2) return;  /* YUYV 4:2:2 需要至少 2 像素宽 */
     for (int dy = 0; dy < dh; dy++) {
-        int cy = dy * crop_h / dh;
-        int sy = mirror_v ? (crop_y + crop_h - 1 - cy) : (crop_y + cy);
-        const unsigned char *src_row = src + (size_t)sy * src_stride;
+        int sy = dy * sh / dh;
+        const unsigned char *src_row = src + (size_t)sy * sw * 2;
         unsigned short *dst_row = dst + (size_t)dy * dst_stride_pixels;
         for (int dx = 0; dx < dw; dx++) {
-            int cx = dx * crop_w / dw;
-            int sx = mirror_h ? (crop_x + crop_w - 1 - cx) : (crop_x + cx);
+            int sx = dx * sw / dw;
             /* YUYV 每两像素一对 (Cb, Cr)；sx 必须偶数对齐 */
             int sx0 = sx & ~1;
             /* clamp 到 sw-2，避免 sx==sw-1 时 +2/+3 越界到下一行 */
@@ -71,17 +63,14 @@ static void yuyv_to_rgb565_scaled(const unsigned char *src, int sw, int sh,
     }
 }
 
-/* 打开并核验 framebuffer；实际节点由板级环境变量提供，失败只停本地预览。 */
 static int display_open_fb(ipcam_display_ctx_t *ctx)
 {
     struct fb_var_screeninfo vinfo;
     struct fb_fix_screeninfo finfo;
 
-    const char *fb_dev = getenv("IPCAM_FB_DEV");
-    if (!fb_dev || !*fb_dev) fb_dev = IPCAM_FB_DEV;
-    ctx->fb_fd = open(fb_dev, O_RDWR);
+    ctx->fb_fd = open(IPCAM_FB_DEV, O_RDWR);
     if (ctx->fb_fd < 0) {
-        MLOGE("open %s: %s\n", fb_dev, strerror(errno));
+        MLOGE("open %s: %s\n", IPCAM_FB_DEV, strerror(errno));
         return -1;
     }
     if (ioctl(ctx->fb_fd, FBIOGET_VSCREENINFO, &vinfo) < 0) {
@@ -117,13 +106,6 @@ static int display_open_fb(ipcam_display_ctx_t *ctx)
         ctx->fb_fd = -1;
         return -1;
     }
-    if (ctx->fb_size < (size_t)ctx->fb_line_length * (size_t)ctx->fb_h) {
-        MLOGE("fb memory=%zu below line_length*height=%zu\n", ctx->fb_size,
-              (size_t)ctx->fb_line_length * (size_t)ctx->fb_h);
-        close(ctx->fb_fd);
-        ctx->fb_fd = -1;
-        return -1;
-    }
 
     ctx->fb_base = mmap(NULL, ctx->fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->fb_fd, 0);
     if (ctx->fb_base == MAP_FAILED) {
@@ -144,132 +126,48 @@ static int display_open_fb(ipcam_display_ctx_t *ctx)
     return 0;
 }
 
-/* 只读取显示专用最新帧副本；关闭预览/熄屏时停止转换，避免拖慢编码链路。 */
 static void *display_thread(void *arg)
 {
     ipcam_display_ctx_t *ctx = arg;
     ipcam_frame_t frame;
     unsigned long frames = 0;
     struct timeval t0, t1;
-    size_t src_cap = ipcam_ring_capacity(ctx->rb);
-    unsigned char *src_copy = src_cap ? malloc(src_cap) : NULL;
-    if (!src_copy) {
-        MLOGE("alloc display source copy failed (%zu bytes)\n", src_cap);
-        return NULL;
-    }
+    int dst_stride_pixels = ctx->fb_line_length / 2;  /* 16bpp = 2 bytes/pixel */
+
     MLOGI("display thread start, out=%dx%d\n", ctx->out_w, ctx->out_h);
     gettimeofday(&t0, NULL);
 
-    int last_enabled = -1;
-    unsigned long last_seq = 0;
-    while (*ctx->running && ctx->service_running) {
-        int enabled;
-        float zoom, center_x, center_y;
-        pthread_mutex_lock(&ctx->view_mtx);
-        enabled = ctx->view_enabled && !ctx->screen_paused &&
-                  ipcam_param_get_preview_enabled();
-        zoom = ctx->zoom;
-        center_x = ctx->center_x;
-        center_y = ctx->center_y;
-        pthread_mutex_unlock(&ctx->view_mtx);
-        if (!enabled) {
-            /* 预览关闭/熄屏时不复制或转换 YUYV；只在状态边沿清一次屏。 */
-            if (last_enabled != 0) memset(ctx->fb_base, 0, ctx->fb_size);
-            pthread_mutex_lock(&ctx->preview_mtx);
-            ctx->preview_valid = 0;
-            pthread_mutex_unlock(&ctx->preview_mtx);
-            last_enabled = 0;
-            usleep(50 * 1000);
-            continue;
-        }
-        last_enabled = 1;
-
-        int latest_rc = ipcam_ring_copy_latest(ctx->rb, src_copy, src_cap,
-                                               &frame, last_seq);
-        if (latest_rc != 0) {
-            /* copy_latest 是非阻塞查询；短暂让出 CPU，避免无帧时忙等。 */
-            usleep(latest_rc < 0 ? 50 * 1000 : 10 * 1000);
-            continue;
-        }
-        last_seq = frame.seqNo;
-        frame.rawData = src_copy;
+    while (*ctx->running) {
+        if (ipcam_ring_get(ctx->rb, &frame) != 0) break;
 
         /*
          * src 宽高由 capture 协商结果传入（ctx->src_w / src_h）。
-         * V4L2 的 bytesperline 可能带行尾 padding，不能再用
-         * src_w*src_h*2 做精确比较；只要完整覆盖 stride*height 即可安全读取。
+         * frame.size 应 == src_w * src_h * 2；不一致则丢弃并警告。
          */
         int src_w = ctx->src_w;
         int src_h = ctx->src_h;
-        size_t src_stride = frame.stride ? frame.stride : (size_t)src_w * 2;
-        size_t expected = src_stride * (size_t)src_h;
-        if (src_stride < (size_t)src_w * 2 || frame.size < expected) {
-            MLOGW("frame size %zu/stride %zu invalid for %dx%d (%zu), skip\n",
-                  frame.size, src_stride, src_w, src_h, expected);
+        size_t expected = (size_t)src_w * src_h * 2;
+        if (frame.size != expected) {
+            MLOGW("frame size %zu != %d*%d*2 (%zu), skip\n",
+                  frame.size, src_w, src_h, expected);
+            ipcam_ring_release(ctx->rb);
             continue;
         }
 
-        if (zoom < 1.0f) zoom = 1.0f;
-        if (zoom > 4.0f) zoom = 4.0f;
-        int crop_w = (int)((float)src_w / zoom);
-        int crop_h = (int)((float)src_h / zoom);
-        /* 先按倍率确定观察窗口，再按 LCD 宽高比收窄一个方向；如果直接
-         * 把 4:3 源图拉伸到 1024:600，双指缩放看似可用但物体比例会变形。 */
-        float src_ratio = (float)crop_w / (float)(crop_h > 0 ? crop_h : 1);
-        float dst_ratio = (float)ctx->out_w / (float)(ctx->out_h > 0 ? ctx->out_h : 1);
-        if (src_ratio > dst_ratio)
-            crop_w = (int)((float)crop_h * dst_ratio);
-        else if (src_ratio < dst_ratio)
-            crop_h = (int)((float)crop_w / dst_ratio);
-        if (crop_w < 2) crop_w = 2;
-        if (crop_h < 2) crop_h = 2;
-        /* YUYV 色度按像素对采样，水平窗口保持偶数，避免边缘半对错位。 */
-        if (crop_w & 1) crop_w--;
-        if (crop_w < 2) crop_w = 2;
-        int crop_x = (int)(center_x * src_w - crop_w / 2);
-        int crop_y = (int)(center_y * src_h - crop_h / 2);
-        if (crop_x < 0) crop_x = 0;
-        if (crop_y < 0) crop_y = 0;
-        if (crop_x + crop_w > src_w) crop_x = src_w - crop_w;
-        if (crop_y + crop_h > src_h) crop_y = src_h - crop_h;
-        /* 先渲染到独立预览缓冲，再按 framebuffer 行跨度提交；这样 GUI
-         * 可在不持有 ring 槽的情况下复制同一帧，媒体线程也不会直接覆盖整屏。 */
-        pthread_mutex_lock(&ctx->preview_mtx);
         yuyv_to_rgb565_scaled(frame.rawData, src_w, src_h,
-                              ctx->preview_base, ctx->out_w, ctx->out_h, ctx->out_w,
-                              src_stride,
-                              crop_x, crop_y, crop_w, crop_h,
-                              ipcam_param_get_mirror_horizontal(),
-                              ipcam_param_get_mirror_vertical());
-        for (int y = 0; y < ctx->out_h; y++) {
-            memcpy((unsigned char *)ctx->fb_base + (size_t)y * ctx->fb_line_length,
-                   ctx->preview_base + (size_t)y * ctx->out_w,
-                   (size_t)ctx->out_w * sizeof(*ctx->preview_base));
-        }
-        ctx->preview_frame = frame;
-        ctx->preview_frame.rawData = ctx->preview_base;
-        ctx->preview_frame.size = ctx->preview_size;
-        ctx->preview_frame.width = (uint16_t)ctx->out_w;
-        ctx->preview_frame.height = (uint16_t)ctx->out_h;
-        ctx->preview_frame.stride = (uint32_t)ctx->out_w * 2U;
-        ctx->preview_frame.pixel_format = IPCAM_PIXEL_FORMAT_RGB565;
-        ctx->preview_valid = 1;
-        pthread_mutex_unlock(&ctx->preview_mtx);
-        pthread_mutex_lock(&ctx->stats_mtx);
-        ctx->frames_rendered++;
-        pthread_mutex_unlock(&ctx->stats_mtx);
+                              ctx->fb_base, ctx->out_w, ctx->out_h, dst_stride_pixels);
         frames++;
+
+        ipcam_ring_release(ctx->rb);
     }
 
     gettimeofday(&t1, NULL);
     double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) / 1e6;
     MLOGI("display thread exit, frames=%lu avg_fps=%.1f\n",
           frames, sec > 0 ? frames / sec : 0);
-    free(src_copy);
     return NULL;
 }
 
-/* 打开 framebuffer 并启动本地处理线程；失败只影响预览，不停止采集。 */
 int ipcam_display_start(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
                         int src_w, int src_h,
                         volatile sig_atomic_t *running)
@@ -279,75 +177,25 @@ int ipcam_display_start(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
     ctx->fb_base = NULL;
     ctx->rb = rb;
     ctx->running = running;
-    ctx->service_running = 1;
     ctx->src_w = src_w > 0 ? src_w : IPCAM_CAPTURE_WIDTH;
     ctx->src_h = src_h > 0 ? src_h : IPCAM_CAPTURE_HEIGHT;
-    pthread_mutex_init(&ctx->view_mtx, NULL);
-    pthread_mutex_init(&ctx->preview_mtx, NULL);
-    pthread_mutex_init(&ctx->stats_mtx, NULL);
-    ctx->view_enabled = ipcam_param_get_preview_enabled() ? 1 : 0;
-    ctx->zoom = 1.0f;
-    ctx->center_x = 0.5f;
-    ctx->center_y = 0.5f;
 
-    if (display_open_fb(ctx) < 0) {
-        pthread_mutex_destroy(&ctx->stats_mtx);
-        pthread_mutex_destroy(&ctx->preview_mtx);
-        pthread_mutex_destroy(&ctx->view_mtx);
-        return -1;
-    }
-    if (ctx->out_w <= 0 || ctx->out_h <= 0 ||
-        (size_t)ctx->out_w > SIZE_MAX / (size_t)ctx->out_h / sizeof(*ctx->preview_base)) {
-        MLOGE("invalid framebuffer dimensions %dx%d\n", ctx->out_w, ctx->out_h);
-        munmap(ctx->fb_base, ctx->fb_size);
-        ctx->fb_base = NULL;
-        close(ctx->fb_fd);
-        ctx->fb_fd = -1;
-        pthread_mutex_destroy(&ctx->stats_mtx);
-        pthread_mutex_destroy(&ctx->preview_mtx);
-        pthread_mutex_destroy(&ctx->view_mtx);
-        return -1;
-    }
-    ctx->preview_size = (size_t)ctx->out_w * (size_t)ctx->out_h * sizeof(*ctx->preview_base);
-    ctx->preview_base = calloc(1, ctx->preview_size);
-    if (!ctx->preview_base) {
-        MLOGE("alloc preview RGB565 buffer failed (%zu bytes)\n", ctx->preview_size);
-        munmap(ctx->fb_base, ctx->fb_size);
-        ctx->fb_base = NULL;
-        close(ctx->fb_fd);
-        ctx->fb_fd = -1;
-        pthread_mutex_destroy(&ctx->stats_mtx);
-        pthread_mutex_destroy(&ctx->preview_mtx);
-        pthread_mutex_destroy(&ctx->view_mtx);
-        return -1;
-    }
-    /* 背光接口是板级可选项；没有导出的 sysfs 节点时保留视频服务并记录一次警告。 */
-    if (ipcam_display_set_backlight_percent(ipcam_param_get_backlight_percent()) != 0) {
-        MLOGW("backlight capability unavailable; set IPCAM_BACKLIGHT_PATH after board probing\n");
-    }
+    if (display_open_fb(ctx) < 0) return -1;
 
     if (pthread_create(&ctx->thread, NULL, display_thread, ctx) != 0) {
         MLOGE("pthread_create display failed\n");
         if (ctx->fb_base) munmap(ctx->fb_base, ctx->fb_size);
         if (ctx->fb_fd >= 0) close(ctx->fb_fd);
-        free(ctx->preview_base);
-        ctx->preview_base = NULL;
-        pthread_mutex_destroy(&ctx->stats_mtx);
-        pthread_mutex_destroy(&ctx->view_mtx);
-        pthread_mutex_destroy(&ctx->preview_mtx);
         return -1;
     }
     return 0;
 }
 
-/* 停止本地转换并释放 framebuffer，保持全局采集/编码运行标志不变。 */
 void ipcam_display_stop(ipcam_display_ctx_t *ctx)
 {
     if (!ctx) return;
-    /* 仅停止显示服务；不能修改 main 的全局运行标志，否则关闭 LCD
-     * 会连带终止采集、编码和网络服务。关闭输入 ring 负责唤醒线程。 */
-    ctx->service_running = 0;
-    if (ctx->rb) ipcam_ring_close(ctx->rb);
+    if (ctx->running) *ctx->running = 0;
+
     if (ctx->thread) {
         pthread_join(ctx->thread, NULL);
         ctx->thread = 0;
@@ -361,102 +209,4 @@ void ipcam_display_stop(ipcam_display_ctx_t *ctx)
         close(ctx->fb_fd);
         ctx->fb_fd = -1;
     }
-    free(ctx->preview_base);
-    ctx->preview_base = NULL;
-    ctx->preview_size = 0;
-    pthread_mutex_destroy(&ctx->preview_mtx);
-    pthread_mutex_destroy(&ctx->view_mtx);
-    pthread_mutex_destroy(&ctx->stats_mtx);
-}
-
-/* 原子替换观察视口；中心坐标归一化到 0～1，zoom 限制在 1～4。 */
-int ipcam_display_set_view(ipcam_display_ctx_t *ctx, int enabled,
-                           float zoom, float center_x, float center_y)
-{
-    if (!ctx || zoom < 1.0f || zoom > 4.0f || center_x < 0.0f || center_x > 1.0f ||
-        center_y < 0.0f || center_y > 1.0f) return -1;
-    pthread_mutex_lock(&ctx->view_mtx);
-    ctx->view_enabled = enabled ? 1 : 0;
-    ctx->zoom = zoom;
-    ctx->center_x = center_x;
-    ctx->center_y = center_y;
-    pthread_mutex_unlock(&ctx->view_mtx);
-    return 0;
-}
-
-/* 熄屏只暂停本地转换，保留 zoom/中心，唤醒后无需重置 GUI 状态。 */
-int ipcam_display_set_screen_paused(ipcam_display_ctx_t *ctx, int paused)
-{
-    if (!ctx) return -1;
-    pthread_mutex_lock(&ctx->view_mtx);
-    ctx->screen_paused = paused ? 1 : 0;
-    pthread_mutex_unlock(&ctx->view_mtx);
-    return 0;
-}
-
-/* 通过板级 sysfs 节点设置亮度；未配置节点时返回失败而不伪造成功。 */
-int ipcam_display_set_backlight_percent(int percent)
-{
-    if (percent < 0 || percent > 100) return -1;
-    const char *path = getenv("IPCAM_BACKLIGHT_PATH");
-    if (!path || !*path) return -1;
-    int max_value = 100;
-    const char *max_env = getenv("IPCAM_BACKLIGHT_MAX");
-    if (max_env && *max_env) max_value = atoi(max_env);
-    if (max_value <= 0) return -1;
-    int value = max_value * percent / 100;
-    FILE *fp = fopen(path, "w");
-    if (!fp) { MLOGW("backlight open %s: %s\n", path, strerror(errno)); return -1; }
-    int write_ok = fprintf(fp, "%d\n", value) > 0;
-    int close_ok = fclose(fp) == 0;
-    int rc = write_ok && close_ok ? 0 : -1;
-    if (rc != 0) MLOGW("backlight write %s failed\n", path);
-    return rc;
-}
-
-/* 复制当前视口快照，供控制器构造命令时保留 zoom/中心。 */
-void ipcam_display_get_view(ipcam_display_ctx_t *ctx, int *enabled,
-                            float *zoom, float *center_x, float *center_y)
-{
-    if (!ctx) return;
-    pthread_mutex_lock(&ctx->view_mtx);
-    if (enabled) *enabled = ctx->view_enabled;
-    if (zoom) *zoom = ctx->zoom;
-    if (center_x) *center_x = ctx->center_x;
-    if (center_y) *center_y = ctx->center_y;
-    pthread_mutex_unlock(&ctx->view_mtx);
-}
-
-/* 复制渲染帧计数；统计锁与 framebuffer/视口锁分离，避免查询拖慢转换线程。 */
-void ipcam_display_get_stats(ipcam_display_ctx_t *ctx, uint64_t *rendered)
-{
-    if (!ctx || !rendered) return;
-    pthread_mutex_lock(&ctx->stats_mtx);
-    *rendered = ctx->frames_rendered;
-    pthread_mutex_unlock(&ctx->stats_mtx);
-}
-
-/* 复制最新 RGB565 预览帧；复制期间锁住工作缓冲，调用方无需归还槽位。 */
-int ipcam_display_preview_acquire(ipcam_display_ctx_t *ctx,
-                                  void *out_data, size_t out_cap,
-                                  ipcam_frame_t *out_frame)
-{
-    if (!ctx || !out_data || !out_frame) return -1;
-    pthread_mutex_lock(&ctx->preview_mtx);
-    if (!ctx->preview_valid || ctx->preview_size > out_cap) {
-        pthread_mutex_unlock(&ctx->preview_mtx);
-        return -1;
-    }
-    memcpy(out_data, ctx->preview_base, ctx->preview_size);
-    *out_frame = ctx->preview_frame;
-    out_frame->rawData = out_data;
-    pthread_mutex_unlock(&ctx->preview_mtx);
-    return 0;
-}
-
-void ipcam_display_preview_release(ipcam_display_ctx_t *ctx, ipcam_frame_t *frame)
-{
-    /* acquire 是复制语义，保留成对 API 供未来零拷贝实现，不释放调用方内存。 */
-    (void)ctx;
-    (void)frame;
 }

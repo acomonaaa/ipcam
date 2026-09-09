@@ -53,23 +53,19 @@ static void crash_handler(int sig)
     backtrace_symbols_fd(bt, nbt, STDERR_FILENO);
 
     /* 用快照（已预先在正常上下文拷贝），避免 pthread_mutex_lock */
-    /* 崩溃路径只读取预先复制的结构，新增控制字段也放进快照，便于定位现场状态。 */
     n = snprintf(buf, sizeof(buf),
         "--- ipcam param snapshot ---\n"
         "  model=%s swver=%s net_mode=%u\n"
         "  wifi_ssid=%s apn=%s\n"
         "  capture=%ux%u jpeg_q=%u target_fps=%u\n"
         "  http_port=%u http_bind_local=%u log_level=%u\n"
-        "  mirror_h=%u mirror_v=%u preview=%u backlight=%u timeout=%u\n"
         "--- end ---\n",
         s_crash_snapshot.model, s_crash_snapshot.swver, s_crash_snapshot.net_mode,
         s_crash_snapshot.wifi_ssid, s_crash_snapshot.apn,
         s_crash_snapshot.capture_w, s_crash_snapshot.capture_h,
         s_crash_snapshot.jpeg_quality, s_crash_snapshot.target_fps,
         s_crash_snapshot.http_port, s_crash_snapshot.http_bind_local,
-        s_crash_snapshot.log_level, s_crash_snapshot.mirror_horizontal,
-        s_crash_snapshot.mirror_vertical, s_crash_snapshot.preview_enabled,
-        s_crash_snapshot.backlight_percent, s_crash_snapshot.screen_timeout_min);
+        s_crash_snapshot.log_level);
     safe_write_str(buf, (size_t)n);
 
     /* 恢复默认 handler 再 raise，让内核产生 core dump / 终止 */

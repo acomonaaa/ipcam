@@ -57,13 +57,7 @@ typedef struct ipcam_param_s {
     /* log */
     uint8_t  log_level;
 
-    /* 本地显示与板级控制字段复用旧 reserved 区，保持配置文件尺寸兼容。 */
-    uint8_t  mirror_horizontal;
-    uint8_t  mirror_vertical;
-    uint8_t  preview_enabled;
-    uint8_t  backlight_percent;
-    uint8_t  screen_timeout_min;
-    uint8_t  reserved[27];
+    uint8_t  reserved[32];
 } ipcam_param_t;
 #pragma pack()
 
@@ -88,12 +82,6 @@ uint8_t  ipcam_param_get_target_fps(void);
 uint16_t ipcam_param_get_http_port(void);
 uint8_t  ipcam_param_get_http_bind_local(void);
 uint8_t  ipcam_param_get_log_level(void);
-uint8_t  ipcam_param_get_mirror_horizontal(void);
-uint8_t  ipcam_param_get_mirror_vertical(void);
-uint8_t  ipcam_param_get_preview_enabled(void);
-uint8_t  ipcam_param_get_backlight_percent(void);
-uint8_t  ipcam_param_get_screen_timeout_min(void);
-uint32_t ipcam_param_get_generation(void);
 const char *ipcam_param_get_model(void);
 const char *ipcam_param_get_swver(void);
 
@@ -106,17 +94,9 @@ int ipcam_param_set_capture_w(uint16_t v);
 int ipcam_param_set_capture_h(uint16_t v);
 int ipcam_param_set_jpeg_quality(uint8_t v);
 int ipcam_param_set_target_fps(uint8_t v);
-int ipcam_param_set_video_group(uint16_t width, uint16_t height,
-                                uint8_t target_fps, uint8_t jpeg_quality);
 int ipcam_param_set_http_port(uint16_t v);
 int ipcam_param_set_http_bind_local(uint8_t v);
 int ipcam_param_set_log_level(uint8_t v);
-int ipcam_param_set_mirror_horizontal(uint8_t v);
-int ipcam_param_set_mirror_vertical(uint8_t v);
-int ipcam_param_set_mirror_pair(uint8_t horizontal, uint8_t vertical);
-int ipcam_param_set_preview_enabled(uint8_t v);
-int ipcam_param_set_backlight_percent(uint8_t v);
-int ipcam_param_set_screen_timeout_min(uint8_t v);
 
 /* 序列化为 JSON 字符串（snprintf 到 buf，返回写入字节数；buf 不足返回 -1） */
 int ipcam_param_to_json(char *buf, size_t buf_sz);

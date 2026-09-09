@@ -4,7 +4,6 @@
 #include <signal.h>     /* sig_atomic_t */
 #include <pthread.h>    /* pthread_t */
 #include <stddef.h>     /* size_t */
-#include <stdint.h>
 #include "ipcam_ringbuffer.h"
 
 /*
@@ -22,12 +21,6 @@ typedef struct ipcam_capture_ctx_s {
     int              fd;             /* /dev/video0 fd */
     int              width;
     int              height;
-    uint32_t         bytes_per_line; /* V4L2 实际行跨度 */
-    uint32_t         size_image;     /* V4L2 报告的单帧有效上限 */
-    uint32_t         pixel_format;   /* 协商后的 V4L2 fourcc */
-    uint32_t         target_fps;     /* 请求的输出目标帧率 */
-    uint32_t         actual_fps;
-    int              fps_controlled; /* 1=驱动精确接受目标，0=需软件选帧或驱动未返回精确值 */
     int              n_bufs;         /* V4L2 缓冲数量（建议 >= 3） */
     struct v4l2_buf_info {
         void         *start;
@@ -37,12 +30,7 @@ typedef struct ipcam_capture_ctx_s {
     ipcam_ring_buffer_t *rb_disp;     /* 写入端 #1（display 消费） */
     ipcam_ring_buffer_t *rb_enc;      /* 写入端 #2（encode 消费） */
     volatile sig_atomic_t *running;
-    volatile sig_atomic_t service_running; /* 仅采集服务自身的生命周期 */
     pthread_t        thread;          /* 非 detached，可 join */
-    pthread_mutex_t  stats_mtx;
-    uint64_t         frames_emitted;
-    uint64_t         frames_dropped_disp;
-    uint64_t         frames_dropped_enc;
 } ipcam_capture_ctx_t;
 
 /* 初始化并启动采集线程（pthread_create 后立即返回） */
@@ -56,8 +44,5 @@ void ipcam_capture_stop(ipcam_capture_ctx_t *ctx);
 
 /* 查询 V4L2 协商后的实际分辨率（在 capture_start 成功后调用） */
 void ipcam_capture_get_dimensions(const ipcam_capture_ctx_t *ctx, int *w, int *h);
-/* 读取采集输出与两路环槽丢帧累计值；返回前会复制快照，调用方无需持锁。 */
-void ipcam_capture_get_stats(ipcam_capture_ctx_t *ctx, uint64_t *emitted,
-                             uint64_t *dropped_disp, uint64_t *dropped_enc);
 
 #endif /* IPCAM_CAPTURE_H */

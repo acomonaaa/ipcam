@@ -8,12 +8,11 @@
  *   - capture_thread (writer) -> rb_yuyv -> display_thread (reader)
  *   - capture_thread (writer) -> rb_yuyv -> encode_thread  (reader)
  *
- * 消费队列仍是单 reader；需要多个网络观察者时使用 copy_latest() 的只读
- * 快照接口，不移动 read_idx。多消费者写入场景请开多个 ring，例如
- * rb_yuyv_display / rb_yuyv_encode / rb_jpeg_record。
+ * **不允许多个 reader 同时挂同一个 rb**——这是调用方约定。
+ * 多消费者场景请开多个 ring（每个 ring 单 reader），例如 rb_yuyv_display / rb_yuyv_encode。
  *
  * 帧布局：
- *   每个 slot = [ipcam_frame_t header] [payload bytes]
+ *   每个 slot = [ipcam_frame_t header (24B)] [payload bytes]
  *   header.rawData 指向 slot 的 payload 起点
  *   header.size    是 payload 的字节数
  *
@@ -23,35 +22,16 @@
 
 #include <pthread.h>
 #include <stddef.h>
-#include <stdint.h>
 
 #define IPCAM_FRAME_TYPE_I   1   /* MJPEG: 每帧都是 I */
 #define IPCAM_FRAME_TYPE_P   2   /* 预留（H.264 用） */
-/* 显示预览帧的 fourcc（对应 V4L2 RGBP，避免服务层散落魔数）。 */
-#define IPCAM_PIXEL_FORMAT_RGB565  ((uint32_t)('R') | ((uint32_t)('G') << 8) | \
-                                    ((uint32_t)('B') << 16) | ((uint32_t)('P') << 24))
 
 typedef struct ipcam_frame_s {
     void    *rawData;      /* 帧数据指针（指向 slot 内的 payload） */
     size_t   size;         /* 帧字节数 */
     unsigned long seqNo;   /* 单调递增序列号 */
     int      type;         /* IPCAM_FRAME_TYPE_* */
-    uint64_t monotonic_ns; /* 采集/编码完成时的 CLOCK_MONOTONIC 时间戳 */
-    uint16_t width;        /* 有效图像宽度；编码后仍保留源尺寸 */
-    uint16_t height;       /* 有效图像高度 */
-    uint32_t stride;       /* 原始帧行跨度，压缩帧为 0 */
-    uint32_t pixel_format; /* V4L2 fourcc；压缩帧为 0 */
-    uint32_t config_generation; /* 参数切换代次，便于消费者丢弃旧帧 */
 } ipcam_frame_t;
-
-typedef struct ipcam_frame_meta_s {
-    uint64_t monotonic_ns;
-    uint16_t width;
-    uint16_t height;
-    uint32_t stride;
-    uint32_t pixel_format;
-    uint32_t config_generation;
-} ipcam_frame_meta_t;
 
 /*
  * 内部 slot 头。每个 slot 在 alloc 时按以下布局连续分配：
@@ -82,7 +62,6 @@ typedef struct ipcam_ring_buffer_s {
     int       closed;          /* 1 = 关闭（生产者退出） */
 
     unsigned long seq_counter;
-    uint64_t dropped_count;      /* 满队列丢弃/覆盖的帧数，供录像可靠性监控 */
 } ipcam_ring_buffer_t;
 
 /*
@@ -103,8 +82,6 @@ void ipcam_ring_destroy(ipcam_ring_buffer_t *rb);
  * 返回 0=成功，-1=已关闭。
  */
 int ipcam_ring_append(ipcam_ring_buffer_t *rb, const void *in_data, size_t in_bytes);
-int ipcam_ring_append_meta(ipcam_ring_buffer_t *rb, const void *in_data,
-                           size_t in_bytes, const ipcam_frame_meta_t *meta);
 
 /*
  * 生产者非阻塞写入：满则立即返回 -1，不阻塞生产者。
@@ -112,11 +89,6 @@ int ipcam_ring_append_meta(ipcam_ring_buffer_t *rb, const void *in_data,
  * 返回 0=成功，-1=已关闭或满。
  */
 int ipcam_ring_try_append(ipcam_ring_buffer_t *rb, const void *in_data, size_t in_bytes);
-int ipcam_ring_try_append_meta(ipcam_ring_buffer_t *rb, const void *in_data,
-                               size_t in_bytes, const ipcam_frame_meta_t *meta);
-/* 最新帧队列写入：满时丢弃最旧帧，保证生产者不会因无人消费而永久停滞。 */
-int ipcam_ring_try_append_latest_meta(ipcam_ring_buffer_t *rb, const void *in_data,
-                                      size_t in_bytes, const ipcam_frame_meta_t *meta);
 
 /*
  * 消费者取一帧：阻塞直到有可用帧或缓冲被关闭且清空。
@@ -126,22 +98,6 @@ int ipcam_ring_try_append_latest_meta(ipcam_ring_buffer_t *rb, const void *in_da
  */
 int ipcam_ring_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame);
 
-/* 非阻塞取帧：0=成功，1=当前为空，-1=已关闭或参数错误；成功后仍须 release。 */
-int ipcam_ring_try_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame);
-
-/*
- * 复制当前最新帧而不消费环形缓冲。
- * 直播客户端和 snapshot 共享编码结果时使用该接口，避免多个 reader
- * 互相抢帧；out_data 由调用方提供，容量不足或当前无帧返回 -1。
- * 返回 0 成功，1 表示没有新序号（last_seq 已经是最新），-1 表示错误。
- */
-int ipcam_ring_copy_latest(ipcam_ring_buffer_t *rb, void *out_data,
-                           size_t out_cap, ipcam_frame_t *out_frame,
-                           unsigned long last_seq);
-
-/* 丢弃当前已排队帧；参数变更后用于清理旧配置代次，避免旧帧混入新链路。 */
-void ipcam_ring_clear(ipcam_ring_buffer_t *rb);
-
 /* 消费者消费完一帧，slot 进入空闲 */
 void ipcam_ring_release(ipcam_ring_buffer_t *rb);
 
@@ -150,8 +106,6 @@ void ipcam_ring_close(ipcam_ring_buffer_t *rb);
 
 /* 当前帧数（仅供统计） */
 int ipcam_ring_count(ipcam_ring_buffer_t *rb);
-size_t ipcam_ring_capacity(const ipcam_ring_buffer_t *rb);
-uint64_t ipcam_ring_dropped_count(const ipcam_ring_buffer_t *rb);
 
 /*
  * 工具：给定 frame.rawData，反查它属于哪个 rb 的第几个 slot。

@@ -4,10 +4,6 @@
 #include <signal.h>     /* sig_atomic_t */
 #include <pthread.h>    /* pthread_t */
 #include "ipcam_ringbuffer.h"
-#include "ipcam_control.h"
-#include "ipcam_record.h"
-#include "ipcam_display.h"
-#include "ipcam_screen.h"
 
 /*
  * HTTP MJPEG 推流服务器：
@@ -15,11 +11,6 @@
  *   GET /stream.mjpg       → multipart/x-mixed-replace; 每帧前写 boundary + Content-Type + Content-Length + JPEG
  *   GET /snapshot.jpg      → 单帧 JPEG
  *   GET /api/status        → JSON 状态
- *   GET /api/capabilities  → 已验证能力清单
- *   GET /api/control/result?id=N → 控制请求结果
- *   POST /api/control      → 预览视口、翻转、录像和拍照命令
- *   POST /api/record       → 录像 start/stop
- *   POST /api/photo        → 独立拍照
  *
  * 默认绑定由 param `http_bind_local` 决定（默认 0 → 0.0.0.0）。
  * 可通过环境变量 IPCAM_HTTP_BIND 覆盖。
@@ -38,12 +29,7 @@ typedef struct ipcam_stream_ctx_s {
     int                  listen_fd;
     int                  port;
     ipcam_ring_buffer_t *jpeg_rb;     /* 输入：JPEG 字节流 */
-    ipcam_control_ctx_t *control;     /* GUI/HTTP 共用的串行控制契约 */
-    ipcam_record_ctx_t *recorder;     /* 可选：录像控制与状态 */
-    ipcam_display_ctx_t *display;     /* 可选：本地预览视口控制 */
-    ipcam_screen_ctx_t *screen;       /* 可选：熄屏策略 */
     volatile sig_atomic_t *running;
-    volatile sig_atomic_t service_running; /* 仅 HTTP 服务自身的生命周期 */
     pthread_t            thread;      /* accept 循环线程（可 join） */
 
     pthread_mutex_t      client_mtx;    /* 保护 client_cnt + client_threads[] */
@@ -54,13 +40,6 @@ typedef struct ipcam_stream_ctx_s {
 
 int  ipcam_stream_start(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
                         volatile sig_atomic_t *running);
-int  ipcam_stream_start_ex(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
-                           volatile sig_atomic_t *running,
-                           ipcam_control_ctx_t *control);
-void ipcam_stream_set_recorder(ipcam_stream_ctx_t *ctx, ipcam_record_ctx_t *recorder);
-void ipcam_stream_set_control(ipcam_stream_ctx_t *ctx, ipcam_control_ctx_t *control);
-void ipcam_stream_set_display(ipcam_stream_ctx_t *ctx, ipcam_display_ctx_t *display);
-void ipcam_stream_set_screen(ipcam_stream_ctx_t *ctx, ipcam_screen_ctx_t *screen);
 void ipcam_stream_stop(ipcam_stream_ctx_t *ctx);
 
 #endif /* IPCAM_STREAM_HTTP_H */

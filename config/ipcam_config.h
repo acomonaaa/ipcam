@@ -47,26 +47,6 @@
 #define IPCAM_RING_DEPTH       4
 #endif
 
-/* 录像消费者使用独立队列，避免慢盘反压采集和 HTTP 直播。 */
-#ifndef IPCAM_RECORD_RING_DEPTH
-#define IPCAM_RECORD_RING_DEPTH 16
-#endif
-
-/* 录像只允许写入经过挂载检查的目录；可由板级配置覆盖。 */
-#ifndef IPCAM_STORAGE_ROOT
-#define IPCAM_STORAGE_ROOT     "/mnt/sdcard"
-#endif
-#ifndef IPCAM_RECORD_RESERVE_BYTES
-#define IPCAM_RECORD_RESERVE_BYTES (128ULL * 1024ULL * 1024ULL)
-#endif
-#ifndef IPCAM_RECORD_SEGMENT_SECONDS
-#define IPCAM_RECORD_SEGMENT_SECONDS 300
-#endif
-/* RIFF/AVI 的 32 位尺寸字段接近 4 GiB 时提前切段，避免生成不可播放文件。 */
-#ifndef IPCAM_RECORD_MAX_SEGMENT_BYTES
-#define IPCAM_RECORD_MAX_SEGMENT_BYTES (3ULL * 1024ULL * 1024ULL * 1024ULL)
-#endif
-
 /* 设备节点 */
 #ifndef IPCAM_VIDEO_DEV
 #define IPCAM_VIDEO_DEV        "/dev/video0"
