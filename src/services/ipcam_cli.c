@@ -5,6 +5,11 @@
 
 #include <libgen.h>
 #include <limits.h>     /* PATH_MAX */
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +19,67 @@
 #include <unistd.h>
 
 #include "ipcam_config.h"
+
+/*
+ * camctl 通过本机 HTTP 回环访问运行中的 daemon，保证 status/录像/拍照
+ * 与 GUI 走同一套控制契约。只处理短 JSON 响应，设置超时避免命令行永久阻塞。
+ */
+static int local_http_request(const char *method, const char *path, const char *body)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    const char *port_env = getenv("IPCAM_HTTP_PORT");
+    int port = port_env && *port_env ? atoi(port_env) : IPCAM_HTTP_PORT;
+    if (port <= 0 || port > 65535 || inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1) {
+        close(fd);
+        return -1;
+    }
+    addr.sin_port = htons((uint16_t)port);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    size_t body_len = body ? strlen(body) : 0;
+    char request[1024];
+    int n = snprintf(request, sizeof(request),
+                     "%s %s HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                     "Connection: close\r\nContent-Length: %zu\r\n\r\n%s",
+                     method, path, body_len, body ? body : "");
+    if (n <= 0 || n >= (int)sizeof(request)) { close(fd); return -1; }
+    size_t sent = 0;
+    while (sent < (size_t)n) {
+        ssize_t wr = write(fd, request + sent, (size_t)n - sent);
+        if (wr < 0 && errno == EINTR) continue;
+        if (wr <= 0) { close(fd); return -1; }
+        sent += (size_t)wr;
+    }
+
+    char response[16384];
+    size_t got = 0;
+    while (got < sizeof(response) - 1) {
+        ssize_t rd = read(fd, response + got, sizeof(response) - 1 - got);
+        if (rd < 0 && errno == EINTR) continue;
+        if (rd <= 0) break;
+        got += (size_t)rd;
+    }
+    close(fd);
+    response[got] = '\0';
+    char *body_start = strstr(response, "\r\n\r\n");
+    if (!body_start) return -1;
+    body_start += 4;
+    const char *status = response + 9; /* HTTP/1.x 后的三位状态码 */
+    int status_code = atoi(status);
+    fputs(body_start, stdout);
+    return status_code >= 200 && status_code < 300 ? 0 : -1;
+}
 
 static int do_ver(int argc, char **argv)
 {
@@ -30,6 +96,9 @@ static int do_ver(int argc, char **argv)
 static int do_status(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    /* camctl 与 GUI/HTTP 复用同一状态接口，避免 CLI 显示编译期假值。 */
+    if (local_http_request("GET", "/api/status", NULL) == 0) return 0;
+    fprintf(stderr, "camctl status: daemon unavailable, showing compile-time defaults\n");
     printf("ipcam STATUS (static info):\n");
     printf("  model        : %s\n", IPCAM_MODEL);
     printf("  swver        : %s\n", IPCAM_VERSION);
@@ -38,6 +107,57 @@ static int do_status(int argc, char **argv)
     printf("  http_port    : %d\n", IPCAM_HTTP_PORT);
     printf("  jpeg_q       : %d\n", IPCAM_JPEG_QUALITY);
     return 0;
+}
+
+static int do_capabilities(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    return local_http_request("GET", "/api/capabilities", NULL) == 0 ? 0 : 1;
+}
+
+static int do_record(int argc, char **argv)
+{
+    if (argc < 2 || (strcmp(argv[1], "start") != 0 && strcmp(argv[1], "stop") != 0)) {
+        fprintf(stderr, "usage: camctl record <start|stop>\n");
+        return 1;
+    }
+    char body[32];
+    snprintf(body, sizeof(body), "action=%s", argv[1]);
+    return local_http_request("POST", "/api/record", body) == 0 ? 0 : 1;
+}
+
+static int do_photo(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    return local_http_request("POST", "/api/photo", "") == 0 ? 0 : 1;
+}
+
+static int do_control(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr, "usage: camctl control <preview|view|mirror|light> ...\n");
+        return 1;
+    }
+    char body[256];
+    if (strcmp(argv[1], "preview") == 0 && argc >= 3) {
+        snprintf(body, sizeof(body), "command=preview&enabled=%d", atoi(argv[2]) ? 1 : 0);
+    } else if (strcmp(argv[1], "view") == 0 && argc >= 6) {
+        snprintf(body, sizeof(body), "command=view&enabled=%d&zoom=%s&center_x=%s&center_y=%s",
+                 atoi(argv[2]) ? 1 : 0, argv[3], argv[4], argv[5]);
+    } else if (strcmp(argv[1], "mirror") == 0 && argc >= 4) {
+        snprintf(body, sizeof(body), "command=mirror&mirror_horizontal=%d&mirror_vertical=%d",
+                 atoi(argv[2]) ? 1 : 0, atoi(argv[3]) ? 1 : 0);
+    } else if (strcmp(argv[1], "light") == 0 && argc >= 3) {
+        /* 补光是临时板级状态，范围校验由统一控制队列再次执行。 */
+        snprintf(body, sizeof(body), "command=light&percent=%d", atoi(argv[2]));
+    } else {
+        fprintf(stderr, "usage: camctl control preview <0|1>\n"
+                        "       camctl control view <0|1> <zoom> <center_x> <center_y>\n"
+                        "       camctl control mirror <0|1> <0|1>\n"
+                        "       camctl control light <0..100>\n");
+        return 1;
+    }
+    return local_http_request("POST", "/api/control", body) == 0 ? 0 : 1;
 }
 
 static int do_reboot(int argc, char **argv)
@@ -151,7 +271,7 @@ ipcam_cli_action_t ipcam_cli_dispatch(int argc, char **argv)
     }
     if (strcmp(name, "camctl") == 0) {
         if (argc < 2) {
-            fprintf(stderr, "usage: camctl <status|reboot>\n");
+            fprintf(stderr, "usage: camctl <status|capabilities|record|photo|control|reboot|ota>\n");
             return IPCAM_CLI_EXIT_ERR;
         }
         if (strcmp(argv[1], "status") == 0) {
@@ -160,6 +280,18 @@ ipcam_cli_action_t ipcam_cli_dispatch(int argc, char **argv)
         }
         if (strcmp(argv[1], "reboot") == 0) {
             return do_reboot(argc - 1, argv + 1) ? IPCAM_CLI_EXIT_ERR : IPCAM_CLI_EXIT_OK;
+        }
+        if (strcmp(argv[1], "capabilities") == 0) {
+            return do_capabilities(argc - 1, argv + 1) ? IPCAM_CLI_EXIT_ERR : IPCAM_CLI_EXIT_OK;
+        }
+        if (strcmp(argv[1], "record") == 0) {
+            return do_record(argc - 1, argv + 1) ? IPCAM_CLI_EXIT_ERR : IPCAM_CLI_EXIT_OK;
+        }
+        if (strcmp(argv[1], "photo") == 0) {
+            return do_photo(argc - 1, argv + 1) ? IPCAM_CLI_EXIT_ERR : IPCAM_CLI_EXIT_OK;
+        }
+        if (strcmp(argv[1], "control") == 0) {
+            return do_control(argc - 1, argv + 1) ? IPCAM_CLI_EXIT_ERR : IPCAM_CLI_EXIT_OK;
         }
         if (strcmp(argv[1], "ota") == 0) {
             return do_ota(argc - 1, argv + 1) ? IPCAM_CLI_EXIT_ERR : IPCAM_CLI_EXIT_OK;

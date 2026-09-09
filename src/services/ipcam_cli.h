@@ -7,7 +7,7 @@
  * 通过软链接 / BusyBox applet 把同一二进制当作多个命令启动：
  *   ipcam       → 默认（运行守护进程）
  *   camver      → 打印版本
- *   camctl      → 控制子命令（status / reboot）
+ *   camctl      → 控制子命令（status / capabilities / record / photo / control / reboot）
  *
  * ipcam_cli_dispatch 返回 IPCAM_CLI_RUN_DAEMON 表示需要 main 进入 daemon 流程，
  * 其他返回值（>=0）是进程退出码。

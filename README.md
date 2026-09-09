@@ -7,11 +7,15 @@
 - OV5640 摄像头 V4L2 采集（YUYV 4:2:2）
 - LCD 实时显示（YUYV → RGB565 软件转换 → /dev/fb0 mmap）
 - MJPEG-over-HTTP 推流（libjpeg-turbo + multipart/x-mixed-replace）
-- HTTP 端点：`/`、`/stream.mjpg`、`/snapshot.jpg`、`/api/status`、`/api/config` (GET/POST)、`/api/version`、`/api/ota` (GET/POST)、`/api/reboot`、`/healthz`
+- HTTP 端点：`/`、`/stream.mjpg`、`/snapshot.jpg`、`/api/status`（含 target/capture/output fps）、`/api/capabilities`、`/api/control`、`/api/control/result`、`/api/record`、`/api/photo`、`/api/config` (GET/POST)、`/api/version`、`/api/ota` (GET/POST)、`/api/reboot`、`/healthz`
 - 网络层可插拔：4G（pppd）/ WiFi（wpa_supplicant）
-- argv[0] 多调用二进制：`ipcam`（守护进程）/ `camver`（版本）/ `camctl`（status/reboot/ota/rollback）
+- argv[0] 多调用二进制：`ipcam`（守护进程）/ `camver`（版本）/ `camctl`（状态、控制、录像、拍照、reboot、OTA）
 - 运行时配置（`/etc/ipcam.conf`，二进制 + CRC 校验，HTTP POST 改写）
 - 7 级 BCF2 风格日志（runtime level switching）
+- 固件侧独立拍照与 MJPEG AVI 录像（5 分钟分段、SD 卡挂载校验、缺帧重复统计）
+- 本地预览开关、1×～4×视口、水平/垂直翻转、熄屏唤醒和 Linux evdev 多点触摸契约
+- 板级补光临时控制（只接受显式配置的亮度节点，开机默认关闭）
+- 统一控制队列：GUI、HTTP 与 `camctl` 共用能力、状态、命令和结果接口
 - 库版本打印 + SIGSEGV/SIGBUS/SIGILL 崩溃 handler（异步安全，dump 当前配置）
 - OTA 升级（无需自有服务器：本地文件 或任意 HTTP URL + SHA256 校验 + 自动 rollback）
 
@@ -57,6 +61,11 @@ ipcam/
     │   ├── ipcam_display.{h,c}        # LCD 显示（YUYV→RGB565）
     │   ├── ipcam_encode.{h,c}         # MJPEG 编码（libjpeg-turbo）
     │   ├── ipcam_encode_stub.c        # 编码空壳（display-only fallback）
+    │   ├── ipcam_record.{h,c}         # SD 卡照片与 MJPEG AVI 分段录像
+    │   ├── ipcam_control.{h,c}        # GUI/HTTP/camctl 统一控制契约
+    │   ├── ipcam_screen.{h,c}         # 自动熄屏、背光和唤醒状态机
+    │   ├── ipcam_touch.{h,c}          # Linux evdev 多点触摸输入适配
+    │   ├── ipcam_light.{h,c}          # 板级补光节点适配
     │   ├── ipcam_stream.{h,c}         # HTTP MJPEG 推流服务
     │   ├── ipcam_net4g.{h,c}          # 4G 拨号（AT + pppd）
     │   ├── ipcam_netwifi.{h,c}        # WiFi 连接（wpa_supplicant）
@@ -108,7 +117,7 @@ make ipcam-display-only
 SKIP_TJ_CHECK=1 ./scripts/build.sh ipcam-display-only
 ```
 
-`src/services/ipcam_encode_stub.c` 提供空壳 `ipcam_encode_start/stop`，让 daemon 链接通过但无 MJPEG 流。
+`src/services/ipcam_encode_stub.c` 提供空壳 `ipcam_encode_start(_ex)/stop`，让 daemon 链接通过但无 MJPEG 流。
 
 ### 5.4 编译选项
 
@@ -143,8 +152,12 @@ OTA 看门狗（`S90ipcam`）依赖 BusyBox **`wget`** 探测 `http://127.0.0.1:
 - 手动启动：`/etc/init.d/S90ipcam start`
 - 查看版本：`camver`
 - 查看状态：`camctl status`
-- 查看日志：`tail -f /var/log/ipcam.log`
+- 查看日志：`tail -f /tmp/ipcam/ipcam.log`（可用 `IPCAM_LOG_FILE` 覆盖）
 - 浏览器预览：`http://<board_ip>:8080/`（默认绑定 `0.0.0.0`）
+
+板级探测后可通过环境变量绑定实际节点和挂载点：`IPCAM_VIDEO_DEV`、`IPCAM_FB_DEV`、
+`IPCAM_TOUCH_DEV`、`IPCAM_BACKLIGHT_PATH`、`IPCAM_LIGHT_PATH`、`IPCAM_STORAGE_ROOT`。
+应用不会猜测 GPIO 编号，也不会在 SD 未挂载时把照片写入根文件系统。
 
 ## 7. 验证清单
 
@@ -157,7 +170,9 @@ OTA 看门狗（`S90ipcam`）依赖 BusyBox **`wget`** 探测 `http://127.0.0.1:
 | 4G 推流 | 接 4G 模组到 usbotg2；`curl -d 'net_mode=1' http://127.0.0.1:8080/api/config` 后重启 daemon，浏览器通过 4G IP 访问 | 同上，但出网走 ppp0 |
 | API 状态 | `curl http://<board_ip>:8080/api/status` | 返回 JSON：model/swver/capture/ring_count 等 |
 | 配置修改 | `curl -X POST -d 'jpeg_quality=80' http://<board_ip>:8080/api/config` | 立即生效 |
-| 拍照 | `curl -o snap.jpg http://<board_ip>:8080/snapshot.jpg` | 下载得到单张 JPEG |
+| 拍照 | `curl -X POST http://<board_ip>:8080/api/photo` | 返回 SD 卡正式文件路径；`/snapshot.jpg` 仍是在线快照 |
+| 录像 | `curl -X POST -d action=start http://<board_ip>:8080/api/record` | 返回请求编号，查询 `/api/record` 状态 |
+| 控制 | `curl -X POST -d 'command=light&percent=50' http://<board_ip>:8080/api/control` | 统一控制队列设置临时补光，能力不可用时返回失败 |
 | OTA 升级 | `camctl ota /mnt/sd/ipcam-new <sha256> && camctl ota commit` | 重启后自动应用新版本 |
 
 ## 8. 关键命令速查
@@ -170,11 +185,21 @@ camctl ota <file> [sha256]                # 本地文件 OTA
 camctl ota url <url> [sha256]             # HTTP URL OTA
 camctl ota commit                         # 切换 + reboot
 camctl ota rollback                       # 回滚
+camctl capabilities                       # 已验证能力
+camctl record start|stop                  # 手动录像
+camctl photo                              # 独立拍照
+camctl control preview <0|1>              # 本地预览开关
+camctl control view <0|1> <zoom> <cx> <cy> # 本地视口
+camctl control mirror <0|1> <0|1>         # 水平/垂直翻转
+camctl control light <0..100>             # 临时补光
 
 http://<board_ip>:8080/                   # 浏览器实时预览
 http://<board_ip>:8080/snapshot.jpg      # 拍照
 http://<board_ip>:8080/stream.mjpg        # 流媒体
 ```
+
+固件首版只对外公布 `640×480、目标 15 fps` 档位；JPEG 质量可在运行时调整。
+分辨率和帧率的其它档位必须完成实机压力测试后再加入能力清单。
 
 ## 9. 借鉴的设计思想（参考 `mc-lib + mc-mid + mc-app` 分层）
 

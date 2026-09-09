@@ -22,9 +22,14 @@ typedef struct ipcam_encode_ctx_s {
     int                  width;      /* 协商后实际宽度 */
     int                  height;     /* 协商后实际高度 */
     ipcam_ring_buffer_t *in_rb;      /* 输入：YUYV */
-    ipcam_ring_buffer_t *out_rb;     /* 输出：JPEG 字节流 */
+    ipcam_ring_buffer_t *out_rb;     /* 输出：HTTP 最新帧 JPEG */
+    ipcam_ring_buffer_t *aux_rb;     /* 可选输出：录像专用 JPEG 队列 */
     volatile sig_atomic_t *running;
+    volatile sig_atomic_t service_running; /* 仅编码服务自身的生命周期 */
     int                  quality;    /* 1..100 */
+    pthread_mutex_t      stats_mtx;  /* 保护已完成 JPEG 编码计数 */
+    uint64_t             frames_encoded;
+    uint64_t             frames_dropped;
 
     pthread_t            thread;
 } ipcam_encode_ctx_t;
@@ -34,6 +39,15 @@ int  ipcam_encode_start(ipcam_encode_ctx_t *ctx,
                         ipcam_ring_buffer_t *out,
                         int src_w, int src_h,
                         volatile sig_atomic_t *running);
+int  ipcam_encode_start_ex(ipcam_encode_ctx_t *ctx,
+                           ipcam_ring_buffer_t *in,
+                           ipcam_ring_buffer_t *out,
+                           ipcam_ring_buffer_t *aux,
+                           int src_w, int src_h,
+                           volatile sig_atomic_t *running);
 void ipcam_encode_stop(ipcam_encode_ctx_t *ctx);
+/* 读取 JPEG 编码/跳过累计值，供主循环计算实际编码帧率。 */
+void ipcam_encode_get_stats(ipcam_encode_ctx_t *ctx, uint64_t *encoded,
+                            uint64_t *dropped);
 
 #endif /* IPCAM_ENCODE_H */

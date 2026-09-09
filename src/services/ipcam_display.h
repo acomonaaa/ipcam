@@ -12,8 +12,6 @@
  *
  * 当前仅支持 RGB565 16bpp framebuffer；其他 bpp 在启动时返回 -1。
  */
-#include "ipcam_ringbuffer.h"
-
 typedef struct ipcam_display_ctx_s {
     int      fb_fd;
     int      fb_w;
@@ -33,12 +31,44 @@ typedef struct ipcam_display_ctx_s {
 
     ipcam_ring_buffer_t *rb;    /* 读取端 */
     volatile sig_atomic_t *running;
+    volatile sig_atomic_t service_running; /* 仅显示服务自身的生命周期 */
     pthread_t  thread;
+    pthread_mutex_t view_mtx;
+    pthread_mutex_t preview_mtx; /* 保护供 GUI 复制的最新 RGB565 帧 */
+    pthread_mutex_t stats_mtx;    /* 保护已渲染帧累计值 */
+    uint64_t       frames_rendered;
+    unsigned short  *preview_base;
+    size_t           preview_size;
+    ipcam_frame_t    preview_frame;
+    int              preview_valid;
+    int              view_enabled;
+    int              screen_paused;
+    float            zoom;
+    float            center_x;
+    float            center_y;
 } ipcam_display_ctx_t;
 
 int  ipcam_display_start(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
                          int src_w, int src_h,
                          volatile sig_atomic_t *running);
 void ipcam_display_stop(ipcam_display_ctx_t *ctx);
+
+/* 设置本地观察视口；zoom 限制在 1～4，中心坐标为源图像归一化坐标。 */
+int ipcam_display_set_view(ipcam_display_ctx_t *ctx, int enabled,
+                           float zoom, float center_x, float center_y);
+/* 熄屏期间暂停 YUYV→RGB 转换但保留用户视口，唤醒时恢复原视图。 */
+int ipcam_display_set_screen_paused(ipcam_display_ctx_t *ctx, int paused);
+void ipcam_display_get_view(ipcam_display_ctx_t *ctx, int *enabled,
+                            float *zoom, float *center_x, float *center_y);
+/* 读取本地预览已渲染帧累计值，供 5 秒性能汇总计算实际帧率。 */
+void ipcam_display_get_stats(ipcam_display_ctx_t *ctx, uint64_t *rendered);
+/* 复制最新 RGB565 预览帧；调用方提供 out_data，成功后无需释放 ring 槽。 */
+int ipcam_display_preview_acquire(ipcam_display_ctx_t *ctx,
+                                  void *out_data, size_t out_cap,
+                                  ipcam_frame_t *out_frame);
+void ipcam_display_preview_release(ipcam_display_ctx_t *ctx,
+                                   ipcam_frame_t *frame);
+/* 通过 IPCAM_BACKLIGHT_PATH（亮度）和 IPCAM_BACKLIGHT_MAX（最大值）写入背光；0 用于自动熄屏。 */
+int ipcam_display_set_backlight_percent(int percent);
 
 #endif /* IPCAM_DISPLAY_H */
