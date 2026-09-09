@@ -7,9 +7,12 @@
 #include <stdint.h>
 #include "ipcam_ringbuffer.h"
 
+#define IPCAM_CAPTURE_DEVICE_PATH_MAX 128
+
 /*
  * V4L2 capture thread.
- * - 打开 /dev/video0
+ * - 未指定 IPCAM_VIDEO_DEV 时扫描 /dev/videoN，并选择已识别的 mx6s-csi
+ * - 显式指定 IPCAM_VIDEO_DEV 时仍执行 capability、格式和帧容量校验
  * - 协商 YUYV 4:2:2 @ IPCAM_CAPTURE_WIDTH x IPCAM_CAPTURE_HEIGHT
  * - 用 mmap 申请 N 个 video buffer，循环 DQBUF -> 拷贝到两条环形缓冲 -> QBUF
  *
@@ -19,7 +22,14 @@
 #include "ipcam_ringbuffer.h"
 
 typedef struct ipcam_capture_ctx_s {
-    int              fd;             /* /dev/video0 fd */
+    int              fd;             /* 已选择的 V4L2 设备 fd */
+    char             device_path[IPCAM_CAPTURE_DEVICE_PATH_MAX];
+    /*
+     * 正点原子 4.1.15 的 mx6s-csi 驱动在 S_FMT 中接受了 YUYV，却可能在
+     * G_FMT 中遗漏 pixelformat/布局字段。只有确认设备身份属于 mx6s-csi
+     * 时才启用兼容回退，避免把其它 V4L2 设备的错误格式当成 YUYV。
+     */
+    int              legacy_gfmt_pixelformat_missing;
     int              width;
     int              height;
     uint32_t         bytes_per_line; /* V4L2 实际行跨度 */

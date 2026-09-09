@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* WiFi 配置、进程和接口生命周期日志归入 WIFI 模块。 */
+#define IPCAM_LOG_MODULE "WIFI"
 #include "ipcam_netwifi.h"
 #include "ipcam_log.h"
 

@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* JPEG 转码与输出队列诊断归入 ENC 模块，便于串口按业务筛选。 */
+#define IPCAM_LOG_MODULE "ENC "
 #include "ipcam_encode.h"
 #include "ipcam_log.h"
 #include "ipcam_param.h"
@@ -24,15 +26,14 @@ static void encode_add_stats(ipcam_encode_ctx_t *ctx, uint64_t encoded,
 }
 
 /*
- * YUYV (packed 4:2:2) -> planar 4:2:2 (Y 整分辨率 + Cb/Cr 半宽整高)
+ * YUYV (packed 4:2:2) -> planar 4:2:0 (Y 整分辨率 + Cb/Cr 半宽半高)
  *
  * YUYV 字节布局：
  *   b0=Y0  b1=Cb0  b2=Y1  b3=Cr0  b4=Y2  b5=Cb1  b6=Y3  b7=Cr1  ...
  *
- * 输出：
- *   Y[i]   (i in [0, W*H))              = src[(i/W)*W*2 + (i%W)*2 + 0]
- *   Cb[j]  (j in [0, (W/2)*H))          = src[(j/(W/2))*W*2 + (j%(W/2))*4 + 1]
- *   Cr[j]  (j in [0, (W/2)*H))          = src[(j/(W/2))*W*2 + (j%(W/2))*4 + 3]
+ * 输出的 Cb/Cr 每个样本对应两行输入的平均值；奇数高度时最后一行
+ * 复制参与平均。这与 TJSAMP_420 的半高平面布局一致，避免只改采样
+ * 枚举却仍分配/填充 4:2:2 数据造成越界或颜色错位。
  */
 /*
  * 将带实际行跨度的 YUYV 帧拆为 libjpeg-turbo 所需的平面数据。
@@ -51,17 +52,30 @@ static void unpack_yuyv_to_planar(const unsigned char *src, int w, int h,
         int sy = mirror_v ? (h - 1 - y) : y;
         const unsigned char *srow = src + (size_t)sy * stride;
         unsigned char *yrow  = Y  + (size_t)y * row_pixels;
-        unsigned char *cbrow = Cb + (size_t)y * row_pairs;
-        unsigned char *crrow = Cr + (size_t)y * row_pairs;
         for (int x = 0; x < w; x++) {
             int sx = mirror_h ? (w - 1 - x) : x;
             yrow[x] = srow[sx * 2 + 0];
         }
+    }
+
+    int chroma_rows = (h + 1) / 2;
+    for (int cy = 0; cy < chroma_rows; cy++) {
+        int y0 = cy * 2;
+        int y1 = y0 + 1 < h ? y0 + 1 : y0;
+        int sy0 = mirror_v ? (h - 1 - y0) : y0;
+        int sy1 = mirror_v ? (h - 1 - y1) : y1;
+        const unsigned char *srow0 = src + (size_t)sy0 * stride;
+        const unsigned char *srow1 = src + (size_t)sy1 * stride;
+        unsigned char *cbrow = Cb + (size_t)cy * row_pairs;
+        unsigned char *crrow = Cr + (size_t)cy * row_pairs;
         for (int p = 0; p < row_pairs; p++) {
-            int sx = mirror_h ? (w - 2 - p * 2) : p * 2;
-            if (sx < 0) sx = 0;
-            cbrow[p] = srow[sx * 2 + 1];
-            crrow[p] = srow[sx * 2 + 3];
+            int pair = mirror_h ? (row_pairs - 1 - p) : p;
+            unsigned int cb = (unsigned int)srow0[pair * 4 + 1] +
+                              (unsigned int)srow1[pair * 4 + 1];
+            unsigned int cr = (unsigned int)srow0[pair * 4 + 3] +
+                              (unsigned int)srow1[pair * 4 + 3];
+            cbrow[p] = (unsigned char)((cb + 1U) / 2U);
+            crrow[p] = (unsigned char)((cr + 1U) / 2U);
         }
     }
 }
@@ -72,6 +86,7 @@ static void *encode_thread(void *arg)
     ipcam_encode_ctx_t *ctx = arg;
     ipcam_frame_t frame;
     unsigned long encoded = 0, skipped = 0;
+    unsigned long live_overwrites = 0;
     unsigned long record_drops = 0;
     struct timeval t0, t1;
 
@@ -81,18 +96,24 @@ static void *encode_thread(void *arg)
         return NULL;
     }
 
-    MLOGI("encode thread start, quality=%d w=%d h=%d\n",
-          ctx->quality, ctx->width, ctx->height);
+    /* 配置可能来自已持久化的 /etc/ipcam.conf，启动日志必须打印实际编码质量，
+     * 不能只打印编译期默认值，否则现场会误以为 q60 已经生效。 */
+    MLOGI("encode thread start, quality=%u w=%d h=%d\n",
+          ipcam_param_get_jpeg_quality(), ctx->width, ctx->height);
     gettimeofday(&t0, NULL);
 
     int W = ctx->width;
     int H = ctx->height;
     int Wp = W / 2;       /* pair width */
+    int Ch = (H + 1) / 2; /* TJSAMP_420 的色度平面高度 */
+    MLOGI("JPEG pipeline ready: samp=420 y=%zu chroma=%zu/%zu\n",
+          (size_t)W * (size_t)H, (size_t)Wp * (size_t)Ch,
+          (size_t)Wp * (size_t)Ch);
 
     /* planar 工作缓冲：每次循环复用，避免每帧 malloc */
     unsigned char *Yp  = malloc((size_t)W * H);
-    unsigned char *Cbp = malloc((size_t)Wp * H);
-    unsigned char *Crp = malloc((size_t)Wp * H);
+    unsigned char *Cbp = malloc((size_t)Wp * Ch);
+    unsigned char *Crp = malloc((size_t)Wp * Ch);
     if (!Yp || !Cbp || !Crp) {
         MLOGE("alloc YUV planes failed\n");
         free(Yp); free(Cbp); free(Crp);
@@ -104,7 +125,8 @@ static void *encode_thread(void *arg)
     unsigned long  jpeg_size = 0;
 
     while (*ctx->running && ctx->service_running) {
-        if (ipcam_ring_get(ctx->in_rb, &frame) != 0) break;
+        /* 编码速度低于采集速度时主动丢弃旧帧，避免延迟随时间线性增长。 */
+        if (ipcam_ring_get_latest(ctx->in_rb, &frame) != 0) break;
 
         size_t stride = frame.stride ? frame.stride : (size_t)W * 2;
         if (stride < (size_t)W * 2 || frame.size < stride * (size_t)H) {
@@ -128,7 +150,7 @@ static void *encode_thread(void *arg)
          * libjpeg-turbo 2.1.x 参数顺序为 (handle, planes, width, strides, height, …)。
          * 曾误写成 strides/W 对调，会导致压缩失败、崩溃或垃圾 JPEG。
          */
-        if (tjCompressFromYUVPlanes(tj, planes, W, strides, H, TJSAMP_422,
+        if (tjCompressFromYUVPlanes(tj, planes, W, strides, H, TJSAMP_420,
                                     &jpeg_buf, &jpeg_size,
                                     ipcam_param_get_jpeg_quality(),
                                     TJFLAG_FASTDCT) != 0) {
@@ -155,17 +177,37 @@ static void *encode_thread(void *arg)
         out_meta.width = (uint16_t)W;
         out_meta.height = (uint16_t)H;
         out_meta.config_generation = frame.config_generation;
-        if (ipcam_ring_try_append_latest_meta(ctx->out_rb, jpeg_buf, jpeg_size, &out_meta) != 0) {
-            /* HTTP 直播采用最新帧优先，慢客户端不能反压编码线程。 */
-            skipped++;
+        int live_rc = ipcam_ring_try_append_latest_meta(ctx->out_rb, jpeg_buf,
+                                                        jpeg_size, &out_meta);
+        if (live_rc > 0) {
+            /* 覆盖旧直播帧是低延迟策略的正常结果，不应算作编码失败。 */
+            live_overwrites++;
+        }
+        if (live_rc < 0) {
+            /* ring 关闭通常发生在停机阶段；仅记录输出失败，不污染编码丢帧统计。 */
+            MLOGW("live jpeg ring unavailable while encoding\n");
         }
         encoded++;
-        if (ctx->aux_rb && ipcam_ring_try_append_meta(ctx->aux_rb, jpeg_buf, jpeg_size, &out_meta) != 0) {
-            record_drops++;
-            if ((record_drops % 30) == 1) MLOGW("record jpeg ring full, dropping frame\n");
+        int record_rc = 0;
+        if (ctx->aux_rb) {
+            record_rc = ipcam_ring_try_append_meta(ctx->aux_rb, jpeg_buf, jpeg_size, &out_meta);
+            if (record_rc != 0) {
+                record_drops++;
+                if ((record_drops % 30) == 1) MLOGW("record jpeg ring full, dropping frame\n");
+            }
         }
 
         ipcam_ring_release(ctx->in_rb);
+        /*
+         * BCF2 的视频线程不会只在退出时给结果，而是打印首批帧和周期帧。
+         * 这里记录输入序号、JPEG 大小、时间戳以及两个消费者的结果，能直接
+         * 判断是编码慢、直播覆盖还是录像队列溢出，同时限制串口输出频率。
+         */
+        if (encoded <= 30 || (encoded % 30) == 0) {
+            MLOGI("frame no=%lu src_seq=%lu ts=%llu jpeg=%lu live_rc=%d record_rc=%d\n",
+                  encoded, frame.seqNo, (unsigned long long)frame.monotonic_ns,
+                  jpeg_size, live_rc, record_rc);
+        }
     }
 
     free(Yp); free(Cbp); free(Crp);
@@ -174,8 +216,9 @@ static void *encode_thread(void *arg)
 
     gettimeofday(&t1, NULL);
     double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) / 1e6;
-    MLOGI("encode thread exit, encoded=%lu skipped=%lu avg_fps=%.1f\n",
-          encoded, skipped, sec > 0 ? encoded / sec : 0);
+    MLOGI("encode thread exit, encoded=%lu skipped=%lu live_overwrites=%lu record_drops=%lu avg_fps=%.1f\n",
+          encoded, skipped, live_overwrites, record_drops,
+          sec > 0 ? encoded / sec : 0);
     return NULL;
 }
 
@@ -203,6 +246,9 @@ int ipcam_encode_start_ex(ipcam_encode_ctx_t *ctx,
         pthread_mutex_destroy(&ctx->stats_mtx);
         return -1;
     }
+    MLOGI("encode service ready: input=%dx%d quality=%u live_rb=%s record_rb=%s\n",
+          ctx->width, ctx->height, ipcam_param_get_jpeg_quality(),
+          ctx->out_rb ? "yes" : "no", ctx->aux_rb ? "yes" : "no");
     return 0;
 }
 
@@ -210,6 +256,10 @@ int ipcam_encode_start_ex(ipcam_encode_ctx_t *ctx,
 void ipcam_encode_stop(ipcam_encode_ctx_t *ctx)
 {
     if (!ctx) return;
+    uint64_t encoded = 0, dropped = 0;
+    ipcam_encode_get_stats(ctx, &encoded, &dropped);
+    MLOGI("encode stop requested: encoded=%llu dropped=%llu\n",
+          (unsigned long long)encoded, (unsigned long long)dropped);
     ctx->service_running = 0;
     /* 仅关闭编码服务自己的输入和输出，避免修改其它线程的运行状态。 */
     if (ctx->in_rb) ipcam_ring_close(ctx->in_rb);
@@ -221,6 +271,7 @@ void ipcam_encode_stop(ipcam_encode_ctx_t *ctx)
         ctx->thread = 0;
     }
     pthread_mutex_destroy(&ctx->stats_mtx);
+    MLOGI("encode stopped\n");
 }
 
 /* 兼容旧接口：不挂接录像队列。 */

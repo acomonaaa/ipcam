@@ -58,6 +58,17 @@ typedef enum {
 
 #define IPCAM_LOG_MODULE_DEFAULT  "ipcam"
 
+/*
+ * BCF2 的 MLOG 宏会在每个源文件通过 MO_LOG_MODULE 标记业务模块。
+ * ipcam 也按翻译单元提供 IPCAM_LOG_MODULE；未声明时继续使用
+ * ipcam_log_init() 设置的进程级模块名，兼容旧调用方。
+ */
+#ifdef IPCAM_LOG_MODULE
+#define IPCAM_LOG_DEFAULT_MODULE IPCAM_LOG_MODULE
+#else
+#define IPCAM_LOG_DEFAULT_MODULE ((const char *)0)
+#endif
+
 /* 公共 API（与 BCF2 mo_log_* 对齐） */
 void ipcam_log_init(const char *module);
 void ipcam_log_uninit(void);
@@ -90,18 +101,18 @@ void ipcam_log_printf(ipcam_log_level_t level, const char *module,
  *
  * 注意：FORMAT 必须包含 \n。
  */
-#define MLOGF(fmt, ...)  ipcam_log_printf(IPCAM_LOG_FATAL,   NULL, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
-#define MLOGP(fmt, ...)  ipcam_log_printf(IPCAM_LOG_PRINT,   NULL, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
-#define MLOGE(fmt, ...)  ipcam_log_printf(IPCAM_LOG_ERROR,   NULL, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
-#define MLOGW(fmt, ...)  ipcam_log_printf(IPCAM_LOG_WARNING, NULL, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
-#define MLOGI(fmt, ...)  ipcam_log_printf(IPCAM_LOG_INFO,    NULL, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
-#define MLOGD(fmt, ...)  ipcam_log_printf(IPCAM_LOG_DEBUG,   NULL, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define MLOGF(fmt, ...)  ipcam_log_printf(IPCAM_LOG_FATAL,   IPCAM_LOG_DEFAULT_MODULE, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define MLOGP(fmt, ...)  ipcam_log_printf(IPCAM_LOG_PRINT,   IPCAM_LOG_DEFAULT_MODULE, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define MLOGE(fmt, ...)  ipcam_log_printf(IPCAM_LOG_ERROR,   IPCAM_LOG_DEFAULT_MODULE, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define MLOGW(fmt, ...)  ipcam_log_printf(IPCAM_LOG_WARNING, IPCAM_LOG_DEFAULT_MODULE, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define MLOGI(fmt, ...)  ipcam_log_printf(IPCAM_LOG_INFO,    IPCAM_LOG_DEFAULT_MODULE, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define MLOGD(fmt, ...)  ipcam_log_printf(IPCAM_LOG_DEBUG,   IPCAM_LOG_DEFAULT_MODULE, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 
 /*
  * BCF2 的 MLOG 宏允许每个源文件声明自己的短模块名（如 MAIN、HTTP、SD）。
- * ipcam 大多数日志仍使用进程模块名，避免无意义地改写已有输出；媒体链路的
- * 关键运行日志使用下面这组显式模块宏，便于在串口或 /var/log/ipcam.log 中
- * 直接按 CAP / DISP / ENC / HTTP 定位问题，同时保留源文件和行号。
+ * 业务源文件可以直接声明 IPCAM_LOG_MODULE，便于在串口或
+ * /var/log/ipcam.log 中按 CAP / DISP / ENC / HTTP 定位问题，同时保留源文件
+ * 和行号；未声明模块的旧代码继续使用进程级模块名。
  */
 #define MLOGF_M(module, fmt, ...) ipcam_log_printf(IPCAM_LOG_FATAL,   module, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 #define MLOGP_M(module, fmt, ...) ipcam_log_printf(IPCAM_LOG_PRINT,   module, __FILE__, __LINE__, fmt, ##__VA_ARGS__)

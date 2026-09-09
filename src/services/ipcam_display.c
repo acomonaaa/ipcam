@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* LCD/framebuffer、预览视口和本地渲染日志归入 DISP 模块。 */
+#define IPCAM_LOG_MODULE "DISP"
 #include "ipcam_display.h"
 #include "ipcam_log.h"
 #include "ipcam_param.h"
@@ -14,6 +16,7 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <stdint.h>
 #include <unistd.h>
 
 #include "ipcam_config.h"
@@ -97,9 +100,27 @@ static int display_open_fb(ipcam_display_ctx_t *ctx)
         return -1;
     }
 
+    /* framebuffer 的可见窗口可能位于 virtual buffer 的偏移位置；先核验
+     * 虚拟尺寸和 offset，再让 LVGL flush 使用这些 offset，避免合法的局部
+     * 刷新因驱动参数异常写出 mmap 区域。 */
+    if (vinfo.xres == 0 || vinfo.yres == 0 ||
+        vinfo.xres_virtual < vinfo.xres ||
+        vinfo.yres_virtual < vinfo.yres ||
+        vinfo.xoffset > vinfo.xres_virtual - vinfo.xres ||
+        vinfo.yoffset > vinfo.yres_virtual - vinfo.yres) {
+        MLOGE("invalid fb geometry: visible=%ux%u virtual=%ux%u offset=%u,%u\n",
+              vinfo.xres, vinfo.yres, vinfo.xres_virtual, vinfo.yres_virtual,
+              vinfo.xoffset, vinfo.yoffset);
+        close(ctx->fb_fd);
+        ctx->fb_fd = -1;
+        return -1;
+    }
+
     ctx->fb_w  = vinfo.xres;
     ctx->fb_h  = vinfo.yres;
     ctx->fb_bpp = vinfo.bits_per_pixel;
+    ctx->fb_xoffset = (int)vinfo.xoffset;
+    ctx->fb_yoffset = (int)vinfo.yoffset;
     ctx->fb_line_length = (int)finfo.line_length;
     ctx->fb_size = finfo.smem_len;
 
@@ -117,9 +138,11 @@ static int display_open_fb(ipcam_display_ctx_t *ctx)
         ctx->fb_fd = -1;
         return -1;
     }
-    if (ctx->fb_size < (size_t)ctx->fb_line_length * (size_t)ctx->fb_h) {
-        MLOGE("fb memory=%zu below line_length*height=%zu\n", ctx->fb_size,
-              (size_t)ctx->fb_line_length * (size_t)ctx->fb_h);
+    uint64_t visible_end = ((uint64_t)ctx->fb_yoffset + (uint64_t)ctx->fb_h) *
+                           (uint64_t)ctx->fb_line_length;
+    if (visible_end > (uint64_t)ctx->fb_size) {
+        MLOGE("fb memory=%zu below offset framebuffer end=%llu\n", ctx->fb_size,
+              (unsigned long long)visible_end);
         close(ctx->fb_fd);
         ctx->fb_fd = -1;
         return -1;
@@ -164,9 +187,13 @@ static void *display_thread(void *arg)
     unsigned long last_seq = 0;
     while (*ctx->running && ctx->service_running) {
         int enabled;
+        int view_flag;
+        int paused_flag;
         float zoom, center_x, center_y;
         pthread_mutex_lock(&ctx->view_mtx);
-        enabled = ctx->view_enabled && !ctx->screen_paused &&
+        view_flag = ctx->view_enabled;
+        paused_flag = ctx->screen_paused;
+        enabled = view_flag && !paused_flag &&
                   ipcam_param_get_preview_enabled();
         zoom = ctx->zoom;
         center_x = ctx->center_x;
@@ -174,7 +201,11 @@ static void *display_thread(void *arg)
         pthread_mutex_unlock(&ctx->view_mtx);
         if (!enabled) {
             /* 预览关闭/熄屏时不复制或转换 YUYV；只在状态边沿清一次屏。 */
-            if (last_enabled != 0) memset(ctx->fb_base, 0, ctx->fb_size);
+            if (last_enabled != 0)
+                MLOGI("preview inactive: view=%d screen_paused=%d\n",
+                      view_flag, paused_flag);
+            if (last_enabled != 0 && ctx->framebuffer_writer_enabled)
+                memset(ctx->fb_base, 0, ctx->fb_size);
             pthread_mutex_lock(&ctx->preview_mtx);
             ctx->preview_valid = 0;
             pthread_mutex_unlock(&ctx->preview_mtx);
@@ -182,6 +213,9 @@ static void *display_thread(void *arg)
             usleep(50 * 1000);
             continue;
         }
+        if (last_enabled != 1)
+            MLOGI("preview active: zoom=%.2f center=%.3f,%.3f writer=%d\n",
+                  zoom, center_x, center_y, ctx->framebuffer_writer_enabled);
         last_enabled = 1;
 
         int latest_rc = ipcam_ring_copy_latest(ctx->rb, src_copy, src_cap,
@@ -241,10 +275,14 @@ static void *display_thread(void *arg)
                               crop_x, crop_y, crop_w, crop_h,
                               ipcam_param_get_mirror_horizontal(),
                               ipcam_param_get_mirror_vertical());
-        for (int y = 0; y < ctx->out_h; y++) {
-            memcpy((unsigned char *)ctx->fb_base + (size_t)y * ctx->fb_line_length,
-                   ctx->preview_base + (size_t)y * ctx->out_w,
-                   (size_t)ctx->out_w * sizeof(*ctx->preview_base));
+        if (ctx->framebuffer_writer_enabled) {
+            for (int y = 0; y < ctx->out_h; y++) {
+                memcpy((unsigned char *)ctx->fb_base +
+                           (size_t)(y + ctx->fb_yoffset) * ctx->fb_line_length +
+                           (size_t)ctx->fb_xoffset * sizeof(*ctx->preview_base),
+                       ctx->preview_base + (size_t)y * ctx->out_w,
+                       (size_t)ctx->out_w * sizeof(*ctx->preview_base));
+            }
         }
         ctx->preview_frame = frame;
         ctx->preview_frame.rawData = ctx->preview_base;
@@ -259,6 +297,13 @@ static void *display_thread(void *arg)
         ctx->frames_rendered++;
         pthread_mutex_unlock(&ctx->stats_mtx);
         frames++;
+        /* 与 BCF2 视频线程一致，首批帧和周期帧带上源序号/时间戳，便于把 LCD
+         * 卡顿与 CSI、颜色转换或 framebuffer 提交区分开。 */
+        if (frames <= 30 || (frames % 30) == 0) {
+            MLOGI("frame no=%lu src_seq=%lu ts=%llu src=%dx%d crop=%dx%d+%d+%d\n",
+                  frames, frame.seqNo, (unsigned long long)frame.monotonic_ns,
+                  src_w, src_h, crop_w, crop_h, crop_x, crop_y);
+        }
     }
 
     gettimeofday(&t1, NULL);
@@ -269,10 +314,14 @@ static void *display_thread(void *arg)
     return NULL;
 }
 
-/* 打开 framebuffer 并启动本地处理线程；失败只影响预览，不停止采集。 */
-int ipcam_display_start(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
-                        int src_w, int src_h,
-                        volatile sig_atomic_t *running)
+/*
+ * 打开 framebuffer 并启动本地处理线程；失败只影响预览，不停止采集。
+ * framebuffer_writer=0 时仍映射 framebuffer 以供 LVGL flush 复用，但显示线程
+ * 只维护独立 RGB565 预览副本，避免两个线程同时写 LCD 造成撕裂和控件消失。
+ */
+int ipcam_display_start_ex(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
+                           int src_w, int src_h, int framebuffer_writer,
+                           volatile sig_atomic_t *running)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->fb_fd = -1;
@@ -280,6 +329,7 @@ int ipcam_display_start(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
     ctx->rb = rb;
     ctx->running = running;
     ctx->service_running = 1;
+    ctx->framebuffer_writer_enabled = framebuffer_writer ? 1 : 0;
     ctx->src_w = src_w > 0 ? src_w : IPCAM_CAPTURE_WIDTH;
     ctx->src_h = src_h > 0 ? src_h : IPCAM_CAPTURE_HEIGHT;
     pthread_mutex_init(&ctx->view_mtx, NULL);
@@ -337,13 +387,28 @@ int ipcam_display_start(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
         pthread_mutex_destroy(&ctx->preview_mtx);
         return -1;
     }
+    MLOGI("display service ready: fb=%dx%d src=%dx%d writer=%d view=%d\n",
+          ctx->out_w, ctx->out_h, ctx->src_w, ctx->src_h,
+          ctx->framebuffer_writer_enabled, ctx->view_enabled);
     return 0;
+}
+
+/* 旧接口默认由 display 线程直接写屏，保留无 LVGL 构建/调试程序的行为。 */
+int ipcam_display_start(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
+                        int src_w, int src_h,
+                        volatile sig_atomic_t *running)
+{
+    return ipcam_display_start_ex(ctx, rb, src_w, src_h, 1, running);
 }
 
 /* 停止本地转换并释放 framebuffer，保持全局采集/编码运行标志不变。 */
 void ipcam_display_stop(ipcam_display_ctx_t *ctx)
 {
     if (!ctx) return;
+    uint64_t rendered = 0;
+    ipcam_display_get_stats(ctx, &rendered);
+    MLOGI("display stop requested: rendered=%llu\n",
+          (unsigned long long)rendered);
     /* 仅停止显示服务；不能修改 main 的全局运行标志，否则关闭 LCD
      * 会连带终止采集、编码和网络服务。关闭输入 ring 负责唤醒线程。 */
     ctx->service_running = 0;
@@ -367,6 +432,14 @@ void ipcam_display_stop(ipcam_display_ctx_t *ctx)
     pthread_mutex_destroy(&ctx->preview_mtx);
     pthread_mutex_destroy(&ctx->view_mtx);
     pthread_mutex_destroy(&ctx->stats_mtx);
+    MLOGI("display stopped\n");
+}
+
+/* 运行期切换 framebuffer 所有者；只在 LVGL 启动失败的回退分支调用。 */
+void ipcam_display_set_framebuffer_writer(ipcam_display_ctx_t *ctx, int enabled)
+{
+    if (!ctx) return;
+    ctx->framebuffer_writer_enabled = enabled ? 1 : 0;
 }
 
 /* 原子替换观察视口；中心坐标归一化到 0～1，zoom 限制在 1～4。 */
@@ -381,6 +454,8 @@ int ipcam_display_set_view(ipcam_display_ctx_t *ctx, int enabled,
     ctx->center_x = center_x;
     ctx->center_y = center_y;
     pthread_mutex_unlock(&ctx->view_mtx);
+    MLOGI("view changed: enabled=%d zoom=%.2f center=%.3f,%.3f\n",
+          enabled ? 1 : 0, zoom, center_x, center_y);
     return 0;
 }
 
@@ -391,6 +466,7 @@ int ipcam_display_set_screen_paused(ipcam_display_ctx_t *ctx, int paused)
     pthread_mutex_lock(&ctx->view_mtx);
     ctx->screen_paused = paused ? 1 : 0;
     pthread_mutex_unlock(&ctx->view_mtx);
+    MLOGI("screen preview %s\n", paused ? "paused" : "resumed");
     return 0;
 }
 
@@ -411,6 +487,7 @@ int ipcam_display_set_backlight_percent(int percent)
     int close_ok = fclose(fp) == 0;
     int rc = write_ok && close_ok ? 0 : -1;
     if (rc != 0) MLOGW("backlight write %s failed\n", path);
+    else MLOGI("backlight set: percent=%d value=%d path=%s\n", percent, value, path);
     return rc;
 }
 

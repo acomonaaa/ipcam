@@ -137,11 +137,13 @@ int ipcam_ring_try_append_latest_meta(ipcam_ring_buffer_t *rb, const void *in_da
                                       size_t in_bytes, const ipcam_frame_meta_t *meta)
 {
     if (!rb || !in_data || in_bytes > rb->slot_bytes) return -1;
+    int overwritten = 0;
     pthread_mutex_lock(&rb->mtx);
     if (rb->closed) { pthread_mutex_unlock(&rb->mtx); return -1; }
     if (rb->count >= rb->depth) {
         /* 直播只关心最新画面；主动释放最旧槽，避免 ring 满后永远不再前进。 */
         rb->dropped_count++;
+        overwritten = 1;
         rb->read_idx = (rb->read_idx + 1) % rb->depth;
         rb->count--;
     }
@@ -153,7 +155,7 @@ int ipcam_ring_try_append_latest_meta(ipcam_ring_buffer_t *rb, const void *in_da
     rb->count++;
     pthread_cond_signal(&rb->cond_not_empty);
     pthread_mutex_unlock(&rb->mtx);
-    return 0;
+    return overwritten;
 }
 
 /* 阻塞写入：录像等可靠队列可用，但不能接到采集生产者。 */
@@ -203,6 +205,40 @@ int ipcam_ring_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame)
     ipcam_slot_t *hdr = slot_hdr(mem);
     *out_frame = hdr->header;
     /* 注意：不移动 read_idx；release 时才推进 */
+    pthread_mutex_unlock(&rb->mtx);
+    return 0;
+}
+
+/*
+ * 低延迟消费者：编码线程不应按 FIFO 把已经落后的画面逐张压完。
+ * 采集生产者仍使用普通非阻塞写入，因而这里释放的只是尚未被消费者
+ * 持有的旧槽；返回的最新槽在 release 前不会被本接口再次覆盖。
+ */
+int ipcam_ring_get_latest(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame)
+{
+    if (!rb || !out_frame) return -1;
+
+    pthread_mutex_lock(&rb->mtx);
+    while (rb->count == 0 && !rb->closed) {
+        pthread_cond_wait(&rb->cond_not_empty, &rb->mtx);
+    }
+    if (rb->count == 0 && rb->closed) {
+        pthread_mutex_unlock(&rb->mtx);
+        return -1;
+    }
+
+    /* write_idx 指向下一个写槽；其前一个槽就是当前最新帧。 */
+    int latest_idx = (rb->write_idx + rb->depth - 1) % rb->depth;
+    int stale = rb->count - 1;
+    if (stale > 0) {
+        /* 这些帧尚未交给消费者，直接归还槽位并累计低延迟丢弃统计。 */
+        rb->dropped_count += (uint64_t)stale;
+        rb->read_idx = latest_idx;
+        rb->count = 1;
+        pthread_cond_broadcast(&rb->cond_not_full);
+    }
+
+    *out_frame = slot_hdr(rb->slot_mem[latest_idx])->header;
     pthread_mutex_unlock(&rb->mtx);
     return 0;
 }

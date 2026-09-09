@@ -9,6 +9,10 @@
 thirdparts/libjpeg-turbo/src/
 thirdparts/libjpeg-turbo/install/
 thirdparts/libjpeg-turbo/build/
+thirdparts/lvgl/src/
+
+# LVGL 和应用的中间对象；源码与配置仍由项目文件/外部依赖提供。
+/build/
 
 # Editor / OS
 *~

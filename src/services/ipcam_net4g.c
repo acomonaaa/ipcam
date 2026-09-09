@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* AT/PPP 拨号生命周期日志归入 4G 模块。 */
+#define IPCAM_LOG_MODULE "4G  "
 #include "ipcam_net4g.h"
 #include "ipcam_log.h"
 

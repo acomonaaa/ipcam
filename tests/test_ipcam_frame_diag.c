@@ -69,10 +69,51 @@ static void test_ring_metadata_roundtrip(void)
     ipcam_ring_destroy(rb);
 }
 
+static void test_ring_latest_consumer(void)
+{
+    unsigned char payload[3][4] = {
+        { 0x10, 0x11, 0x12, 0x13 },
+        { 0x20, 0x21, 0x22, 0x23 },
+        { 0x30, 0x31, 0x32, 0x33 }
+    };
+    ipcam_frame_t frame;
+    ipcam_ring_buffer_t *rb = ipcam_ring_create(3, sizeof(payload[0]));
+
+    assert(rb != NULL);
+    assert(ipcam_ring_try_append(rb, payload[0], sizeof(payload[0])) == 0);
+    assert(ipcam_ring_try_append(rb, payload[1], sizeof(payload[1])) == 0);
+    assert(ipcam_ring_try_append(rb, payload[2], sizeof(payload[2])) == 0);
+
+    /* 三帧排队时只应交付最新一帧，旧帧计入低延迟丢弃统计。 */
+    assert(ipcam_ring_get_latest(rb, &frame) == 0);
+    assert(frame.seqNo == 3);
+    assert(memcmp(frame.rawData, payload[2], sizeof(payload[2])) == 0);
+    assert(ipcam_ring_dropped_count(rb) == 2);
+    ipcam_ring_release(rb);
+    assert(ipcam_ring_count(rb) == 0);
+
+    /* 最新帧覆盖接口的返回值必须区分“成功覆盖”与“关闭/参数错误”。 */
+    assert(ipcam_ring_try_append_latest_meta(rb, payload[0], sizeof(payload[0]), NULL) == 0);
+    assert(ipcam_ring_try_append_latest_meta(rb, payload[1], sizeof(payload[1]), NULL) == 0);
+    assert(ipcam_ring_try_append_latest_meta(rb, payload[2], sizeof(payload[2]), NULL) == 0);
+    assert(ipcam_ring_try_append_latest_meta(rb, payload[0], sizeof(payload[0]), NULL) == 1);
+    assert(ipcam_ring_dropped_count(rb) == 3);
+    assert(ipcam_ring_get_latest(rb, &frame) == 0);
+    assert(frame.seqNo == 7);
+    assert(memcmp(frame.rawData, payload[0], sizeof(payload[0])) == 0);
+    ipcam_ring_release(rb);
+
+    /* 关闭后仍允许先消费残留帧；清空后 get_latest 必须正常退出。 */
+    ipcam_ring_close(rb);
+    assert(ipcam_ring_get_latest(rb, &frame) == -1);
+    ipcam_ring_destroy(rb);
+}
+
 int main(void)
 {
     test_probe_stride_and_mutation();
     test_ring_metadata_roundtrip();
+    test_ring_latest_consumer();
     puts("ipcam frame diagnostic tests: PASS");
     return 0;
 }

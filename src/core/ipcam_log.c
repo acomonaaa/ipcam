@@ -95,7 +95,7 @@ static void detect_color(void)
     s_use_color = s_out == NULL && isatty(STDERR_FILENO);
 }
 
-/* 初始化日志状态并尝试切换到 tmpfs 文件；失败时保留 stderr，不能阻塞主流程。 */
+/* 初始化日志状态；启动脚本可用 IPCAM_LOG_FILE 把 stderr 接到串口控制台。 */
 void ipcam_log_init(const char *module)
 {
     if (module && *module) ipcam_log_setmodule(module);
@@ -125,10 +125,12 @@ void ipcam_log_init(const char *module)
     if (slash) { *slash = '\0'; if (*log_dir) mkdir(log_dir, 0755); }
     ipcam_log_redirect_to_file(log_path);
 
-    /* 简单的级别公告，方便看进程启动 */
-    fprintf(stderr, "%s[ipcam] log init: module=%s level=%d(%s) color=%d\n",
+    /* 公告实际生效的位置；/dev/console 失败时明确显示已经回退到 stderr。 */
+    const char *effective_path = s_out_path[0] ? s_out_path : "stderr";
+    fprintf(stderr, "%s[ipcam] log init: module=%s level=%d(%s) color=%d file=%s\n",
             s_use_color ? IPCAM_DARK_GREY : "",
-            s_module, (int)s_level, s_level_name[(int)s_level], s_use_color);
+            s_module, (int)s_level, s_level_name[(int)s_level], s_use_color,
+            effective_path);
 }
 
 /* 仅在 s_print_mtx 已持有时调用，避免日志轮转再次获取同一把锁。 */

@@ -1,4 +1,7 @@
 #define _GNU_SOURCE
+/* camctl 走 HTTP 控制面；命令发起与结果日志归入 CLI 模块。 */
+#define IPCAM_LOG_MODULE "CLI "
+
 #include "ipcam_cli.h"
 #include "ipcam_log.h"
 #include "ipcam_ota.h"

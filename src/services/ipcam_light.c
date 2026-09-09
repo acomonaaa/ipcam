@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* 补光控制是独立硬件路径，沿用 BCF2 的模块化日志格式便于定位节点问题。 */
+#define IPCAM_LOG_MODULE "LIGHT"
 
 #include "ipcam_light.h"
 #include "ipcam_log.h"

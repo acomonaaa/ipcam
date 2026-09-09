@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* HTTP 请求、MJPEG 会话和客户端生命周期归入 HTTP 模块。 */
+#define IPCAM_LOG_MODULE "HTTP"
 #include "ipcam_stream.h"
 #include "ipcam_log.h"
 #include "ipcam_ota.h"
@@ -57,20 +59,26 @@ static ssize_t safe_write(int fd, const void *buf, size_t len)
         ssize_t n = write(fd, (const char *)buf + sent, len - sent);
         if (n < 0) {
             if (errno == EINTR) continue;
+            MLOGW("socket write failed: fd=%d len=%zu errno=%d(%s)\n",
+                  fd, len - sent, errno, strerror(errno));
             return -1;
         }
-        if (n == 0) return -1;
+        if (n == 0) {
+            MLOGW("socket write returned zero: fd=%d len=%zu\n", fd, len - sent);
+            return -1;
+        }
         sent += n;
     }
     return (ssize_t)sent;
 }
 
+/* 根页面只负责呈现直播：让 4:3 图像占满视口可用空间，超出的宽度用黑边保留比例。 */
 static const char *serve_index_body =
     "<!doctype html><html><head><meta charset='utf-8'>"
-    "<title>ipcam</title>"
-    "<style>body{margin:0;background:#000;color:#fff;font-family:sans-serif;text-align:center}"
-    "h3{margin:6px}img{max-width:100%;display:block;margin:0 auto}</style></head>"
-    "<body><h3>ipcam live</h3>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>"
+    "<style>html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#000}"
+    "img{width:100vw;height:100vh;display:block;object-fit:contain;background:#000}</style></head>"
+    "<body>"
     "<img src='/stream.mjpg' alt='live stream'>"
     "</body></html>";
 
@@ -704,7 +712,8 @@ static void serve_snapshot(int fd, ipcam_ring_buffer_t *jpeg_rb, pthread_mutex_t
     free(local);
 }
 
-static void serve_stream(int fd, ipcam_ring_buffer_t *jpeg_rb, pthread_mutex_t *ring_mtx,
+static void serve_stream(int fd, unsigned long sid,
+                         ipcam_ring_buffer_t *jpeg_rb, pthread_mutex_t *ring_mtx,
                          volatile sig_atomic_t *running,
                          volatile sig_atomic_t *service_running)
 {
@@ -715,15 +724,23 @@ static void serve_stream(int fd, ipcam_ring_buffer_t *jpeg_rb, pthread_mutex_t *
         "Connection: close\r\n"
         "\r\n";
 
-    if (safe_write(fd, hdr, strlen(hdr)) < 0) return;
+    if (safe_write(fd, hdr, strlen(hdr)) < 0) {
+        MLOGW("stream header failed: sid=%lu fd=%d\n", sid, fd);
+        return;
+    }
 
     /* 每个客户端只复制“最新帧”，不消费共享 ring。
      * 这样慢客户端会自然跳帧，也不会阻塞其它客户端或编码线程。 */
     (void)ring_mtx;
     size_t local_cap = ipcam_ring_capacity(jpeg_rb);
     unsigned char *local = local_cap ? malloc(local_cap) : NULL;
-    if (!local) return;
+    if (!local) {
+        MLOGE("stream buffer allocation failed: sid=%lu capacity=%zu\n",
+              sid, local_cap);
+        return;
+    }
     unsigned long last_seq = 0;
+    unsigned long frames_sent = 0;
 
     /* 既要响应进程退出，也要响应只停止 HTTP 服务的局部生命周期；
      * 旧实现只检查 running，main 关闭直播时会因客户端仍在等待新帧而无法收敛。 */
@@ -749,12 +766,23 @@ static void serve_stream(int fd, ipcam_ring_buffer_t *jpeg_rb, pthread_mutex_t *
         if (safe_write(fd, part_hdr, (size_t)hn) < 0) goto cleanup;
         if (frame_size > 0 && safe_write(fd, local, frame_size) < 0) goto cleanup;
         if (safe_write(fd, "\r\n", 2) < 0) goto cleanup;
+        frames_sent++;
+        /* 慢客户端只取最新帧；按首批/周期帧记录发送序号，能直接判断网络
+         * 卡顿还是编码端没有产生新 JPEG，同时不会按 15 fps 刷屏。 */
+        if (frames_sent <= 3 || (frames_sent % 30) == 0) {
+            MLOGI("stream frame: sid=%lu no=%lu seq=%lu bytes=%zu\n",
+                  sid, frames_sent, f.seqNo, frame_size);
+        }
         continue;
 cleanup:
+        MLOGI("stream session drain: sid=%lu frames=%lu last_seq=%lu\n",
+              sid, frames_sent, last_seq);
         free(local);
         return;
     }
 
+    MLOGI("stream session drain: sid=%lu frames=%lu last_seq=%lu reason=service_stop\n",
+          sid, frames_sent, last_seq);
     free(local);
 }
 
@@ -1009,9 +1037,9 @@ static void handle_client(int fd, ipcam_ring_buffer_t *jpeg_rb, ipcam_stream_ctx
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/stream.mjpg") == 0) {
         unsigned long sid = next_session_id();
         MLOGI("stream session start sid=%lu path=%s\n", sid, path);
-        serve_stream(fd, jpeg_rb, &ctx->ring_mtx, ctx->running,
+        serve_stream(fd, sid, jpeg_rb, &ctx->ring_mtx, ctx->running,
                      &ctx->service_running);
-        MLOGI("stream session end   sid=%lu\n", sid);
+        MLOGI("stream session end sid=%lu\n", sid);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/snapshot.jpg") == 0) {
         serve_snapshot(fd, jpeg_rb, &ctx->ring_mtx);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/status") == 0) {
@@ -1102,11 +1130,16 @@ static void *client_thread(void *arg)
     close(a->cfd);
 
     pthread_mutex_lock(&ctx->client_mtx);
+    int active_clients;
     if (a->slot >= 0 && a->slot < IPCAM_MAX_TRACKED_CLIENTS)
         ctx->client_fds[a->slot] = -1;
     if (ctx->client_cnt > 0) ctx->client_cnt--;
+    active_clients = ctx->client_cnt;
     pthread_cond_broadcast(&ctx->client_cond);
     pthread_mutex_unlock(&ctx->client_mtx);
+
+    MLOGI("client disconnected fd=%d slot=%d active=%d\n",
+          a->cfd, a->slot, active_clients);
 
     free(a);
     return NULL;
@@ -1302,6 +1335,7 @@ int ipcam_stream_start_ex(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
         stream_destroy_sync(ctx);
         return -1;
     }
+    MLOGI("HTTP service ready: bind=%s port=%d\n", bind_ip, ctx->port);
     return 0;
 }
 
@@ -1339,6 +1373,10 @@ void ipcam_stream_set_screen(ipcam_stream_ctx_t *ctx, ipcam_screen_ctx_t *screen
 void ipcam_stream_stop(ipcam_stream_ctx_t *ctx)
 {
     if (!ctx) return;
+    pthread_mutex_lock(&ctx->client_mtx);
+    int clients_before_stop = ctx->client_cnt;
+    pthread_mutex_unlock(&ctx->client_mtx);
+    MLOGI("HTTP stop requested: clients=%d\n", clients_before_stop);
     /* 只关闭 HTTP 服务；采集、编码和录像由各自的生命周期管理。 */
     ctx->service_running = 0;
     /* 关 listen_fd 让 accept() 立刻失败退出 */
@@ -1365,4 +1403,5 @@ void ipcam_stream_stop(ipcam_stream_ctx_t *ctx)
     pthread_mutex_unlock(&ctx->client_mtx);
 
     stream_destroy_sync(ctx);
+    MLOGI("HTTP stopped: clients=0\n");
 }

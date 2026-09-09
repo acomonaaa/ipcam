@@ -82,7 +82,7 @@ typedef struct ipcam_ring_buffer_s {
     int       closed;          /* 1 = 关闭（生产者退出） */
 
     unsigned long seq_counter;
-    uint64_t dropped_count;      /* 满队列丢弃/覆盖的帧数，供录像可靠性监控 */
+    uint64_t dropped_count;      /* 覆盖或主动跳过的过期帧数，供媒体链路监控 */
 } ipcam_ring_buffer_t;
 
 /*
@@ -114,7 +114,8 @@ int ipcam_ring_append_meta(ipcam_ring_buffer_t *rb, const void *in_data,
 int ipcam_ring_try_append(ipcam_ring_buffer_t *rb, const void *in_data, size_t in_bytes);
 int ipcam_ring_try_append_meta(ipcam_ring_buffer_t *rb, const void *in_data,
                                size_t in_bytes, const ipcam_frame_meta_t *meta);
-/* 最新帧队列写入：满时丢弃最旧帧，保证生产者不会因无人消费而永久停滞。 */
+/* 最新帧队列写入：满时丢弃最旧帧，保证生产者不会因无人消费而永久停滞。
+ * 返回 0=写入且未覆盖旧帧，1=写入成功并覆盖旧帧，-1=关闭或参数错误。 */
 int ipcam_ring_try_append_latest_meta(ipcam_ring_buffer_t *rb, const void *in_data,
                                       size_t in_bytes, const ipcam_frame_meta_t *meta);
 
@@ -125,6 +126,14 @@ int ipcam_ring_try_append_latest_meta(ipcam_ring_buffer_t *rb, const void *in_da
  * 返回 0=成功，-1=已关闭且无帧。
  */
 int ipcam_ring_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame);
+
+/*
+ * 消费者取最新一帧：等待语义与 ipcam_ring_get 相同，但返回前会释放已经
+ * 排队的过期帧，只保留当前最新槽。调用者仍必须与 ipcam_ring_release 成对
+ * 使用；该接口只适用于同一 ring 的单消费者模型。
+ * 返回 0=成功，-1=已关闭且无帧。
+ */
+int ipcam_ring_get_latest(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame);
 
 /* 非阻塞取帧：0=成功，1=当前为空，-1=已关闭或参数错误；成功后仍须 release。 */
 int ipcam_ring_try_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame);

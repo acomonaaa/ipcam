@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* BCF2 按源文件区分日志模块；主编排日志统一标记为 MAIN。 */
+#define IPCAM_LOG_MODULE "MAIN"
 #include "ipcam_capture.h"
 #include "ipcam_cli.h"
 #include "ipcam_control.h"
@@ -6,6 +8,7 @@
 #include "ipcam_encode.h"
 #include "ipcam_log.h"
 #include "ipcam_light.h"
+#include "ipcam_lvgl.h"
 #include "ipcam_net4g.h"
 #include "ipcam_netwifi.h"
 #include "ipcam_ota.h"
@@ -46,6 +49,7 @@ typedef struct {
     int record_started;
     int touch_started;
     int screen_started;
+    int lvgl_started;
     int stream_started;
     int control_started;
 
@@ -58,6 +62,7 @@ typedef struct {
     ipcam_record_ctx_t   rec;
     ipcam_touch_ctx_t    touch;
     ipcam_screen_ctx_t   screen;
+    ipcam_lvgl_ctx_t     lvgl;
     ipcam_stream_ctx_t   http;
     ipcam_control_ctx_t  control;
 
@@ -70,6 +75,7 @@ typedef struct {
     struct {
         ipcam_screen_ctx_t *screen;
         ipcam_display_ctx_t *display;
+        ipcam_lvgl_ctx_t *lvgl;
         int active;
         int id0;
         int id1;
@@ -102,10 +108,15 @@ static void reset_touch_gesture(subsys_t *s)
 static void on_touch_report(const ipcam_touch_point_t *points, int count, void *opaque)
 {
     subsys_t *s = opaque;
-    if (!s || !s->touch_runtime.screen) return;
-    ipcam_screen_touch(s->touch_runtime.screen, count);
-    /* 熄屏唤醒的首个触摸只负责亮屏，不能误触发缩放或按钮动作。 */
-    if (!ipcam_screen_accept_input(s->touch_runtime.screen)) return;
+    if (!s) return;
+    if (s->touch_runtime.screen) {
+        ipcam_screen_touch(s->touch_runtime.screen, count);
+        /* 熄屏唤醒的首个触摸只负责亮屏，不能误触发缩放或按钮动作。 */
+        if (!ipcam_screen_accept_input(s->touch_runtime.screen)) return;
+    }
+    /* LVGL 只接收已经完成坐标归一化的快照，避免它再次读取同一个 evdev。 */
+    if (s->touch_runtime.lvgl)
+        ipcam_lvgl_touch_report(s->touch_runtime.lvgl, points, count);
     if (count < 2 || !s->touch_runtime.display) {
         reset_touch_gesture(s);
         return;
@@ -216,6 +227,7 @@ static void cleanup_all(subsys_t *s)
     if (s->control_started) { MLOGI("stopping control\n");       ipcam_control_deinit(&s->control); s->control_started = 0; }
     if (s->record_started)  { MLOGI("stopping recorder\n");      ipcam_record_stop(&s->rec);  s->record_started = 0; }
     if (s->touch_started)   { MLOGI("stopping touch\n");         ipcam_touch_stop(&s->touch); s->touch_started = 0; }
+    if (s->lvgl_started)    { MLOGI("stopping lvgl\n");          ipcam_lvgl_stop(&s->lvgl); s->lvgl_started = 0; }
     if (s->screen_started)  { MLOGI("stopping screen\n");        ipcam_screen_stop(&s->screen); s->screen_started = 0; }
     if (s->encode_started)  { MLOGI("stopping encode\n");        ipcam_encode_stop(&s->enc);   s->encode_started = 0; }
     if (s->display_started) { MLOGI("stopping display\n");       ipcam_display_stop(&s->dis);  s->display_started = 0; }
@@ -283,12 +295,19 @@ static int run_daemon(void)
             if (!ppp_peer || !*ppp_peer) ppp_peer = IPCAM_4G_PPP_PEER;
             MLOGI("4G config at_dev=%s ppp_peer=%s\n", at_dev, ppp_peer);
             ipcam_net_4g_init(&s.net4g, ipcam_param_get_apn(), at_dev, ppp_peer);
-            if (ipcam_net_4g_start(&s.net4g) == 0) s.net_started = 1;
+            if (ipcam_net_4g_start(&s.net4g) == 0) {
+                s.net_started = 1;
+                MLOGI("4G service ready: at_dev=%s ppp_peer=%s\n",
+                      s.net4g.at_dev, s.net4g.ppp_peer);
+            }
             else MLOGW("4G start failed, continuing in local-only mode\n");
         } else {
             ipcam_net_wifi_init(&s.netwf, ipcam_param_get_wifi_ssid(),
                                 ipcam_param_get_wifi_psk(), "wlan0");
-            if (ipcam_net_wifi_start(&s.netwf) == 0) s.net_started = 1;
+            if (ipcam_net_wifi_start(&s.netwf) == 0) {
+                s.net_started = 1;
+                MLOGI("WiFi service ready: ifname=%s\n", s.netwf.ifname);
+            }
             else MLOGW("WiFi start failed, continuing in local-only mode\n");
         }
     } else {
@@ -311,6 +330,9 @@ static int run_daemon(void)
         cleanup_all(&s);
         return 1;
     }
+    MLOGI("YUYV rings ready: depth=%d slot=%zu/%zu\n",
+          IPCAM_RING_DEPTH, ipcam_ring_capacity(s.rb_yuyv_disp),
+          ipcam_ring_capacity(s.rb_yuyv_enc));
 
     /* JPEG 上限按原始 YUYV 尺寸估算并设最低 1 MiB，避免高质量/高分辨率
      * 帧超过旧的固定 256 KiB 槽后被静默丢弃。 */
@@ -323,6 +345,9 @@ static int run_daemon(void)
         cleanup_all(&s);
         return 1;
     }
+    MLOGI("JPEG rings ready: live_depth=%d record_depth=%d slot=%zu\n",
+          IPCAM_RING_DEPTH, IPCAM_RECORD_RING_DEPTH,
+          ipcam_ring_capacity(s.rb_jpeg));
 
     /* 3) 启动线程（顺序：capture -> display -> encode -> record -> stream）。
      * 采集或 LCD 失败时仍保留控制/状态/HTTP 服务，让上位机能看到具体故障，
@@ -335,10 +360,29 @@ static int run_daemon(void)
         ipcam_capture_get_dimensions(&s.cap, &cap_w, &cap_h);
         MLOGI("capture final dims: %dx%d\n", cap_w, cap_h);
 
-        if (ipcam_display_start(&s.dis, s.rb_yuyv_disp, cap_w, cap_h, &g_running) < 0) {
+        const char *lvgl_env = getenv("IPCAM_LVGL");
+        int lvgl_requested = IPCAM_LVGL_ENABLE;
+        if (lvgl_env && *lvgl_env) lvgl_requested = strcmp(lvgl_env, "0") != 0;
+
+        /* LVGL 接管 LCD 刷新时，display 线程仍保留预览帧生产能力，但不再
+         * 与 LVGL 同时写 framebuffer，避免两个线程交错覆盖同一块显存。 */
+        if (ipcam_display_start_ex(&s.dis, s.rb_yuyv_disp, cap_w, cap_h,
+                                   lvgl_requested ? 0 : 1, &g_running) < 0) {
             MLOGW("display start failed; keep network/recording services alive\n");
         } else {
             s.display_started = 1;
+            MLOGI("display pipeline started: lvgl_requested=%d\n", lvgl_requested);
+            if (lvgl_requested) {
+                if (ipcam_lvgl_start(&s.lvgl, &s.dis, &g_running) == 0) {
+                    s.lvgl_started = 1;
+                    MLOGI("LVGL display frontend ready\n");
+                } else {
+                    /* LVGL 初始化失败时恢复旧的直接 framebuffer 路径，保证
+                     * 显示能力降级而不是让 LCD 停留在黑屏。 */
+                    ipcam_display_set_framebuffer_writer(&s.dis, 1);
+                    MLOGW("lvgl start failed; fallback to direct framebuffer writer\n");
+                }
+            }
         }
 
         if (s.display_started &&
@@ -346,18 +390,28 @@ static int run_daemon(void)
                                ipcam_param_get_backlight_percent(),
                                ipcam_param_get_screen_timeout_min()) == 0) {
             s.screen_started = 1;
+            MLOGI("screen power service started\n");
         } else if (s.display_started) {
             MLOGW("screen power service start failed\n");
         }
     }
 
-    /* 触摸设备路径由板级配置提供；未配置或设备不存在时不阻塞视频服务。 */
+    /* 触摸设备默认采用板上实测的 Goodix event1；环境变量仍可覆盖，便于
+     * 不同硬件变体或临时诊断。未配置/不存在时不阻塞视频服务。 */
     const char *touch_dev = getenv("IPCAM_TOUCH_DEV");
+    if (!touch_dev || !*touch_dev) touch_dev = IPCAM_TOUCH_DEV;
     s.touch_runtime.screen = s.screen_started ? &s.screen : NULL;
     s.touch_runtime.display = s.display_started ? &s.dis : NULL;
-    if (touch_dev && *touch_dev && s.touch_runtime.screen && s.touch_runtime.display &&
-        ipcam_touch_start(&s.touch, touch_dev, on_touch_report, &s) == 0) {
+    s.touch_runtime.lvgl = s.lvgl_started ? &s.lvgl : NULL;
+    if (touch_dev && *touch_dev && s.touch_runtime.display &&
+        (s.touch_runtime.screen || s.touch_runtime.lvgl) &&
+        ipcam_touch_start_ex(&s.touch, touch_dev, s.dis.out_w, s.dis.out_h,
+                             on_touch_report, &s) == 0) {
         s.touch_started = 1;
+        MLOGI("touch started: %s\n", touch_dev);
+    } else if (touch_dev && *touch_dev && s.touch_runtime.display &&
+               (s.touch_runtime.screen || s.touch_runtime.lvgl)) {
+        MLOGW("touch start failed: %s\n", touch_dev);
     }
 
     if (s.capture_started &&
@@ -366,6 +420,7 @@ static int run_daemon(void)
         MLOGE("encode start failed; keep status service alive\n");
     } else if (s.capture_started) {
         s.encode_started = 1;
+        MLOGI("encode pipeline started\n");
     }
 
     /* display-only 模式（encode stub 设置 quality=0 sentinel）：跳过 stream */
@@ -379,6 +434,7 @@ static int run_daemon(void)
             MLOGE("record service start failed; continue without recording\n");
         } else {
             s.record_started = 1;
+            MLOGI("record pipeline started\n");
         }
     }
 
@@ -394,12 +450,14 @@ static int run_daemon(void)
         return 1;
     }
     s.control_started = 1;
+    MLOGI("control pipeline started\n");
 
     if (!encode_is_stub) {
         if (ipcam_stream_start_ex(&s.http, s.rb_jpeg, &g_running, &s.control) < 0) {
             MLOGE("http stream start failed; local control remains available\n");
         } else {
             s.stream_started = 1;
+            MLOGI("HTTP pipeline started\n");
             ipcam_stream_set_recorder(&s.http, s.record_started ? &s.rec : NULL);
             ipcam_stream_set_display(&s.http, s.display_started ? &s.dis : NULL);
             ipcam_stream_set_screen(&s.http, s.screen_started ? &s.screen : NULL);
@@ -408,8 +466,10 @@ static int run_daemon(void)
         MLOGW("encode stub detected (display-only build); skipping HTTP stream\n");
     }
 
-    MLOGI("ipcam running. Visit http://<board_ip>:%d/ in a browser.\n",
-          ipcam_param_get_http_port());
+    MLOGI("ipcam running: http_port=%d capture=%dx%d@%u jpeg_q=%u preview=%u\n",
+          ipcam_param_get_http_port(), cap_w, cap_h,
+          ipcam_param_get_target_fps(), ipcam_param_get_jpeg_quality(),
+          ipcam_param_get_preview_enabled());
     unsigned metrics_tick = 0;
     uint64_t prev_capture_frames = 0;
     uint64_t prev_encode_frames = 0;

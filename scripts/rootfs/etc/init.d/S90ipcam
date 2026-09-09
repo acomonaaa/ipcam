@@ -31,11 +31,15 @@ is_running() {
 
 ensure_runtime() {
     # NFS rootfs 的 /var/log、/var/run 可能尚未被基础 rootfs 创建；先准备目录，
-    # 再验证日志文件可写，避免后台启动失败后只留下“started”假象。
+    # 只有在串口控制台不可用时才要求回退日志文件可写，避免串口可用时被
+    # 无关的文件系统权限阻断启动。
     mkdir -p /var/log /var/run 2>/dev/null || {
         echo "[S90ipcam] ERROR: cannot create /var/log or /var/run" >&2
         return 1
     }
+    if [ -c "$CONSOLE_DEV" ] && : > "$CONSOLE_DEV" 2>/dev/null; then
+        return 0
+    fi
     if ! : >> "$LOGFILE" 2>/dev/null; then
         echo "[S90ipcam] ERROR: cannot write $LOGFILE" >&2
         return 1
@@ -166,16 +170,17 @@ start_once() {
     rm -f "$PIDFILE"
 
     # 不能使用 BusyBox 启动器的后台选项 -b：该选项会把 stdout/stderr 重定向到
-    # /dev/null。应用的结构化日志默认写 stderr，因此优先直接接到串口控制台，
-    # 让 run mybootnet 后无需手工 tail；-m 仍负责写入真实 daemon PID。
+    # /dev/null。应用的结构化日志默认写 stderr，因此优先直接接到串口控制台；
+    # 同时显式设置 IPCAM_LOG_FILE，覆盖应用默认的 tmpfs 文件输出，让 run
+    # mybootnet 后可以实时看到日志；-m 仍负责写入真实 daemon PID。
     if [ -c "$CONSOLE_DEV" ] && : > "$CONSOLE_DEV" 2>/dev/null; then
         app_output="$CONSOLE_DEV"
-        start-stop-daemon -S -m -p "$PIDFILE" -x "$DAEMON" -- \
+        IPCAM_LOG_FILE="$CONSOLE_DEV" start-stop-daemon -S -m -p "$PIDFILE" -x "$DAEMON" -- \
             </dev/null >"$CONSOLE_DEV" 2>&1 &
     else
         app_output="$LOGFILE"
         s90_log "WARN: $CONSOLE_DEV unavailable; application output falls back to $LOGFILE"
-        start-stop-daemon -S -m -p "$PIDFILE" -x "$DAEMON" -- \
+        IPCAM_LOG_FILE="$LOGFILE" start-stop-daemon -S -m -p "$PIDFILE" -x "$DAEMON" -- \
             </dev/null >>"$LOGFILE" 2>&1 &
     fi
 
@@ -193,7 +198,7 @@ start_once() {
         s90_log "ERROR: ipcam process not running; check serial console or $LOGFILE"
         return 1
     fi
-    s90_log "started, pid=$pid, output=$app_output, diagnostics=$LOGFILE"
+    s90_log "started, pid=$pid, output=$app_output, IPCAM_LOG_FILE=$app_output, diagnostics=$LOGFILE"
 
     # Watchdog：仅在 .prev 存在（即刚做过 commit）才等待 + rollback
     if [ -f "$PREV" ]; then

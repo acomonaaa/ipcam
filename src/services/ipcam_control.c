@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 
+/* 统一控制命令的受理、校验和结果日志归入 CTRL 模块。 */
+#define IPCAM_LOG_MODULE "CTRL"
 #include "ipcam_control.h"
 #include "ipcam_config.h"
 #include "ipcam_log.h"
@@ -38,6 +40,69 @@ static uint8_t probe_touch_points(void)
     if (points < 2) return 0;
     if (points > IPCAM_TOUCH_MAX_POINTS) points = IPCAM_TOUCH_MAX_POINTS;
     return (uint8_t)points;
+}
+
+/* 将统一控制命令转换成稳定的日志文本；不把无关的请求体原样打到串口。 */
+static const char *control_command_name(ipcam_control_command_type_t type)
+{
+    switch (type) {
+    case IPCAM_CONTROL_SET_VIDEO: return "set_video";
+    case IPCAM_CONTROL_SET_MIRROR: return "set_mirror";
+    case IPCAM_CONTROL_SET_PREVIEW: return "set_preview";
+    case IPCAM_CONTROL_SET_VIEW: return "set_view";
+    case IPCAM_CONTROL_SET_BACKLIGHT: return "set_backlight";
+    case IPCAM_CONTROL_SET_LIGHT: return "set_light";
+    case IPCAM_CONTROL_SET_SCREEN_TIMEOUT: return "set_screen_timeout";
+    case IPCAM_CONTROL_RECORD_START: return "record_start";
+    case IPCAM_CONTROL_RECORD_STOP: return "record_stop";
+    case IPCAM_CONTROL_PHOTO: return "photo";
+    default: return "unknown";
+    }
+}
+
+/* 只打印会影响设备行为的参数，便于复现 GUI/HTTP/camctl 发出的控制请求。 */
+static void control_log_command(const ipcam_control_command_t *cmd,
+                                uint64_t request_id)
+{
+    if (!cmd) return;
+    switch (cmd->type) {
+    case IPCAM_CONTROL_SET_VIDEO:
+        MLOGI("command submit id=%llu name=%s video=%ux%u@%u q=%u\n",
+              (unsigned long long)request_id, control_command_name(cmd->type),
+              cmd->video.width, cmd->video.height, cmd->video.target_fps,
+              cmd->video.jpeg_quality);
+        break;
+    case IPCAM_CONTROL_SET_MIRROR:
+        MLOGI("command submit id=%llu name=%s mirror_h=%d mirror_v=%d\n",
+              (unsigned long long)request_id, control_command_name(cmd->type),
+              cmd->mirror_horizontal, cmd->mirror_vertical);
+        break;
+    case IPCAM_CONTROL_SET_PREVIEW:
+        MLOGI("command submit id=%llu name=%s enabled=%d\n",
+              (unsigned long long)request_id, control_command_name(cmd->type),
+              cmd->enabled);
+        break;
+    case IPCAM_CONTROL_SET_VIEW:
+        MLOGI("command submit id=%llu name=%s enabled=%d zoom=%.2f center=%.3f,%.3f\n",
+              (unsigned long long)request_id, control_command_name(cmd->type),
+              cmd->enabled, cmd->zoom, cmd->center_x, cmd->center_y);
+        break;
+    case IPCAM_CONTROL_SET_BACKLIGHT:
+    case IPCAM_CONTROL_SET_LIGHT:
+        MLOGI("command submit id=%llu name=%s percent=%d\n",
+              (unsigned long long)request_id, control_command_name(cmd->type),
+              cmd->percent);
+        break;
+    case IPCAM_CONTROL_SET_SCREEN_TIMEOUT:
+        MLOGI("command submit id=%llu name=%s timeout_min=%d\n",
+              (unsigned long long)request_id, control_command_name(cmd->type),
+              cmd->timeout_min);
+        break;
+    default:
+        MLOGI("command submit id=%llu name=%s\n",
+              (unsigned long long)request_id, control_command_name(cmd->type));
+        break;
+    }
 }
 
 static void fill_capabilities(const ipcam_control_ctx_t *ctx,
@@ -334,6 +399,9 @@ int ipcam_control_init(ipcam_control_ctx_t *ctx,
     ctx->running = running;
     ctx->next_request_id = 0;
     ctx->initialized = 1;
+    MLOGI("control service ready: capture=%s display=%s screen=%s recorder=%s\n",
+          capture ? "yes" : "no", display ? "yes" : "no",
+          screen ? "yes" : "no", recorder ? "yes" : "no");
     return 0;
 }
 
@@ -341,8 +409,10 @@ int ipcam_control_init(ipcam_control_ctx_t *ctx,
 void ipcam_control_deinit(ipcam_control_ctx_t *ctx)
 {
     if (!ctx || !ctx->initialized) return;
+    MLOGI("control service stopping\n");
     pthread_mutex_destroy(&ctx->mtx);
     ctx->initialized = 0;
+    MLOGI("control service stopped\n");
 }
 
 /* 返回当前驱动协商值覆盖后的已验证能力清单。 */
@@ -419,16 +489,28 @@ int ipcam_control_submit_command(ipcam_control_ctx_t *ctx,
     result->request_id = id;
     result->state = IPCAM_CONTROL_RESULT_PROCESSING;
     pthread_mutex_unlock(&ctx->mtx);
+    control_log_command(command, id);
 
     /* 命令本体在控制器锁内串行执行；录像启停仍由录像线程异步收尾。 */
     ipcam_control_result_t completed;
     memset(&completed, 0, sizeof(completed));
     completed.request_id = id;
+    int apply_rc;
     pthread_mutex_lock(&ctx->mtx);
-    apply_command(ctx, command, &completed);
+    apply_rc = apply_command(ctx, command, &completed);
     result = find_result_locked(ctx, id);
     if (result) *result = completed;
     pthread_mutex_unlock(&ctx->mtx);
+    if (apply_rc == 0) {
+        MLOGI("command done id=%llu name=%s persisted=%d message=%s path=%s\n",
+              (unsigned long long)id, control_command_name(command->type),
+              completed.persisted, completed.message,
+              completed.path[0] ? completed.path : "-");
+    } else {
+        MLOGW("command failed id=%llu name=%s rc=%d message=%s\n",
+              (unsigned long long)id, control_command_name(command->type),
+              apply_rc, completed.message);
+    }
     if (request_id) *request_id = id;
     return 0;
 }

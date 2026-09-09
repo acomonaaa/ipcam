@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* 系统横幅、崩溃快照和库版本日志归入 SYS 模块。 */
+#define IPCAM_LOG_MODULE "SYS "
 #include "ipcam_sys.h"
 #include "ipcam_param.h"
 #include "ipcam_config.h"

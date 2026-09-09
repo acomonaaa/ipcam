@@ -1,8 +1,12 @@
 #define _GNU_SOURCE
+/* 采集线程的正常帧、V4L2 和设备协商日志归入 CAP 模块。 */
+#define IPCAM_LOG_MODULE "CAP "
 #include "ipcam_capture.h"
 #include "ipcam_log.h"
 #include "ipcam_param.h"
 
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/videodev2.h>
@@ -19,6 +23,9 @@
 #include "ipcam_config.h"
 
 #define V4L2_BUFS  4
+#define IPCAM_VIDEO_SYSFS_DIR "/sys/class/video4linux"
+#define IPCAM_VIDEO_NAME_MAX  64
+#define IPCAM_MAX_VIDEO_NODES 64
 
 /* 对可被信号打断的 V4L2 ioctl 自动重试，其他错误原样返回。 */
 static int xioctl(int fd, int req, void *arg)
@@ -59,11 +66,196 @@ static void capture_teardown(ipcam_capture_ctx_t *ctx)
     }
 }
 
-/* 解析 S_FMT/G_FMT；要求 YUYV，否则失败 */
-/* 协商 YUYV、stride 和帧率；驱动不接受 S_PARM 时标记为软件选帧。 */
+/* 将固定长度的 V4L2 FourCC 转成可安全打印的文本；0 明确显示为 NONE。 */
+static void capture_fourcc_text(uint32_t fourcc, char text[5])
+{
+    if (!text) return;
+    if (fourcc == 0) {
+        memcpy(text, "NONE", 5);
+        return;
+    }
+    for (int i = 0; i < 4; i++) {
+        unsigned char c = (unsigned char)((fourcc >> (i * 8)) & 0xffU);
+        text[i] = isprint(c) ? (char)c : '?';
+    }
+    text[4] = '\0';
+}
+
+/*
+ * 只接受完整的 /dev/videoN 名称并按编号排序，避免自动模式依赖目录返回顺序。
+ * PxP、USB 等节点可能同时存在，后续还会结合 sysfs/V4L2 身份筛选 CSI。
+ */
+typedef struct capture_video_node_s {
+    int number;
+    char path[IPCAM_CAPTURE_DEVICE_PATH_MAX];
+} capture_video_node_t;
+
+static int capture_video_number(const char *name)
+{
+    char *end = NULL;
+    unsigned long number;
+
+    if (!name || strncmp(name, "video", 5) != 0 ||
+        !isdigit((unsigned char)name[5]))
+        return -1;
+
+    errno = 0;
+    number = strtoul(name + 5, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0' || number > INT32_MAX)
+        return -1;
+    return (int)number;
+}
+
+static int capture_video_node_compare(const void *lhs, const void *rhs)
+{
+    const capture_video_node_t *a = lhs;
+    const capture_video_node_t *b = rhs;
+    return a->number < b->number ? -1 : a->number > b->number;
+}
+
+static int capture_collect_video_nodes(capture_video_node_t *nodes, size_t capacity)
+{
+    DIR *dir;
+    struct dirent *entry;
+    size_t count = 0;
+
+    if (!nodes || capacity == 0) return -1;
+    dir = opendir("/dev");
+    if (!dir) {
+        MLOGE("opendir /dev failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        int number = capture_video_number(entry->d_name);
+        int n;
+        if (number < 0) continue;
+        if (count >= capacity) {
+            MLOGW("too many /dev/videoN nodes; ignoring %s\n", entry->d_name);
+            continue;
+        }
+        n = snprintf(nodes[count].path, sizeof(nodes[count].path),
+                     "/dev/video%d", number);
+        if (n < 0 || n >= (int)sizeof(nodes[count].path)) continue;
+        nodes[count].number = number;
+        count++;
+    }
+    closedir(dir);
+    qsort(nodes, count, sizeof(nodes[0]), capture_video_node_compare);
+    return (int)count;
+}
+
+/* 读取 /sys/class/video4linux/videoN/name，失败时返回空字符串而不阻塞启动。 */
+static void capture_read_sysfs_name(const char *device_path,
+                                    char *name, size_t name_size)
+{
+    const char *base;
+    char sysfs_path[IPCAM_CAPTURE_DEVICE_PATH_MAX + 64];
+    FILE *fp;
+    int n;
+
+    if (!name || name_size == 0) return;
+    name[0] = '\0';
+    base = strrchr(device_path ? device_path : "", '/');
+    if (!base || !base[1]) return;
+    n = snprintf(sysfs_path, sizeof(sysfs_path), "%s/%s/name",
+                 IPCAM_VIDEO_SYSFS_DIR, base + 1);
+    if (n < 0 || n >= (int)sizeof(sysfs_path)) return;
+
+    fp = fopen(sysfs_path, "r");
+    if (!fp) return;
+    if (fgets(name, (int)name_size, fp))
+        name[strcspn(name, "\r\n")] = '\0';
+    fclose(fp);
+}
+
+/* 统一大小写和分隔符，兼容 sysfs 的 mx6s-csi 与 card 的 i.MX6S_CSI。 */
+static int capture_text_matches_csi(const char *text)
+{
+    char normalized[IPCAM_VIDEO_NAME_MAX];
+    size_t out = 0;
+
+    if (!text) return 0;
+    for (size_t i = 0; text[i] && out + 1 < sizeof(normalized); i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (isalnum(c)) normalized[out++] = (char)tolower(c);
+    }
+    normalized[out] = '\0';
+    return strstr(normalized, "mx6scsi") != NULL;
+}
+
+static int capture_querycap(int fd, struct v4l2_capability *cap,
+                            uint32_t *device_caps)
+{
+    if (!cap || !device_caps) return -1;
+    memset(cap, 0, sizeof(*cap));
+    if (xioctl(fd, VIDIOC_QUERYCAP, cap) < 0) return -1;
+    cap->driver[sizeof(cap->driver) - 1] = '\0';
+    cap->card[sizeof(cap->card) - 1] = '\0';
+    cap->bus_info[sizeof(cap->bus_info) - 1] = '\0';
+    *device_caps = cap->capabilities;
+    if (*device_caps & V4L2_CAP_DEVICE_CAPS)
+        *device_caps = cap->device_caps;
+    return 0;
+}
+
+static int capture_has_required_caps(uint32_t device_caps)
+{
+    return (device_caps & V4L2_CAP_VIDEO_CAPTURE) &&
+           (device_caps & V4L2_CAP_STREAMING);
+}
+
+static int capture_is_csi_device(const char *sysfs_name,
+                                 const struct v4l2_capability *cap)
+{
+    return capture_text_matches_csi(sysfs_name) ||
+           (cap && (capture_text_matches_csi((const char *)cap->driver) ||
+                    capture_text_matches_csi((const char *)cap->card)));
+}
+
+static void capture_copy_text(char *dst, size_t dst_size, const char *src)
+{
+    size_t len;
+    if (!dst || dst_size == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    len = strlen(src);
+    if (len >= dst_size) len = dst_size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+static void capture_log_candidate(const char *path, const char *sysfs_name,
+                                  const struct v4l2_capability *cap,
+                                  uint32_t device_caps)
+{
+    MLOGI("video candidate %s: name=%s driver=%s card=%s caps=0x%08x\n",
+          path,
+          (sysfs_name && sysfs_name[0]) ? sysfs_name : "unknown",
+          cap ? (const char *)cap->driver : "unknown",
+          cap ? (const char *)cap->card : "unknown",
+          device_caps);
+}
+
+/*
+ * 解析 S_FMT/G_FMT。S_FMT 是驱动接受请求格式的第一确认；出厂 mx6s-csi
+ * 的 G_FMT 可能漏回 FourCC、stride 或 sizeimage，因此只对已确认的 CSI
+ * 节点使用 S_FMT 回退值，其它设备仍严格拒绝空/错误 FourCC。
+ */
 static int capture_negotiate_yuyv(ipcam_capture_ctx_t *ctx)
 {
     struct v4l2_format fmt;
+    uint32_t s_fmt_fourcc;
+    uint32_t s_bytes_per_line;
+    uint32_t s_size_image;
+    uint32_t g_fmt_fourcc;
+    uint32_t effective_bytes_per_line;
+    uint32_t effective_size_image;
+    char s_fourcc_text[5];
+    char g_fourcc_text[5];
+
     memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmt.fmt.pix.width  = ctx->width;
@@ -76,6 +268,39 @@ static int capture_negotiate_yuyv(ipcam_capture_ctx_t *ctx)
         return -1;
     }
 
+    s_fmt_fourcc = fmt.fmt.pix.pixelformat;
+    s_bytes_per_line = fmt.fmt.pix.bytesperline;
+    s_size_image = fmt.fmt.pix.sizeimage;
+    capture_fourcc_text(s_fmt_fourcc, s_fourcc_text);
+    if (s_fmt_fourcc != V4L2_PIX_FMT_YUYV) {
+        MLOGE("S_FMT returned %s(0x%08x), expected YUYV(0x%08x)\n",
+              s_fourcc_text, (unsigned int)s_fmt_fourcc,
+              (unsigned int)V4L2_PIX_FMT_YUYV);
+        return -1;
+    }
+    if (fmt.fmt.pix.width < 2 || (fmt.fmt.pix.width & 1) ||
+        fmt.fmt.pix.height == 0) {
+        MLOGE("invalid S_FMT dimensions %ux%u for YUYV 4:2:2\n",
+              fmt.fmt.pix.width, fmt.fmt.pix.height);
+        return -1;
+    }
+    if (s_bytes_per_line == 0)
+        s_bytes_per_line = fmt.fmt.pix.width * 2U;
+    uint64_t s_frame_bytes = (uint64_t)s_bytes_per_line * fmt.fmt.pix.height;
+    if (s_bytes_per_line < fmt.fmt.pix.width * 2U ||
+        s_frame_bytes > UINT32_MAX) {
+        MLOGE("invalid S_FMT stride=%u for %ux%u (frame bytes=%llu)\n",
+              s_bytes_per_line, fmt.fmt.pix.width, fmt.fmt.pix.height,
+              (unsigned long long)s_frame_bytes);
+        return -1;
+    }
+    if (s_size_image == 0) s_size_image = (uint32_t)s_frame_bytes;
+    if (s_size_image < s_frame_bytes) {
+        MLOGE("S_FMT sizeimage=%u below stride*height=%llu\n", s_size_image,
+              (unsigned long long)s_frame_bytes);
+        return -1;
+    }
+
     memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (xioctl(ctx->fd, VIDIOC_G_FMT, &fmt) < 0) {
@@ -83,10 +308,26 @@ static int capture_negotiate_yuyv(ipcam_capture_ctx_t *ctx)
         return -1;
     }
 
-    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) {
-        MLOGE("driver did not honor YUYV (negotiated %.4s)\n",
-              (char *)&fmt.fmt.pix.pixelformat);
+    g_fmt_fourcc = fmt.fmt.pix.pixelformat;
+    capture_fourcc_text(g_fmt_fourcc, g_fourcc_text);
+    if (g_fmt_fourcc != V4L2_PIX_FMT_YUYV &&
+        !(g_fmt_fourcc == 0 && ctx->legacy_gfmt_pixelformat_missing &&
+          s_fmt_fourcc == V4L2_PIX_FMT_YUYV)) {
+        MLOGE("driver did not honor YUYV(0x%08x) (G_FMT=%s(0x%08x))\n",
+              (unsigned int)V4L2_PIX_FMT_YUYV, g_fourcc_text,
+              (unsigned int)g_fmt_fourcc);
         return -1;
+    }
+
+    if (g_fmt_fourcc == 0) {
+        /*
+         * 出厂 mx6s-csi 已在 S_FMT 中按 YUYV 配置 CSI，但 G_FMT 直接返回
+         * 未填充的 pix 结构。这里仅对已识别的 CSI 放宽，避免掩盖其它设备
+         * 真正的像素格式协商失败。
+         */
+        MLOGW("%s G_FMT returned pixelformat=NONE(0x00000000); "
+              "using S_FMT=%s for legacy mx6s-csi\n",
+              ctx->device_path, s_fourcc_text);
     }
 
     ctx->width  = fmt.fmt.pix.width;
@@ -98,8 +339,15 @@ static int capture_negotiate_yuyv(ipcam_capture_ctx_t *ctx)
               ctx->width, ctx->height);
         return -1;
     }
-    ctx->bytes_per_line = fmt.fmt.pix.bytesperline;
-    if (ctx->bytes_per_line == 0) ctx->bytes_per_line = (uint32_t)ctx->width * 2U;
+    effective_bytes_per_line = fmt.fmt.pix.bytesperline;
+    if (effective_bytes_per_line == 0 && ctx->legacy_gfmt_pixelformat_missing) {
+        effective_bytes_per_line = s_bytes_per_line;
+        MLOGW("%s G_FMT returned bytesperline=0; using S_FMT bytesperline=%u\n",
+              ctx->device_path, effective_bytes_per_line);
+    }
+    if (effective_bytes_per_line == 0)
+        effective_bytes_per_line = (uint32_t)ctx->width * 2U;
+    ctx->bytes_per_line = effective_bytes_per_line;
     uint64_t frame_bytes = (uint64_t)ctx->bytes_per_line * (uint64_t)ctx->height;
     if (ctx->bytes_per_line < (uint32_t)ctx->width * 2U ||
         frame_bytes > UINT32_MAX) {
@@ -108,7 +356,13 @@ static int capture_negotiate_yuyv(ipcam_capture_ctx_t *ctx)
               (unsigned long long)frame_bytes);
         return -1;
     }
-    ctx->size_image = fmt.fmt.pix.sizeimage;
+    effective_size_image = fmt.fmt.pix.sizeimage;
+    if (effective_size_image == 0 && ctx->legacy_gfmt_pixelformat_missing) {
+        effective_size_image = s_size_image;
+        MLOGW("%s G_FMT returned sizeimage=0; using S_FMT sizeimage=%u\n",
+              ctx->device_path, effective_size_image);
+    }
+    ctx->size_image = effective_size_image;
     if (ctx->size_image == 0)
         ctx->size_image = (uint32_t)frame_bytes;
     if (ctx->size_image < frame_bytes) {
@@ -116,7 +370,7 @@ static int capture_negotiate_yuyv(ipcam_capture_ctx_t *ctx)
               (unsigned long long)frame_bytes);
         return -1;
     }
-    ctx->pixel_format = fmt.fmt.pix.pixelformat;
+    ctx->pixel_format = g_fmt_fourcc == 0 ? s_fmt_fourcc : g_fmt_fourcc;
     struct v4l2_streamparm parm;
     uint32_t target_fps = ipcam_param_get_target_fps();
     ctx->target_fps = target_fps;
@@ -137,60 +391,163 @@ static int capture_negotiate_yuyv(ipcam_capture_ctx_t *ctx)
         ctx->fps_controlled = 0;
         ctx->actual_fps = 0;
     }
-    MLOGI("camera negotiated: %dx%d fmt=YUYV stride=%u sizeimage=%u\n",
-          ctx->width, ctx->height, ctx->bytes_per_line, ctx->size_image);
+    MLOGI("camera negotiated: %s %dx%d fmt=%s stride=%u sizeimage=%u\n",
+          ctx->device_path, ctx->width, ctx->height,
+          g_fmt_fourcc == 0 ? s_fourcc_text : g_fourcc_text,
+          ctx->bytes_per_line, ctx->size_image);
     MLOGI("camera frame interval: target=%u actual=%u fps\n",
           target_fps, ctx->actual_fps);
     return 0;
 }
 
-/* 按环境/编译配置打开设备并记录身份与格式能力，拒绝非 streaming 节点。 */
+/*
+ * 按环境/编译配置打开设备并记录身份与格式能力。
+ * 自动模式只选择名称/QUERYCAP 能确认是 mx6s-csi 的节点，避免把同时存在
+ * 的 PxP 节点当作摄像头；显式覆盖仍保留，方便板级调试其它兼容 V4L2 设备。
+ */
 static int capture_open_device(ipcam_capture_ctx_t *ctx)
 {
-    struct v4l2_capability cap;
     const char *video_dev = getenv("IPCAM_VIDEO_DEV");
     if (!video_dev || !*video_dev) video_dev = IPCAM_VIDEO_DEV;
-    /* 使用非阻塞 DQBUF，使 capture_stop 可以只改变本服务标志并 join，
-     * 不必在另一个线程正在 ioctl 时关闭可被系统复用的 fd。 */
-    ctx->fd = open(video_dev, O_RDWR | O_NONBLOCK);
-    if (ctx->fd < 0) {
-        MLOGE("open %s: %s\n", video_dev, strerror(errno));
-        return -1;
-    }
-    memset(&cap, 0, sizeof(cap));
 
-    if (xioctl(ctx->fd, VIDIOC_QUERYCAP, &cap) < 0) {
-        MLOGE("QUERYCAP: %s\n", strerror(errno));
-        close(ctx->fd);
-        ctx->fd = -1;
-        return -1;
-    }
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
-        MLOGE("%s is not a capture device\n", video_dev);
-        close(ctx->fd);
-        ctx->fd = -1;
-        return -1;
+    ctx->device_path[0] = '\0';
+    ctx->legacy_gfmt_pixelformat_missing = 0;
+    if (video_dev && *video_dev) {
+        struct v4l2_capability cap;
+        char sysfs_name[IPCAM_VIDEO_NAME_MAX] = { 0 };
+        uint32_t device_caps = 0;
+        int fd;
+
+        /* 使用非阻塞 DQBUF，使 capture_stop 可以只改变 service_running；
+         * 不必在另一个线程正在 ioctl 时关闭可被系统复用的 fd。 */
+        fd = open(video_dev, O_RDWR | O_NONBLOCK);
+        if (fd < 0) {
+            MLOGE("open %s: %s\n", video_dev, strerror(errno));
+            return -1;
+        }
+        if (capture_querycap(fd, &cap, &device_caps) < 0) {
+            MLOGE("QUERYCAP %s: %s\n", video_dev, strerror(errno));
+            close(fd);
+            return -1;
+        }
+        capture_read_sysfs_name(video_dev, sysfs_name, sizeof(sysfs_name));
+        capture_log_candidate(video_dev, sysfs_name, &cap, device_caps);
+        if (!capture_has_required_caps(device_caps)) {
+            MLOGE("%s lacks video-capture or streaming capability\n", video_dev);
+            close(fd);
+            return -1;
+        }
+        if (strlen(video_dev) >= sizeof(ctx->device_path)) {
+            MLOGE("configured camera path is too long: %s\n", video_dev);
+            close(fd);
+            return -1;
+        }
+        ctx->fd = fd;
+        capture_copy_text(ctx->device_path, sizeof(ctx->device_path), video_dev);
+        ctx->legacy_gfmt_pixelformat_missing =
+            capture_is_csi_device(sysfs_name, &cap);
+        MLOGI("camera device selected by override: %s (name=%s driver=%s card=%s)\n",
+              ctx->device_path,
+              sysfs_name[0] ? sysfs_name : "unknown",
+              (const char *)cap.driver, (const char *)cap.card);
+    } else {
+        capture_video_node_t nodes[IPCAM_MAX_VIDEO_NODES];
+        struct v4l2_capability selected_cap;
+        char selected_name[IPCAM_VIDEO_NAME_MAX] = { 0 };
+        uint32_t selected_caps = 0;
+        int node_count;
+        int selected_fd = -1;
+
+        node_count = capture_collect_video_nodes(nodes,
+                                                 sizeof(nodes) / sizeof(nodes[0]));
+        if (node_count < 0) return -1;
+        if (node_count == 0) {
+            MLOGE("no /dev/videoN nodes found; CSI camera is unavailable\n");
+            return -1;
+        }
+
+        for (int i = 0; i < node_count; i++) {
+            struct v4l2_capability cap;
+            char sysfs_name[IPCAM_VIDEO_NAME_MAX] = { 0 };
+            uint32_t device_caps = 0;
+            int fd;
+
+            fd = open(nodes[i].path, O_RDWR | O_NONBLOCK);
+            if (fd < 0) {
+                MLOGW("open video candidate %s failed: %s\n",
+                      nodes[i].path, strerror(errno));
+                continue;
+            }
+            if (capture_querycap(fd, &cap, &device_caps) < 0) {
+                MLOGW("QUERYCAP %s failed: %s\n", nodes[i].path, strerror(errno));
+                close(fd);
+                continue;
+            }
+            capture_read_sysfs_name(nodes[i].path, sysfs_name, sizeof(sysfs_name));
+            capture_log_candidate(nodes[i].path, sysfs_name, &cap, device_caps);
+            if (!capture_has_required_caps(device_caps)) {
+                MLOGI("skip %s: not a streaming video-capture node\n", nodes[i].path);
+                close(fd);
+                continue;
+            }
+            if (!capture_is_csi_device(sysfs_name, &cap)) {
+                MLOGI("skip %s: candidate is not mx6s-csi\n", nodes[i].path);
+                close(fd);
+                continue;
+            }
+            if (selected_fd >= 0) {
+                /* 节点已按编号排序，保留第一个可用 CSI，避免设备选择不确定。 */
+                MLOGW("multiple mx6s-csi nodes found; keeping the lowest-numbered one\n");
+                close(fd);
+                continue;
+            }
+            selected_fd = fd;
+            selected_cap = cap;
+            selected_caps = device_caps;
+            capture_copy_text(selected_name, sizeof(selected_name), sysfs_name);
+            capture_copy_text(ctx->device_path, sizeof(ctx->device_path), nodes[i].path);
+        }
+
+        if (selected_fd < 0) {
+            MLOGE("auto discovery found no mx6s-csi capture node; refusing non-CSI video devices\n");
+            return -1;
+        }
+        ctx->fd = selected_fd;
+        ctx->legacy_gfmt_pixelformat_missing = 1;
+        MLOGI("camera device selected automatically: %s (name=%s driver=%s card=%s caps=0x%08x)\n",
+              ctx->device_path,
+              selected_name[0] ? selected_name : "unknown",
+              (const char *)selected_cap.driver,
+              (const char *)selected_cap.card, selected_caps);
     }
 
-    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
-        MLOGE("%s does not support streaming capture\n", video_dev);
-        close(ctx->fd);
-        ctx->fd = -1;
+    struct v4l2_capability cap;
+    uint32_t selected_caps = 0;
+    if (capture_querycap(ctx->fd, &cap, &selected_caps) < 0) {
+        MLOGE("QUERYCAP selected camera failed: %s\n", strerror(errno));
+        capture_teardown(ctx);
+        return -1;
+    }
+    if (!capture_has_required_caps(selected_caps)) {
+        MLOGE("selected camera %s lost capture/streaming capability\n",
+              ctx->device_path);
+        capture_teardown(ctx);
         return -1;
     }
     MLOGI("camera identity: driver=%s card=%s bus=%s\n",
           cap.driver, cap.card, cap.bus_info);
-    /* 记录驱动声明的格式清单，第一阶段以实测 YUYV 档位为准而非猜测。 */
+    /* 记录驱动声明的格式清单，避免现场只看到协商失败而不知道设备能力。 */
     for (struct v4l2_fmtdesc desc = {0}; ; desc.index++) {
+        char fourcc_text[5];
         desc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         if (xioctl(ctx->fd, VIDIOC_ENUM_FMT, &desc) < 0) break;
-        MLOGI("camera format[%u]: %.4s %s\n", desc.index,
-              (char *)&desc.pixelformat, desc.description);
+        capture_fourcc_text(desc.pixelformat, fourcc_text);
+        MLOGI("camera format[%u]: %s %s\n", desc.index,
+              fourcc_text, desc.description);
     }
 
     if (capture_negotiate_yuyv(ctx) < 0) {
-        close(ctx->fd);
-        ctx->fd = -1;
+        capture_teardown(ctx);
         return -1;
     }
     return 0;
@@ -276,6 +633,10 @@ static void *capture_thread(void *arg)
         MLOGE("STREAMON: %s\n", strerror(errno));
         return NULL;
     }
+    /* BCF2 会在媒体线程真正进入工作态时再打一条日志，便于区分“线程创建成功”和“首帧可用”。 */
+    MLOGI("capture stream on: device=%s buffers=%d target_fps=%u actual_fps=%u controlled=%d\n",
+          ctx->device_path, ctx->n_bufs, ctx->target_fps, ctx->actual_fps,
+          ctx->fps_controlled);
 
     gettimeofday(&t0, NULL);
 
@@ -330,7 +691,10 @@ static void *capture_thread(void *arg)
         if (buf.bytesused >= min_frame_bytes &&
             buf.bytesused <= ctx->bufs[buf.index].length) {
             const void *src = ctx->bufs[buf.index].start;
-            uint64_t drop_disp_now = 0, drop_enc_now = 0;
+            /* 这里只记录当前帧是否被某路 ring 丢弃，计数本身由 uint64_t
+             * 累加器保存；用 int 表示布尔事件，避免日志格式把小整型误当成
+             * 64 位计数，且让 -Wformat=2 能在交叉编译时直接拦住问题。 */
+            int drop_disp_now = 0, drop_enc_now = 0;
 
             /* 双路非阻塞写：任一满则丢该路（不阻塞生产者、不等消费者） */
             ipcam_frame_meta_t meta;
@@ -361,6 +725,16 @@ static void *capture_thread(void *arg)
             }
             capture_add_stats(ctx, 1, drop_disp_now, drop_enc_now);
             frames++;
+            /*
+             * 采集链路不能只靠主循环的 5 秒汇总诊断。沿用 BCF2“首批帧 + 周期帧”
+             * 策略：首 30 帧帮助定位首帧时序，之后每 30 帧报告一次序号、时间戳、
+             * 有效长度和两路广播是否丢帧；不按每帧刷屏，避免日志反过来拖慢 CSI。
+             */
+            if (frames <= 30 || (frames % 30) == 0) {
+                MLOGI("frame no=%lu v4l2_seq=%u ts=%llu bytes=%u drop_disp=%d drop_enc=%d\n",
+                      frames, buf.sequence, (unsigned long long)meta.monotonic_ns,
+                      buf.bytesused, drop_disp_now, drop_enc_now);
+            }
         } else if (buf.bytesused < min_frame_bytes) {
             MLOGW("bytesused %u below stride*height %zu, dropping\n",
                   buf.bytesused, min_frame_bytes);
@@ -440,6 +814,9 @@ int ipcam_capture_start(ipcam_capture_ctx_t *ctx,
         pthread_mutex_destroy(&ctx->stats_mtx);
         return -1;
     }
+    MLOGI("capture service ready: device=%s format=0x%08x %dx%d stride=%u sizeimage=%u\n",
+          ctx->device_path, ctx->pixel_format, ctx->width, ctx->height,
+          ctx->bytes_per_line, ctx->size_image);
     return 0;
 }
 
@@ -448,6 +825,7 @@ void ipcam_capture_stop(ipcam_capture_ctx_t *ctx)
 {
     if (!ctx) return;
 
+    MLOGI("capture stop requested: device=%s\n", ctx->device_path);
     /* 非阻塞 DQBUF 让线程自行观察 service_running；不从外部关闭 fd，
      * 避免另一个线程正处于 ioctl 时 fd 号被复用造成误操作。 */
     ctx->service_running = 0;
@@ -459,6 +837,7 @@ void ipcam_capture_stop(ipcam_capture_ctx_t *ctx)
     /* 线程已退出后再释放 mmap 和设备 fd。 */
     capture_teardown(ctx);
     pthread_mutex_destroy(&ctx->stats_mtx);
+    MLOGI("capture stopped: device=%s\n", ctx->device_path);
 }
 
 void ipcam_capture_get_dimensions(const ipcam_capture_ctx_t *ctx, int *w, int *h)

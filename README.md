@@ -5,7 +5,7 @@
 ## 1. 功能
 
 - OV5640 摄像头 V4L2 采集（YUYV 4:2:2）
-- LCD 实时显示（YUYV → RGB565 软件转换 → /dev/fb0 mmap）
+- LCD 实时显示（YUYV → RGB565 软件转换 → LVGL 9 局部合成 → /dev/fb0 mmap）
 - MJPEG-over-HTTP 推流（libjpeg-turbo + multipart/x-mixed-replace）
 - HTTP 端点：`/`、`/stream.mjpg`、`/snapshot.jpg`、`/api/status`（含 target/capture/output fps）、`/api/capabilities`、`/api/control`、`/api/control/result`、`/api/record`、`/api/photo`、`/api/config` (GET/POST)、`/api/version`、`/api/ota` (GET/POST)、`/api/reboot`、`/healthz`
 - 网络层可插拔：4G（pppd）/ WiFi（wpa_supplicant）
@@ -23,7 +23,7 @@
 
 - 开发板：ALIENTEK i.MX6ULL Mini（单核 Cortex-A7 @ 996 MHz、512 MB DDR3、2×100M Ethernet）
 - 摄像头：OV5640（CSI/DVP 并口、i2c2@0x3c、24 MHz MCLK）
-- LCD：RGB 并口（默认 7" 1024×600、PWM1 背光）
+- LCD：RGB 并口（当前板实测 /dev/fb0 为 800×480、RGB565、PWM1 背光）
 - 4G 模组（可选）：任意 Quectel EC20/Air720 兼容 USB 串口模组（接 usbotg2）
 - WiFi 模组（可选）：RTL8188EUS USB WiFi 模组（接 usbotg2）
 
@@ -34,6 +34,7 @@
 - BusyBox 1.29.0
 - 交叉编译器：`gcc-linaro-4.9.4-2017.01-i686_arm-linux-gnueabihf`
 - libjpeg-turbo v2.1.x（可选用 stub 模式跳过）
+- LVGL v9.5.0（源码依赖，使用项目根目录的 `lv_conf.h` 配置）
 
 ## 4. 目录结构
 
@@ -43,12 +44,14 @@ ipcam/
 ├── README.md
 ├── config/
 │   └── ipcam_config.h        # 编译期默认值
+├── lv_conf.h                 # LVGL 9 的 i.MX6ULL 最小配置
 ├── scripts/
 │   ├── build.sh              # 交叉编译入口
 │   └── rootfs/
 │       ├── etc/init.d/S90ipcam   # 启动脚本（healthz watchdog + auto rollback）
 │       └── etc/ppp/peers/quectel # pppd 拨号配置
 ├── thirdparts/libjpeg-turbo/ # 外部库（自行交叉编译）
+├── thirdparts/lvgl/          # LVGL v9.5.0 外部源码依赖说明
 └── src/
     ├── core/                 # LEVEL 1：通用基础（无业务依赖）
     │   ├── ipcam_log.{h,c}            # 7 级日志（BCF2 mo_log 风格）
@@ -58,7 +61,8 @@ ipcam/
     │   └── ipcam_ota.{h,c}            # OTA（含内嵌 SHA256）
     ├── services/             # LEVEL 2：业务子模块（依赖 core）
     │   ├── ipcam_capture.{h,c}        # V4L2 采集
-    │   ├── ipcam_display.{h,c}        # LCD 显示（YUYV→RGB565）
+    │   ├── ipcam_display.{h,c}        # LCD 预览帧生产与 framebuffer 映射
+    │   ├── ipcam_lvgl.{h,c}           # LVGL 9 显示 flush、输入快照和验证页面
     │   ├── ipcam_encode.{h,c}         # MJPEG 编码（libjpeg-turbo）
     │   ├── ipcam_encode_stub.c        # 编码空壳（display-only fallback）
     │   ├── ipcam_record.{h,c}         # SD 卡照片与 MJPEG AVI 分段录像
@@ -99,7 +103,22 @@ make -j$(nproc)
 make install
 ```
 
-### 5.2 编译 ipcam
+### 5.2 准备 LVGL 9
+
+LVGL 源码不复制进本仓库，构建时由 Makefile 直接递归编译；固定使用
+`v9.5.0`，避免板端适配随上游分支漂移：
+
+```sh
+git clone --branch v9.5.0 --depth 1 \
+  https://github.com/lvgl/lvgl.git thirdparts/lvgl/src
+```
+
+`lv_conf.h` 已关闭 LVGL 自带的 fbdev/evdev 后端，应用复用现有
+`ipcam_display` 的 `/dev/fb0` 映射，并由 `ipcam_touch` 的唯一 evdev 线程
+把触点快照交给 LVGL。当前 smoke UI 只使用 ASCII 字符，便于先验证像素、
+刷新和触摸链路；中文字库和完整页面继续在此基础上接入。
+
+### 5.3 编译 ipcam
 
 ```sh
 ./scripts/build.sh                          # 自动探测工具链 + 检查 libturbojpeg
@@ -109,7 +128,7 @@ CROSS_COMPILE=arm-linux-gnueabihf- DEBUG=1 ./scripts/build.sh
 
 产物：项目根目录 `./ipcam`（ELF32 ARM EABI5）。
 
-### 5.3 仅采集 + LCD（无 libjpeg-turbo 时）
+### 5.4 仅采集 + LCD（无 libjpeg-turbo 时）
 
 ```sh
 make ipcam-display-only
@@ -119,7 +138,7 @@ SKIP_TJ_CHECK=1 ./scripts/build.sh ipcam-display-only
 
 `src/services/ipcam_encode_stub.c` 提供空壳 `ipcam_encode_start(_ex)/stop`，让 daemon 链接通过但无 MJPEG 流。
 
-### 5.4 编译选项
+### 5.5 编译选项
 
 ```sh
 make DEBUG=1                       # -O0 -g3 调试构建
@@ -130,6 +149,11 @@ make -B test-host SANITIZE=1       # 使用 ASan/UBSan 强制重编并运行测�
 make clean                        # 清理所有产物
 make install                      # 安装到项目内 ./output/
 ```
+
+LVGL 默认接管 LCD 的 UI 合成；首次部署遇到 UI 初始化问题时可设置
+`IPCAM_LVGL=0` 回退到旧的 display 线程直接写屏。无论哪种模式，
+`IPCAM_FB_DEV` 仍指定 framebuffer，触摸节点由 `IPCAM_TOUCH_DEV` 指定，
+本板默认值分别为 `/dev/fb0` 和 `/dev/input/event1`。
 
 ## 6. 部署到开发板
 
@@ -158,7 +182,9 @@ OTA 看门狗（`S90ipcam`）依赖 BusyBox **`wget`** 探测 `http://127.0.0.1:
 - 浏览器预览：`http://<board_ip>:8080/`（默认绑定 `0.0.0.0`）
 
 板级探测后可通过环境变量绑定实际节点和挂载点：`IPCAM_VIDEO_DEV`、`IPCAM_FB_DEV`、
-`IPCAM_TOUCH_DEV`、`IPCAM_BACKLIGHT_PATH`、`IPCAM_LIGHT_PATH`、`IPCAM_STORAGE_ROOT`。
+`IPCAM_TOUCH_DEV`、`IPCAM_LVGL`、`IPCAM_BACKLIGHT_PATH`、`IPCAM_LIGHT_PATH`、
+`IPCAM_STORAGE_ROOT`。本板的 `/proc/bus/input/devices` 已确认 `event0` 是
+电源键、`event1` 是 `goodix-ts`，因此不能把触摸默认写成 `event0`。
 应用不会猜测 GPIO 编号，也不会在 SD 未挂载时把照片写入根文件系统。
 
 ## 7. 验证清单
@@ -166,8 +192,9 @@ OTA 看门狗（`S90ipcam`）依赖 BusyBox **`wget`** 探测 `http://127.0.0.1:
 | 里程碑 | 验证手段 | 通过标准 |
 |---|---|---|
 | 编译通过 | `make` 无 error | 产出 `./ipcam` ELF32 ARM EABI5 |
-| 启动 | `/etc/init.d/S90ipcam start` | `/var/log/ipcam.log` 显示 capture/display/stream 三个线程 start |
-| LCD 显示 | 插入 OV5640 到 CSI 插座 | LCD 上看到实时画面（无撕裂、≥15 fps@640×480）|
+| 启动 | `/etc/init.d/S90ipcam start` | 日志显示 capture/display/LVGL/stream 线程 start |
+| LCD 显示 | 插入 OV5640 到 CSI 插座 | 800×480 LCD 显示 LVGL 验证页和实时画面 |
+| LCD 触摸 | 点击屏幕上的 `TOUCH TEST` | 按钮文字变为 `TOUCH OK`，日志显示 `touch started: /dev/input/event1` |
 | 局域网推流 | 浏览器访问 `http://<board_ip>:8080/` | 看到实时 MJPEG 流，延迟 < 1 秒 |
 | 4G 推流 | 接 4G 模组到 usbotg2；可用 `IPCAM_4G_AT_DEV` 和 `IPCAM_4G_PPP_PEER` 覆盖 AT 设备与 PPP profile，再通过 `curl -d 'net_mode=1' http://127.0.0.1:8080/api/config` 重启 daemon | 同上，但出网走 ppp0 |
 | API 状态 | `curl http://<board_ip>:8080/api/status` | 返回 JSON：model/swver/capture/ring_count 等 |

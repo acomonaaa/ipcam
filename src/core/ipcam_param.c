@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* 参数加载、校验和持久化日志归入 PARAM 模块。 */
+#define IPCAM_LOG_MODULE "PARAM"
 #include "ipcam_param.h"
 #include "ipcam_config.h"
 #include "ipcam_log.h"

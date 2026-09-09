@@ -1,4 +1,7 @@
 #define _GNU_SOURCE
+/* OTA 的下载、校验和切换日志单独标记，避免与主流程状态混在一起。 */
+#define IPCAM_LOG_MODULE "OTA "
+
 #include "ipcam_ota.h"
 #include "ipcam_log.h"
 #include "ipcam_param.h"

@@ -32,9 +32,9 @@
 #define IPCAM_TARGET_FPS       15
 #endif
 
-/* MJPEG 编码质量（1-100，越高越清晰越慢） */
+/* MJPEG 编码质量（1-100）；配合 4:2:0 采样默认取 60，优先保障板端直播延迟。 */
 #ifndef IPCAM_JPEG_QUALITY
-#define IPCAM_JPEG_QUALITY     75
+#define IPCAM_JPEG_QUALITY     60
 #endif
 
 /* HTTP 服务端口 */
@@ -67,12 +67,35 @@
 #define IPCAM_RECORD_MAX_SEGMENT_BYTES (3ULL * 1024ULL * 1024ULL * 1024ULL)
 #endif
 
-/* 设备节点 */
+/*
+ * 摄像头设备节点：空字符串表示自动扫描 /dev/videoN 并选择 mx6s-csi；
+ * IPCAM_VIDEO_DEV 环境变量可在板端显式覆盖路径，但不会跳过能力校验。
+ */
 #ifndef IPCAM_VIDEO_DEV
-#define IPCAM_VIDEO_DEV        "/dev/video0"
+#define IPCAM_VIDEO_DEV        ""
 #endif
 #ifndef IPCAM_FB_DEV
 #define IPCAM_FB_DEV           "/dev/fb0"
+#endif
+
+/*
+ * Linux evdev 触摸节点：本板实测 Goodix 为 event1，event0 是电源键。
+ * IPCAM_TOUCH_DEV 环境变量优先，用于不同 rootfs 的节点编号变化。
+ */
+#ifndef IPCAM_TOUCH_DEV
+#define IPCAM_TOUCH_DEV        "/dev/input/event1"
+#endif
+
+/*
+ * LVGL 9 默认接管 LCD 的 UI 合成；设置 IPCAM_LVGL=0 可回退到旧的
+ * display 线程直接写屏，便于新 UI 首次部署失败时保留摄像头预览。
+ */
+#ifndef IPCAM_LVGL_ENABLE
+#define IPCAM_LVGL_ENABLE      1
+#endif
+/* 局部绘制缓冲按行数限额，避免在 512 MiB 板上再分配一整屏临时显存。 */
+#ifndef IPCAM_LVGL_BUFFER_LINES
+#define IPCAM_LVGL_BUFFER_LINES 40
 #endif
 
 /* 网络模式：'4g' 或 'wifi' 或 'none'（none = 仅本地显示） */

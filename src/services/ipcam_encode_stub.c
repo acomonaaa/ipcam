@@ -1,5 +1,8 @@
 #define _GNU_SOURCE
+/* display-only 构建没有 JPEG 编码线程，但仍用 ENC 模块明确记录能力降级。 */
+#define IPCAM_LOG_MODULE "ENC "
 #include "ipcam_encode.h"
+#include "ipcam_log.h"
 
 #include <string.h>
 
@@ -20,6 +23,7 @@ int ipcam_encode_start(ipcam_encode_ctx_t *ctx,
         ctx->quality = 0;  /* sentinel：主流程据此跳过 stream */
         ctx->service_running = 1;
         pthread_mutex_init(&ctx->stats_mtx, NULL);
+        MLOGI("display-only encoder stub ready: MJPEG disabled\n");
     }
     return 0;
 }
@@ -43,6 +47,7 @@ int ipcam_encode_start_ex(ipcam_encode_ctx_t *ctx,
 void ipcam_encode_stop(ipcam_encode_ctx_t *ctx)
 {
     if (ctx) {
+        MLOGI("display-only encoder stub stopped\n");
         ctx->service_running = 0;
         pthread_mutex_destroy(&ctx->stats_mtx);
     }

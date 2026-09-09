@@ -43,7 +43,7 @@ uint16_t ipcam_param_get_capture_w(void) { return 640; }
 uint16_t ipcam_param_get_capture_h(void) { return 480; }
 uint16_t ipcam_param_get_out_w(void) { return 0; }
 uint16_t ipcam_param_get_out_h(void) { return 0; }
-uint8_t ipcam_param_get_jpeg_quality(void) { return 75; }
+uint8_t ipcam_param_get_jpeg_quality(void) { return 60; }
 uint8_t ipcam_param_get_target_fps(void) { return 15; }
 uint16_t ipcam_param_get_http_port(void) { return 0; }
 uint8_t ipcam_param_get_http_bind_local(void) { return 1; }

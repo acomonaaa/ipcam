@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 
+/* SD、拍照、AVI 分段和录像状态机日志归入 REC 模块。 */
+#define IPCAM_LOG_MODULE "REC "
 #include "ipcam_record.h"
 #include "ipcam_config.h"
 #include "ipcam_log.h"
@@ -49,6 +51,19 @@ typedef struct avi_segment_s {
     size_t index_count;
     size_t index_cap;
 } avi_segment_t;
+
+/* 统一录像状态名称，日志与 HTTP/GUI 返回的数值状态保持同一语义。 */
+static const char *record_state_name(ipcam_record_state_t state)
+{
+    switch (state) {
+    case IPCAM_RECORD_IDLE: return "IDLE";
+    case IPCAM_RECORD_STARTING: return "STARTING";
+    case IPCAM_RECORD_RECORDING: return "RECORDING";
+    case IPCAM_RECORD_STOPPING: return "STOPPING";
+    case IPCAM_RECORD_ERROR: return "ERROR";
+    default: return "UNKNOWN";
+    }
+}
 
 /* 预估一个 JPEG chunk、idx1 和收尾余量是否仍能落在 32 位 AVI 尺寸上限内。 */
 static int avi_payload_fits(const avi_segment_t *seg, size_t size)
@@ -125,10 +140,15 @@ static int patch_u32(FILE *fp, off_t pos, uint32_t value)
 /* 在状态锁内记录可供 HTTP/GUI 查询的持久错误原因。 */
 static void status_error(ipcam_record_ctx_t *ctx, const char *message)
 {
+    ipcam_record_state_t old_state;
     pthread_mutex_lock(&ctx->mtx);
+    old_state = ctx->status.state;
     ctx->status.state = IPCAM_RECORD_ERROR;
-    snprintf(ctx->status.last_error, sizeof(ctx->status.last_error), "%s", message);
+    const char *safe_message = message ? message : "未知错误";
+    snprintf(ctx->status.last_error, sizeof(ctx->status.last_error), "%s", safe_message);
     pthread_mutex_unlock(&ctx->mtx);
+    MLOGE("record error: state=%s message=%s\n",
+          record_state_name(old_state), safe_message);
 }
 
 /*
@@ -255,6 +275,8 @@ static int avi_open_segment(ipcam_record_ctx_t *ctx, avi_segment_t **out)
 {
     char error[128];
     if (storage_check(ctx->storage_root, error, sizeof(error)) != 0) {
+        MLOGW("segment open rejected: root=%s reason=%s\n",
+              ctx->storage_root, error);
         status_error(ctx, error);
         return -1;
     }
@@ -302,6 +324,9 @@ static int avi_open_segment(ipcam_record_ctx_t *ctx, avi_segment_t **out)
     pthread_mutex_unlock(&ctx->mtx);
     *out = seg;
     seg->drop_base = ipcam_ring_dropped_count(ctx->jpeg_rb);
+    MLOGI("segment open: no=%u temp=%s final=%s base_drop=%llu\n",
+          no, seg->temp_path, seg->final_path,
+          (unsigned long long)seg->drop_base);
     return 0;
 }
 
@@ -309,6 +334,10 @@ static int avi_open_segment(ipcam_record_ctx_t *ctx, avi_segment_t **out)
 static int avi_rotate_segment(ipcam_record_ctx_t *ctx, avi_segment_t **seg)
 {
     if (!ctx || !seg || !*seg) return -1;
+    MLOGI("segment rotate: frames=%llu payload=%llu container=%llu\n",
+          (unsigned long long)(*seg)->frame_count,
+          (unsigned long long)(*seg)->bytes_written,
+          (unsigned long long)(*seg)->container_bytes);
     if (avi_close(ctx, *seg) != 0) {
         *seg = NULL;
         status_error(ctx, "录像分段收尾失败");
@@ -434,12 +463,20 @@ static int avi_close(ipcam_record_ctx_t *ctx, avi_segment_t *seg)
     ctx->status.frame_count += seg->frame_count;
     ctx->status.bytes_written += seg->bytes_written;
     pthread_mutex_unlock(&ctx->mtx);
+    MLOGI("segment close: file=%s frames=%llu payload=%llu container=%llu index=%zu\n",
+          seg->final_path, (unsigned long long)seg->frame_count,
+          (unsigned long long)seg->bytes_written,
+          (unsigned long long)seg->container_bytes, seg->index_count);
     free(seg->last_jpeg);
     free(seg->index); free(seg);
     return 0;
 fail:
     if (fp) fclose(fp);
 fail_no_close:
+    MLOGE("segment close failed: temp=%s final=%s frames=%llu payload=%llu\n",
+          seg->temp_path, seg->final_path,
+          (unsigned long long)seg->frame_count,
+          (unsigned long long)seg->bytes_written);
     unlink(seg->temp_path);
     free(seg->last_jpeg);
     free(seg->index); free(seg);
@@ -452,6 +489,8 @@ static void *record_thread(void *arg)
     ipcam_record_ctx_t *ctx = arg;
     ipcam_frame_t frame;
     avi_segment_t *seg = NULL;
+    unsigned long consumed = 0;
+    MLOGI("record thread start: root=%s\n", ctx->storage_root);
     while (*ctx->running && !record_is_shutdown(ctx)) {
         int get_rc = ipcam_ring_try_get(ctx->jpeg_rb, &frame);
         if (get_rc == 1) {
@@ -493,6 +532,7 @@ static void *record_thread(void *arg)
         }
         if (get_rc != 0) break;
         record_update_latest(ctx, &frame);
+        consumed++;
         pthread_mutex_lock(&ctx->mtx);
         int state = ctx->status.state;
         int stop = ctx->stop_requested;
@@ -507,6 +547,7 @@ static void *record_thread(void *arg)
                 int stop_after_start = ctx->stop_requested;
                 ctx->stop_requested = 0;
                 pthread_mutex_unlock(&ctx->mtx);
+                MLOGI("record state: STARTING->RECORDING file=%s\n", seg->final_path);
                 if (stop_after_start) {
                     pthread_mutex_lock(&ctx->mtx);
                     ctx->status.state = IPCAM_RECORD_STOPPING;
@@ -532,6 +573,7 @@ static void *record_thread(void *arg)
             }
             if (stop) {
                 pthread_mutex_lock(&ctx->mtx); ctx->status.state = IPCAM_RECORD_STOPPING; pthread_mutex_unlock(&ctx->mtx);
+                MLOGI("record state: RECORDING->STOPPING file=%s\n", seg->final_path);
                 if (avi_close(ctx, seg) != 0) status_error(ctx, "录像收尾失败");
                 seg = NULL;
                 pthread_mutex_lock(&ctx->mtx); if (ctx->status.state != IPCAM_RECORD_ERROR) ctx->status.state = IPCAM_RECORD_IDLE; ctx->status.current_file[0] = '\0'; pthread_mutex_unlock(&ctx->mtx);
@@ -598,8 +640,16 @@ static void *record_thread(void *arg)
                     if (!storage_has_room(ctx->storage_root, reserve) ||
                         avi_append(seg, &frame) != 0)
                         write_failed = 1;
-                    else
+                    else {
                         record_add_metrics(ctx, 1, frame.size);
+                        /* 录像同样保留 BCF2 的首批帧/周期帧摘要，重点确认
+                         * SD 写入、时间轴和 JPEG 序号，而不是打印每个字节。 */
+                        if (seg->frame_count <= 30 || (seg->frame_count % 30) == 0) {
+                            MLOGI("record frame no=%llu src_seq=%lu jpeg=%zu file=%s\n",
+                                  (unsigned long long)seg->frame_count, frame.seqNo,
+                                  frame.size, seg->final_path);
+                        }
+                    }
                 }
                 if (write_failed) {
                     status_error(ctx, "录像写入失败");
@@ -617,6 +667,7 @@ static void *record_thread(void *arg)
         ipcam_ring_release(ctx->jpeg_rb);
     }
     if (seg) { if (avi_close(ctx, seg) != 0) status_error(ctx, "退出时录像收尾失败"); }
+    MLOGI("record thread exit: consumed=%lu\n", consumed);
     return NULL;
 }
 
@@ -636,12 +687,24 @@ int ipcam_record_start(ipcam_record_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
     pthread_mutex_init(&ctx->latest_mtx, NULL);
     pthread_cond_init(&ctx->latest_cond, NULL);
     ctx->status.state = IPCAM_RECORD_IDLE;
+    int mounted = 0;
+    uint64_t available = 0;
+    char storage_error[128] = "";
+    int storage_rc = storage_probe(ctx->storage_root, &mounted, &available,
+                                   storage_error, sizeof(storage_error));
+    MLOGI("record service init: root=%s video=%dx%d@%d mounted=%d available=%llu probe_rc=%d%s%s\n",
+          ctx->storage_root, ctx->width, ctx->height, ctx->fps, mounted,
+          (unsigned long long)available, storage_rc,
+          storage_rc == 0 ? "" : " reason=",
+          storage_rc == 0 ? "" : storage_error);
     if (pthread_create(&ctx->thread, NULL, record_thread, ctx) != 0) {
         pthread_cond_destroy(&ctx->latest_cond);
         pthread_mutex_destroy(&ctx->latest_mtx);
         pthread_mutex_destroy(&ctx->mtx);
         return -1;
     }
+    MLOGI("record service ready: state=%s session=%lu\n",
+          record_state_name(IPCAM_RECORD_IDLE), ctx->session_id);
     return 0;
 }
 
@@ -650,13 +713,20 @@ int ipcam_record_request_start(ipcam_record_ctx_t *ctx)
 {
     if (!ctx) return -1;
     pthread_mutex_lock(&ctx->mtx);
-    if (ctx->status.state == IPCAM_RECORD_RECORDING || ctx->status.state == IPCAM_RECORD_STARTING) { pthread_mutex_unlock(&ctx->mtx); return -1; }
+    if (ctx->status.state == IPCAM_RECORD_RECORDING || ctx->status.state == IPCAM_RECORD_STARTING) {
+        ipcam_record_state_t state = ctx->status.state;
+        pthread_mutex_unlock(&ctx->mtx);
+        MLOGW("record start rejected: state=%s\n", record_state_name(state));
+        return -1;
+    }
     ctx->status.state = IPCAM_RECORD_STARTING;
     ctx->status.last_error[0] = '\0';
     ctx->status.elapsed_ms = 0;
     ctx->recording_start_ns = 0;
     ctx->stop_requested = 0;
-    pthread_mutex_unlock(&ctx->mtx); return 0;
+    pthread_mutex_unlock(&ctx->mtx);
+    MLOGI("record start accepted: state=STARTING\n");
+    return 0;
 }
 
 /* 受理停止请求；线程会在当前队列帧边界完成 AVI 索引和同步。 */
@@ -664,9 +734,17 @@ int ipcam_record_request_stop(ipcam_record_ctx_t *ctx)
 {
     if (!ctx) return -1;
     pthread_mutex_lock(&ctx->mtx);
-    if (ctx->status.state != IPCAM_RECORD_RECORDING && ctx->status.state != IPCAM_RECORD_STARTING) { pthread_mutex_unlock(&ctx->mtx); return -1; }
+    if (ctx->status.state != IPCAM_RECORD_RECORDING && ctx->status.state != IPCAM_RECORD_STARTING) {
+        ipcam_record_state_t state = ctx->status.state;
+        pthread_mutex_unlock(&ctx->mtx);
+        MLOGW("record stop rejected: state=%s\n", record_state_name(state));
+        return -1;
+    }
     ctx->stop_requested = 1;
-    pthread_mutex_unlock(&ctx->mtx); return 0;
+    ipcam_record_state_t state = ctx->status.state;
+    pthread_mutex_unlock(&ctx->mtx);
+    MLOGI("record stop accepted: state=%s\n", record_state_name(state));
+    return 0;
 }
 
 /* 复制状态快照，调用方不持有录像锁即可格式化 JSON。 */
@@ -704,6 +782,7 @@ void ipcam_record_get_metrics(ipcam_record_ctx_t *ctx, uint64_t *frames,
 int ipcam_record_save_photo(ipcam_record_ctx_t *ctx, char *path_out, size_t path_sz)
 {
     if (!ctx || !ctx->jpeg_rb) return -1;
+    MLOGI("photo request: root=%s\n", ctx->storage_root);
     char error[128];
     if (storage_check(ctx->storage_root, error, sizeof(error)) != 0) {
         status_error(ctx, error);
@@ -733,6 +812,7 @@ int ipcam_record_save_photo(ipcam_record_ctx_t *ctx, char *path_out, size_t path
         int wait_rc = pthread_cond_timedwait(&ctx->latest_cond, &ctx->latest_mtx, &deadline);
         if (wait_rc != 0) break;
     }
+    unsigned long saved_seq = ctx->latest_seq;
     size_t jpeg_size = (ctx->latest_seq != previous_seq) ? ctx->latest_size : 0;
     unsigned char *jpeg = jpeg_size ? malloc(jpeg_size) : NULL;
     if (jpeg) memcpy(jpeg, ctx->latest_jpeg, jpeg_size);
@@ -771,6 +851,8 @@ int ipcam_record_save_photo(ipcam_record_ctx_t *ctx, char *path_out, size_t path
         unlink(temp); status_error(ctx, "照片保存失败"); return -1;
     }
     if (path_out && path_sz > 0) snprintf(path_out, path_sz, "%s", final);
+    MLOGI("photo saved: file=%s bytes=%zu src_seq=%lu\n",
+          final, jpeg_size, saved_seq);
     return 0;
 }
 
@@ -778,6 +860,7 @@ int ipcam_record_save_photo(ipcam_record_ctx_t *ctx, char *path_out, size_t path
 void ipcam_record_stop(ipcam_record_ctx_t *ctx)
 {
     if (!ctx) return;
+    MLOGI("record stop service requested\n");
     /* 原子置位后广播条件变量，正在等待下一帧的拍照命令会及时返回。 */
     __sync_lock_test_and_set(&ctx->shutdown_requested, 1);
     pthread_mutex_lock(&ctx->latest_mtx);
@@ -799,4 +882,5 @@ void ipcam_record_stop(ipcam_record_ctx_t *ctx)
     pthread_cond_destroy(&ctx->latest_cond);
     pthread_mutex_destroy(&ctx->latest_mtx);
     pthread_mutex_destroy(&ctx->mtx);
+    MLOGI("record service stopped\n");
 }

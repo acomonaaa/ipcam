@@ -10,11 +10,12 @@
  * MJPEG 编码线程：从环形缓冲读 YUYV 帧，调 libjpeg-turbo 编码为 JPEG，
  * 写入"已编码环形缓冲"供 stream_http 消费。
  *
- * **必须** YUYV 4:2:2 输入（与 capture 协商结果一致）。
- * 用 tjCompressFromYUVPlanes + TJSAMP_422，planner 布局：
+ * **必须** YUYV 4:2:2 输入（与 capture 协商结果一致），编码输出使用
+ * TJSAMP_420，减少色度数据量和板端编码开销：
  *   Y plane  = W * H         bytes
- *   Cb plane = (W/2) * H     bytes
- *   Cr plane = (W/2) * H     bytes
+ *   Cb plane = (W/2) * ceil(H/2) bytes
+ *   Cr plane = (W/2) * ceil(H/2) bytes
+ * Cb/Cr 的垂直降采样在编码线程内完成，保持 Y 平面全分辨率和帧元数据尺寸一致。
  */
 #include "ipcam_ringbuffer.h"
 

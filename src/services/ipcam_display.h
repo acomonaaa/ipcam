@@ -17,6 +17,8 @@ typedef struct ipcam_display_ctx_s {
     int      fb_w;
     int      fb_h;
     int      fb_bpp;
+    int      fb_xoffset;
+    int      fb_yoffset;
     int      fb_line_length;    /* finfo.line_length；0 表示未设置 */
     unsigned short *fb_base;    /* mmap 后的帧缓冲基址（RGB565 16bpp） */
     size_t   fb_size;
@@ -37,6 +39,7 @@ typedef struct ipcam_display_ctx_s {
     pthread_mutex_t preview_mtx; /* 保护供 GUI 复制的最新 RGB565 帧 */
     pthread_mutex_t stats_mtx;    /* 保护已渲染帧累计值 */
     uint64_t       frames_rendered;
+    volatile sig_atomic_t framebuffer_writer_enabled;
     unsigned short  *preview_base;
     size_t           preview_size;
     ipcam_frame_t    preview_frame;
@@ -48,10 +51,18 @@ typedef struct ipcam_display_ctx_s {
     float            center_y;
 } ipcam_display_ctx_t;
 
+/* 兼容旧调用方：直接由 display 线程写 framebuffer。 */
 int  ipcam_display_start(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
                          int src_w, int src_h,
                          volatile sig_atomic_t *running);
+/* LVGL 模式下只生成 RGB565 预览副本，把 framebuffer 写入交给 LVGL flush。 */
+int  ipcam_display_start_ex(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
+                            int src_w, int src_h, int framebuffer_writer,
+                            volatile sig_atomic_t *running);
 void ipcam_display_stop(ipcam_display_ctx_t *ctx);
+
+/* 在 LVGL 初始化失败时切回旧的直接写屏路径，避免 LCD 因 UI 能力缺失而黑屏。 */
+void ipcam_display_set_framebuffer_writer(ipcam_display_ctx_t *ctx, int enabled);
 
 /* 设置本地观察视口；zoom 限制在 1～4，中心坐标为源图像归一化坐标。 */
 int ipcam_display_set_view(ipcam_display_ctx_t *ctx, int enabled,

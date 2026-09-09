@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 
+/* 熄屏、唤醒和背光状态日志归入 SCRN 模块。 */
+#define IPCAM_LOG_MODULE "SCRN"
 #include "ipcam_screen.h"
 #include "ipcam_display.h"
 #include "ipcam_log.h"
@@ -60,6 +62,8 @@ int ipcam_screen_start(ipcam_screen_ctx_t *ctx, volatile sig_atomic_t *running,
         pthread_mutex_destroy(&ctx->mtx);
         return -1;
     }
+    MLOGI("screen service ready: backlight=%d%% timeout=%dmin\n",
+          ctx->brightness_percent, ctx->timeout_min);
     return 0;
 }
 
@@ -99,6 +103,8 @@ void ipcam_screen_update(ipcam_screen_ctx_t *ctx, int brightness_percent, int ti
     ctx->timeout_min = timeout_min;
     ctx->last_touch_ns = screen_now_ns();
     pthread_mutex_unlock(&ctx->mtx);
+    MLOGI("screen config updated: backlight=%d%% timeout=%dmin\n",
+          brightness_percent, timeout_min);
     if (was_sleeping) {
         if (ctx->display) ipcam_display_set_screen_paused(ctx->display, 0);
         ipcam_display_set_backlight_percent(brightness_percent);
@@ -119,8 +125,10 @@ int ipcam_screen_accept_input(ipcam_screen_ctx_t *ctx)
 void ipcam_screen_stop(ipcam_screen_ctx_t *ctx)
 {
     if (!ctx) return;
+    MLOGI("screen stop requested\n");
     ctx->service_running = 0;
     if (ctx->thread) { pthread_join(ctx->thread, NULL); ctx->thread = 0; }
     if (ctx->display) ipcam_display_set_screen_paused(ctx->display, 0);
     pthread_mutex_destroy(&ctx->mtx);
+    MLOGI("screen stopped\n");
 }

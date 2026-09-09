@@ -15,6 +15,9 @@
 
 ROOT      := $(shell pwd)
 PREFIX   ?= $(ROOT)/output
+LVGL_DIR  ?= $(ROOT)/thirdparts/lvgl/src
+BUILD_DIR ?= $(ROOT)/build
+LVGL_BUILD_DIR := $(BUILD_DIR)/lvgl
 
 CROSS_COMPILE ?= arm-linux-gnueabihf-
 CC            = $(CROSS_COMPILE)gcc
@@ -37,12 +40,15 @@ TJ_LDFLAGS   := -L$(TJ_PREFIX)/lib -lturbojpeg
 
 # 头文件搜索路径
 INCLUDES := -I$(ROOT)/config \
+            -I$(ROOT) \
             -I$(ROOT)/src \
             -I$(ROOT)/src/core \
-            -I$(ROOT)/src/services
+            -I$(ROOT)/src/services \
+            -I$(LVGL_DIR)
 
 # 32 位 ARM 仍需支持接近 3 GiB 的 AVI 段，启用 glibc 大文件接口。
-CFLAGS  := $(OPT) $(WARN) -std=gnu99 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -pthread $(TJ_CFLAGS) $(INCLUDES)
+CFLAGS  := $(OPT) $(WARN) -std=gnu99 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 \
+           -DLV_CONF_INCLUDE_SIMPLE -pthread $(TJ_CFLAGS) $(INCLUDES)
 # 触摸双指距离计算使用 libm；display-only 也要保持同一手势实现可链接。
 LDFLAGS := -pthread $(TJ_LDFLAGS) -lm
 
@@ -66,6 +72,14 @@ SRCS          := $(SRCS_CORE) $(SRCS_SERVICES) $(ENCODE_SRC) $(SRCS_APP)
 OBJS := $(SRCS:.c=.o)
 BIN  := ipcam
 
+# LVGL 的 CMake 也按 src 下的 C 文件递归编译；这里使用同一边界，关闭的
+# 平台后端会由 lv_conf.h 的宏裁剪，生成的对象放到 build/，不污染外部源码树。
+LVGL_SRCS := $(shell if [ -f "$(LVGL_DIR)/src/lv_init.c" ]; then \
+                    find "$(LVGL_DIR)/src" -type f -name '*.c' -print; \
+                fi)
+LVGL_OBJS := $(patsubst $(LVGL_DIR)/%.c,$(LVGL_BUILD_DIR)/%.o,$(LVGL_SRCS))
+LVGL_STATIC_LIB := $(BUILD_DIR)/liblvgl.a
+
 # argv[0] 多调用入口的软软链接
 LINKS := camver camctl
 
@@ -73,15 +87,31 @@ LINKS := camver camctl
 
 all: $(BIN)
 
-$(BIN): $(OBJS)
+$(BIN): $(OBJS) $(LVGL_STATIC_LIB)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "=== build OK: $@ ==="
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(LVGL_BUILD_DIR)/%.o: $(LVGL_DIR)/%.c
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -I$(LVGL_DIR)/src -c $< -o $@
+
+ifneq ($(strip $(LVGL_SRCS)),)
+$(LVGL_STATIC_LIB): $(LVGL_OBJS)
+	@mkdir -p "$(@D)"
+	$(AR) rcs $@ $^
+else
+$(LVGL_STATIC_LIB):
+	@echo "缺少 LVGL v9.5.0 源码：$(LVGL_DIR)" >&2
+	@echo "请执行：git clone --branch v9.5.0 --depth 1 https://github.com/lvgl/lvgl.git $(LVGL_DIR)" >&2
+	@false
+endif
+
 # ipcam-display-only：保留 stub 编码器，不需要 libjpeg-turbo
-ipcam-display-only: CFLAGS := $(OPT) $(WARN) -std=gnu99 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -pthread $(INCLUDES)
+ipcam-display-only: CFLAGS := $(OPT) $(WARN) -std=gnu99 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 \
+                              -DLV_CONF_INCLUDE_SIMPLE -pthread $(INCLUDES)
 ipcam-display-only: LDFLAGS := -pthread -lm
 ipcam-display-only: $(BIN)
 
@@ -134,3 +164,4 @@ uninstall:
 
 clean:
 	rm -f $(BIN) $(OBJS)
+	rm -rf $(LVGL_BUILD_DIR) $(LVGL_STATIC_LIB)
