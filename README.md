@@ -42,6 +42,9 @@
 ipcam/
 ├── Makefile                  # 顶层单一 Makefile（wildcard 自动收集 src/）
 ├── README.md
+├── design/
+│   ├── IPCam_LCD_UI_sentry.pen       # 最新 800×480 GUI 设计源文件
+│   └── LVGL_MAPPING.md               # 设计页面与 LVGL 实现映射
 ├── config/
 │   └── ipcam_config.h        # 编译期默认值
 ├── lv_conf.h                 # LVGL 9 的 i.MX6ULL 最小配置
@@ -62,7 +65,7 @@ ipcam/
     ├── services/             # LEVEL 2：业务子模块（依赖 core）
     │   ├── ipcam_capture.{h,c}        # V4L2 采集
     │   ├── ipcam_display.{h,c}        # LCD 预览帧生产与 framebuffer 映射
-    │   ├── ipcam_lvgl.{h,c}           # LVGL 9 显示 flush、输入快照和验证页面
+    │   ├── ipcam_lvgl.{h,c}           # LVGL 9 framebuffer/evdev 适配与 UI 服务
     │   ├── ipcam_encode.{h,c}         # MJPEG 编码（libjpeg-turbo）
     │   ├── ipcam_encode_stub.c        # 编码空壳（display-only fallback）
     │   ├── ipcam_record.{h,c}         # SD 卡照片与 MJPEG AVI 分段录像
@@ -74,6 +77,10 @@ ipcam/
     │   ├── ipcam_net4g.{h,c}          # 4G 拨号（AT + pppd）
     │   ├── ipcam_netwifi.{h,c}        # WiFi 连接（wpa_supplicant）
     │   └── ipcam_cli.{h,c}            # argv[0] 多调用派发
+    ├── ui/                   # LVGL 9 的 P01～P08 固定坐标界面与组件
+    │   ├── ipcam_ui.{h,c}              # 页面生命周期、状态同步和动作分发
+    │   ├── ipcam_ui_components.{h,c}   # 与 .pen token 对齐的通用控件
+    │   └── ipcam_ui_screen_*.c         # 八个设计页面的具体布局
     └── main.c                # LEVEL 3：应用入口（编排所有子系统）
 ```
 
@@ -115,8 +122,16 @@ git clone --branch v9.5.0 --depth 1 \
 
 `lv_conf.h` 已关闭 LVGL 自带的 fbdev/evdev 后端，应用复用现有
 `ipcam_display` 的 `/dev/fb0` 映射，并由 `ipcam_touch` 的唯一 evdev 线程
-把触点快照交给 LVGL。当前 smoke UI 只使用 ASCII 字符，便于先验证像素、
-刷新和触摸链路；中文字库和完整页面继续在此基础上接入。
+把触点快照交给 LVGL。最新 `.pen` 已按 800×480 画布同步，P01～P08
+分别落到 `src/ui/ipcam_ui_screen_*.c`，P01/P03 的视频区域直接绑定
+`ipcam_display` 输出的 RGB565 帧，按钮动作通过队列交给统一控制层。
+
+`lv_conf.h` 保留 `LV_FONT_DEFAULT`（Mont14）作为图标和回退字体；当前 UI 文案所需
+的中文已经裁剪为 `src/ui/ipcam_ui_font_cjk_14.c`、`16.c`、`20.c`，并在
+`ipcam_lvgl_start()` 中通过 `ipcam_ui_fonts_t` 注入。若后续页面增加中文，应在
+Ubuntu 上运行 `bash scripts/generate_ui_fonts.sh` 重新生成字库，再交叉编译部署。
+字体注入接口和页面映射详见 [`design/LVGL_MAPPING.md`](design/LVGL_MAPPING.md)。
+页面坐标按设计源文件手工维护，后续 `.pen` 发生布局变化时应同步更新映射。
 
 ### 5.3 编译 ipcam
 
@@ -193,8 +208,8 @@ OTA 看门狗（`S90ipcam`）依赖 BusyBox **`wget`** 探测 `http://127.0.0.1:
 |---|---|---|
 | 编译通过 | `make` 无 error | 产出 `./ipcam` ELF32 ARM EABI5 |
 | 启动 | `/etc/init.d/S90ipcam start` | 日志显示 capture/display/LVGL/stream 线程 start |
-| LCD 显示 | 插入 OV5640 到 CSI 插座 | 800×480 LCD 显示 LVGL 验证页和实时画面 |
-| LCD 触摸 | 点击屏幕上的 `TOUCH TEST` | 按钮文字变为 `TOUCH OK`，日志显示 `touch started: /dev/input/event1` |
+| LCD 显示 | 插入 OV5640 到 CSI 插座 | 800×480 LCD 显示 P01 本地预览首页，P01/P03 视频区域出现实时画面 |
+| LCD 触摸 | 点击 P01～P08 的按钮、单选项和开关 | 页面切换和控制动作生效，日志显示 `touch started: /dev/input/event1` |
 | 局域网推流 | 浏览器访问 `http://<board_ip>:8080/` | 看到实时 MJPEG 流，延迟 < 1 秒 |
 | 4G 推流 | 接 4G 模组到 usbotg2；可用 `IPCAM_4G_AT_DEV` 和 `IPCAM_4G_PPP_PEER` 覆盖 AT 设备与 PPP profile，再通过 `curl -d 'net_mode=1' http://127.0.0.1:8080/api/config` 重启 daemon | 同上，但出网走 ppp0 |
 | API 状态 | `curl http://<board_ip>:8080/api/status` | 返回 JSON：model/swver/capture/ring_count 等 |

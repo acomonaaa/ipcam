@@ -19,12 +19,12 @@
 #define IPCAM_CAPTURE_HEIGHT   480
 #endif
 
-/* LCD 显示分辨率（fb0 由内核报告；这里只是默认裁剪/缩放目标） */
+/* LCD 显示分辨率（fb0 由内核报告；当前设计和板级默认值为 800×480） */
 #ifndef IPCAM_LCD_WIDTH
-#define IPCAM_LCD_WIDTH        1024
+#define IPCAM_LCD_WIDTH        800
 #endif
 #ifndef IPCAM_LCD_HEIGHT
-#define IPCAM_LCD_HEIGHT       600
+#define IPCAM_LCD_HEIGHT       480
 #endif
 
 /* 帧率上限（实际由 V4L2 S_PARM 决定，这里是软上限） */

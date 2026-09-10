@@ -335,8 +335,7 @@ static void serve_config_post(int fd, const char *body, size_t body_len,
         else { MLOGW("config_post: unknown key '%s'\n", key); errors++; continue; }
 
         if (rc == 0 && !strcmp(key, "backlight_percent") && display &&
-            getenv("IPCAM_BACKLIGHT_PATH") &&
-            ipcam_display_set_backlight_percent((int)atoi(val)) != 0) {
+            ipcam_display_set_backlight(display, (int)atoi(val)) != 0) {
             MLOGW("config_post: backlight hardware rejected\n");
             rc = -1;
         }

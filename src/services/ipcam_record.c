@@ -151,6 +151,26 @@ static void status_error(ipcam_record_ctx_t *ctx, const char *message)
           record_state_name(old_state), safe_message);
 }
 
+/* 拍照是旁路操作；单次照片失败不能把正在写 AVI 的状态改成 ERROR，
+ * 否则录像线程会停止继续写帧而用户只看到“拍照失败”。 */
+static void status_photo_error(ipcam_record_ctx_t *ctx, const char *message)
+{
+    if (!ctx) return;
+    const char *safe_message = message ? message : "照片操作失败";
+    pthread_mutex_lock(&ctx->mtx);
+    snprintf(ctx->status.last_error, sizeof(ctx->status.last_error), "%s", safe_message);
+    pthread_mutex_unlock(&ctx->mtx);
+    MLOGW("photo error: message=%s\n", safe_message);
+}
+
+static void status_clear_error(ipcam_record_ctx_t *ctx)
+{
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->mtx);
+    ctx->status.last_error[0] = '\0';
+    pthread_mutex_unlock(&ctx->mtx);
+}
+
 /*
  * 只探测目录是否位于独立挂载设备，并读取该设备空间；挂载判断与录像、
  * 拍照、HTTP 状态共用，避免状态接口把根文件系统误报成 SD 卡空间。
@@ -785,17 +805,17 @@ int ipcam_record_save_photo(ipcam_record_ctx_t *ctx, char *path_out, size_t path
     MLOGI("photo request: root=%s\n", ctx->storage_root);
     char error[128];
     if (storage_check(ctx->storage_root, error, sizeof(error)) != 0) {
-        status_error(ctx, error);
+        status_photo_error(ctx, error);
         return -1;
     }
     char dir[256];
     int dir_len = snprintf(dir, sizeof(dir), "%s/ipcam-recordings", ctx->storage_root);
     if (dir_len < 0 || (size_t)dir_len >= sizeof(dir)) {
-        status_error(ctx, "照片目录路径过长");
+        status_photo_error(ctx, "照片目录路径过长");
         return -1;
     }
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
-        status_error(ctx, "创建照片目录失败");
+        status_photo_error(ctx, "创建照片目录失败");
         return -1;
     }
     pthread_mutex_lock(&ctx->latest_mtx);
@@ -819,13 +839,13 @@ int ipcam_record_save_photo(ipcam_record_ctx_t *ctx, char *path_out, size_t path
     pthread_mutex_unlock(&ctx->latest_mtx);
     if (!jpeg || jpeg_size == 0) {
         free(jpeg);
-        status_error(ctx, "当前没有有效视频帧");
+        status_photo_error(ctx, "当前没有有效视频帧");
         return -1;
     }
     /* 拍照也要为 JPEG 本体预留空间，避免只检查固定余量后写到一半满盘。 */
     if (!storage_has_room(ctx->storage_root, jpeg_size)) {
         free(jpeg);
-        status_error(ctx, "照片空间不足");
+        status_photo_error(ctx, "照片空间不足");
         return -1;
     }
     static unsigned long photo_no;
@@ -838,19 +858,20 @@ int ipcam_record_save_photo(ipcam_record_ctx_t *ctx, char *path_out, size_t path
     if (temp_len < 0 || (size_t)temp_len >= sizeof(temp) ||
         final_len < 0 || (size_t)final_len >= sizeof(final)) {
         free(jpeg);
-        status_error(ctx, "照片文件路径过长");
+        status_photo_error(ctx, "照片文件路径过长");
         return -1;
     }
     int fd = open(temp, O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (fd < 0) { free(jpeg); status_error(ctx, "创建照片文件失败"); return -1; }
+    if (fd < 0) { free(jpeg); status_photo_error(ctx, "创建照片文件失败"); return -1; }
     int write_ok = write_all_fd(fd, jpeg, jpeg_size) == 0 && fsync(fd) == 0;
     int close_ok = close(fd) == 0;
     free(jpeg);
     /* close 失败同样视为未完成，不能把可能仍在写入的临时文件改正式名。 */
     if (!write_ok || !close_ok || access(final, F_OK) == 0 || rename(temp, final) != 0) {
-        unlink(temp); status_error(ctx, "照片保存失败"); return -1;
+        unlink(temp); status_photo_error(ctx, "照片保存失败"); return -1;
     }
     if (path_out && path_sz > 0) snprintf(path_out, path_sz, "%s", final);
+    status_clear_error(ctx);
     MLOGI("photo saved: file=%s bytes=%zu src_seq=%lu\n",
           final, jpeg_size, saved_seq);
     return 0;

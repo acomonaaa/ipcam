@@ -6,6 +6,7 @@
 #include "ipcam_config.h"
 
 #include <execinfo.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,127 @@
  * 在 SIG_DFL 之前由正常上下文预先调用并缓存；crash handler 只读这份快照。
  */
 static ipcam_param_t s_crash_snapshot;
+
+typedef struct ipcam_cpu_policy_s {
+    char governor_path[128];
+    char max_path[128];
+    char old_governor[32];
+    char old_max[32];
+    int governor_saved;
+    int max_saved;
+    int changed;
+    int restore_registered;
+} ipcam_cpu_policy_t;
+
+static ipcam_cpu_policy_t s_cpu_policy;
+
+/* 读取 cpufreq 文本节点并去掉换行，便于保存后在退出时原样恢复。 */
+static int cpu_read_text(const char *path, char *buf, size_t buf_sz)
+{
+    if (!path || !buf || buf_sz < 2) return -1;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    if (!fgets(buf, (int)buf_sz, fp)) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    buf[strcspn(buf, "\r\n")] = '\0';
+    return buf[0] ? 0 : -1;
+}
+
+/* 写入 cpufreq 节点；失败只影响性能调优，不允许阻止摄像头服务启动。 */
+static int cpu_write_text(const char *path, const char *value)
+{
+    if (!path || !value || !*value) return -1;
+    FILE *fp = fopen(path, "w");
+    if (!fp) return -1;
+    int ok = fputs(value, fp) >= 0;
+    if (ok) ok = fputc('\n', fp) != EOF;
+    int close_rc = fclose(fp);
+    return ok && close_rc == 0 ? 0 : -1;
+}
+
+/* 正常退出时恢复 cpufreq，避免 ipcam 退出后悄悄改变系统默认电源策略。 */
+static void ipcam_sys_restore_cpu_policy(void)
+{
+    if (!s_cpu_policy.changed) return;
+    if (s_cpu_policy.max_saved)
+        (void)cpu_write_text(s_cpu_policy.max_path, s_cpu_policy.old_max);
+    if (s_cpu_policy.governor_saved)
+        (void)cpu_write_text(s_cpu_policy.governor_path, s_cpu_policy.old_governor);
+    s_cpu_policy.changed = 0;
+}
+
+/* 启动期尽力解除 powersave 限制；cpufreq 缺失或权限不足时保持原策略运行。 */
+static void ipcam_sys_tune_cpu_policy(void)
+{
+    const char *desired = getenv("IPCAM_CPU_GOVERNOR");
+    if (desired && !strcmp(desired, "0")) {
+        MLOGI("CPU governor tuning disabled by IPCAM_CPU_GOVERNOR=0\n");
+        return;
+    }
+    if (!desired || !*desired) desired = "performance";
+
+    snprintf(s_cpu_policy.governor_path, sizeof(s_cpu_policy.governor_path),
+             "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+    snprintf(s_cpu_policy.max_path, sizeof(s_cpu_policy.max_path),
+             "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq");
+    if (cpu_read_text(s_cpu_policy.governor_path, s_cpu_policy.old_governor,
+                      sizeof(s_cpu_policy.old_governor)) != 0) {
+        MLOGW("CPU cpufreq unavailable: %s\n", strerror(errno));
+        return;
+    }
+    s_cpu_policy.governor_saved = 1;
+    if (cpu_read_text(s_cpu_policy.max_path, s_cpu_policy.old_max,
+                      sizeof(s_cpu_policy.old_max)) == 0)
+        s_cpu_policy.max_saved = 1;
+
+    int changed = 0;
+    if (strcmp(s_cpu_policy.old_governor, desired) != 0) {
+        if (cpu_write_text(s_cpu_policy.governor_path, desired) == 0) {
+            changed = 1;
+            MLOGI("CPU governor: %s -> %s\n", s_cpu_policy.old_governor, desired);
+        } else {
+            MLOGW("CPU governor write failed: path=%s errno=%d(%s)\n",
+                  s_cpu_policy.governor_path, errno, strerror(errno));
+        }
+    }
+
+    const char *max_env = getenv("IPCAM_CPU_MAX_FREQ");
+    char max_freq[32];
+    if (max_env && *max_env) {
+        snprintf(max_freq, sizeof(max_freq), "%s", max_env);
+    } else if (cpu_read_text(
+                   "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
+                   max_freq, sizeof(max_freq)) != 0) {
+        max_freq[0] = '\0';
+    }
+    if (s_cpu_policy.max_saved && max_freq[0] &&
+        strcmp(s_cpu_policy.old_max, max_freq) != 0) {
+        if (cpu_write_text(s_cpu_policy.max_path, max_freq) == 0) {
+            changed = 1;
+            MLOGI("CPU max frequency: %s -> %s kHz\n",
+                  s_cpu_policy.old_max, max_freq);
+        } else {
+            MLOGW("CPU max frequency write failed: path=%s errno=%d(%s)\n",
+                  s_cpu_policy.max_path, errno, strerror(errno));
+        }
+    }
+    s_cpu_policy.changed = changed;
+    if (changed && !s_cpu_policy.restore_registered) {
+        if (atexit(ipcam_sys_restore_cpu_policy) == 0)
+            s_cpu_policy.restore_registered = 1;
+    }
+
+    char current_freq[32];
+    if (cpu_read_text("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
+                      current_freq, sizeof(current_freq)) == 0)
+        MLOGI("CPU policy ready: governor=%s cur_freq=%s kHz\n", desired,
+              current_freq);
+    else
+        MLOGI("CPU policy ready: governor=%s current frequency unavailable\n", desired);
+}
 
 void ipcam_sys_take_snapshot(void)
 {
@@ -102,6 +224,7 @@ void ipcam_sys_register_crash_handlers(void)
 int ipcam_sys_init(const char *module)
 {
     ipcam_log_init(module ? module : IPCAM_MODEL);
+    ipcam_sys_tune_cpu_policy();
     return 0;
 }
 

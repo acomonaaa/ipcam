@@ -6,6 +6,7 @@
 #include "ipcam_config.h"
 #include "ipcam_log.h"
 #include "ipcam_param.h"
+#include "ipcam_storage.h"
 #include "ipcam_touch.h"
 
 #include <stdlib.h>
@@ -56,6 +57,7 @@ static const char *control_command_name(ipcam_control_command_type_t type)
     case IPCAM_CONTROL_RECORD_START: return "record_start";
     case IPCAM_CONTROL_RECORD_STOP: return "record_stop";
     case IPCAM_CONTROL_PHOTO: return "photo";
+    case IPCAM_CONTROL_FORMAT_STORAGE: return "format_storage";
     default: return "unknown";
     }
 }
@@ -123,10 +125,11 @@ static void fill_capabilities(const ipcam_control_ctx_t *ctx,
     caps->preview_zoom = ctx && ctx->display ? 1 : 0;
     caps->preview_zoom_min = 1.0f;
     caps->preview_zoom_max = 4.0f;
-    const char *backlight = getenv("IPCAM_BACKLIGHT_PATH");
     caps->touch_points = probe_touch_points();
-    caps->backlight = ctx && ctx->display && backlight && *backlight &&
-                      access(backlight, W_OK) == 0;
+    /* display 已完成 env/sysfs 探测，能力值必须复用实际探测结果，不能只看
+     * IPCAM_BACKLIGHT_PATH；否则自动发现的 pwm-backlight 会被错误报告为不可用。 */
+    caps->backlight = ctx && ctx->display &&
+                      ipcam_display_backlight_available(ctx->display);
     caps->light = ipcam_light_available();
     caps->screen_timeout = ctx && ctx->display ? 1 : 0;
     caps->record_segment_seconds = IPCAM_RECORD_SEGMENT_SECONDS;
@@ -154,7 +157,7 @@ static ipcam_control_result_t *find_result_locked(ipcam_control_ctx_t *ctx,
     return NULL;
 }
 
-/* 读取有线网卡和 SD 卡状态；存储探测复用录像服务的挂载身份检查。 */
+/* 读取有线网卡和 SD 卡状态；GUI/HTTP 共用同一份挂载与容量快照。 */
 static void fill_link_storage(ipcam_control_status_t *status,
                               ipcam_record_ctx_t *recorder)
 {
@@ -174,12 +177,20 @@ static void fill_link_storage(ipcam_control_status_t *status,
         freeifaddrs(list);
     }
     if (recorder) {
-        int mounted = 0;
-        uint64_t available = 0;
-        int probe_rc = ipcam_record_get_storage_status(recorder, &mounted, &available);
-        status->storage_mounted = mounted ? 1 : 0;
-        if (probe_rc == 0)
-            status->storage_available_bytes = available;
+        ipcam_storage_info_t info;
+        memset(&info, 0, sizeof(info));
+        (void)ipcam_storage_get_info(recorder->storage_root, &info);
+        status->storage_mounted = info.mounted ? 1 : 0;
+        status->storage_total_bytes = info.total_bytes;
+        status->storage_used_bytes = info.used_bytes;
+        status->storage_available_bytes = info.available_bytes;
+        status->storage_format_supported = info.format_supported ? 1 : 0;
+        snprintf(status->storage_mount_path, sizeof(status->storage_mount_path), "%s",
+                 info.mount_path);
+        snprintf(status->storage_device, sizeof(status->storage_device), "%s",
+                 info.device);
+        snprintf(status->storage_fs_type, sizeof(status->storage_fs_type), "%s",
+                 info.fs_type);
     }
 }
 
@@ -294,19 +305,19 @@ static int apply_command(ipcam_control_ctx_t *ctx,
 
     case IPCAM_CONTROL_SET_BACKLIGHT:
         if (cmd->percent < 10 || cmd->percent > 100 || !ctx->display ||
-            !getenv("IPCAM_BACKLIGHT_PATH")) {
+            !ipcam_display_backlight_available(ctx->display)) {
             result_message(result, -8, 0, "背光硬件不可用或保存失败");
             return -8;
         }
         {
             int old_percent = ipcam_param_get_backlight_percent();
-            if (ipcam_display_set_backlight_percent(cmd->percent) != 0) {
+            if (ipcam_display_set_backlight(ctx->display, cmd->percent) != 0) {
                 result_message(result, -8, 0, "背光硬件不可用或保存失败");
                 return -8;
             }
             if (ipcam_param_set_backlight_percent((uint8_t)cmd->percent) != 0) {
                 /* 持久化失败时恢复原亮度，调用方可重试而不会看到假状态。 */
-                ipcam_display_set_backlight_percent(old_percent);
+                ipcam_display_set_backlight(ctx->display, old_percent);
                 result_message(result, -8, 0, "背光保存失败，已回退");
                 return -8;
             }
@@ -314,7 +325,11 @@ static int apply_command(ipcam_control_ctx_t *ctx,
         if (ctx->screen)
             ipcam_screen_update(ctx->screen, cmd->percent,
                                 ipcam_param_get_screen_timeout_min());
-        result_message(result, 0, 1, "背光已生效并保存");
+        if (ctx->display && !ctx->display->backlight_available &&
+            ctx->display->fb_blank_available)
+            result_message(result, 0, 1, "屏幕仅支持亮灭，亮度配置已保存");
+        else
+            result_message(result, 0, 1, "背光已生效并保存");
         return 0;
 
     case IPCAM_CONTROL_SET_LIGHT:
@@ -372,6 +387,25 @@ static int apply_command(ipcam_control_ctx_t *ctx,
         }
         result_message(result, 0, 0, "照片已写入 SD 卡");
         return 0;
+
+    case IPCAM_CONTROL_FORMAT_STORAGE: {
+        if (!ctx->recorder) {
+            result_message(result, -17, 0, "存储服务不可用");
+            return -17;
+        }
+        /* 录像文件仍可能持有 SD 卡文件描述符；格式化前必须由用户先停止
+         * 录像，避免 mkfs 与 AVI 写入并发破坏文件系统。 */
+        if (recording_locks_video(ctx)) {
+            result_message(result, -18, 0, "录像期间不能格式化 SD 卡");
+            return -18;
+        }
+        char message[128] = "";
+        int rc = ipcam_storage_format(ctx->recorder->storage_root,
+                                      message, sizeof(message));
+        result_message(result, rc == 0 ? 0 : -19, 0,
+                       message[0] ? message : "SD 卡格式化失败");
+        return rc == 0 ? 0 : -19;
+    }
 
     default:
         result_message(result, -1, 0, "未知控制命令");

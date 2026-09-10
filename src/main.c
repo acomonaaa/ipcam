@@ -224,10 +224,11 @@ static void cleanup_all(subsys_t *s)
     if (s->rb_jpeg_record) ipcam_ring_close(s->rb_jpeg_record);
 
     if (s->stream_started)  { MLOGI("stopping stream_http\n");   ipcam_stream_stop(&s->http);  s->stream_started = 0; }
+    if (s->touch_started)   { MLOGI("stopping touch\n");         ipcam_touch_stop(&s->touch); s->touch_started = 0; }
+    /* LVGL 线程会读取 control 的只读状态；必须先停 UI，再销毁 control。 */
+    if (s->lvgl_started)    { MLOGI("stopping lvgl\n");          ipcam_lvgl_stop(&s->lvgl); s->lvgl_started = 0; }
     if (s->control_started) { MLOGI("stopping control\n");       ipcam_control_deinit(&s->control); s->control_started = 0; }
     if (s->record_started)  { MLOGI("stopping recorder\n");      ipcam_record_stop(&s->rec);  s->record_started = 0; }
-    if (s->touch_started)   { MLOGI("stopping touch\n");         ipcam_touch_stop(&s->touch); s->touch_started = 0; }
-    if (s->lvgl_started)    { MLOGI("stopping lvgl\n");          ipcam_lvgl_stop(&s->lvgl); s->lvgl_started = 0; }
     if (s->screen_started)  { MLOGI("stopping screen\n");        ipcam_screen_stop(&s->screen); s->screen_started = 0; }
     if (s->encode_started)  { MLOGI("stopping encode\n");        ipcam_encode_stop(&s->enc);   s->encode_started = 0; }
     if (s->display_started) { MLOGI("stopping display\n");       ipcam_display_stop(&s->dis);  s->display_started = 0; }
@@ -451,6 +452,8 @@ static int run_daemon(void)
     }
     s.control_started = 1;
     MLOGI("control pipeline started\n");
+    if (s.lvgl_started)
+        ipcam_lvgl_set_control(&s.lvgl, &s.control);
 
     if (!encode_is_stub) {
         if (ipcam_stream_start_ex(&s.http, s.rb_jpeg, &g_running, &s.control) < 0) {
@@ -478,6 +481,8 @@ static int run_daemon(void)
     int peak_disp = 0, peak_enc = 0, peak_live = 0, peak_record = 0;
     while (g_running) {
         sleep(1);
+        /* UI 回调只入队，主线程在这里串行执行硬件/文件控制命令。 */
+        if (s.lvgl_started) ipcam_lvgl_process_actions(&s.lvgl);
         if (++metrics_tick >= 5) {
             ipcam_record_status_t rst;
             memset(&rst, 0, sizeof(rst));

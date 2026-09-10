@@ -16,9 +16,12 @@ typedef struct ipcam_ui_action_binding_s {
 
 typedef struct ipcam_ui_home_view_s {
     lv_obj_t *root;
+    lv_obj_t *video_surface;
+    lv_obj_t *video_image;
     lv_obj_t *network_text;
     lv_obj_t *storage_text;
     lv_obj_t *fps_text;
+    lv_obj_t *video_resolution;
     lv_obj_t *zoom_text;
     lv_obj_t *video_placeholder;
     lv_obj_t *access_helper;
@@ -42,6 +45,8 @@ typedef struct ipcam_ui_home_view_s {
 
 typedef struct ipcam_ui_fullscreen_view_s {
     lv_obj_t *root;
+    lv_obj_t *video_surface;
+    lv_obj_t *video_image;
     lv_obj_t *video_placeholder;
     lv_obj_t *zoom_value;
     lv_obj_t *recording_pill;
@@ -53,10 +58,13 @@ typedef struct ipcam_ui_video_view_s {
     lv_obj_t *lock_notice;
     lv_obj_t *resolution_rows[3];
     lv_obj_t *resolution_dots[3];
+    lv_obj_t *resolution_labels[3];
     lv_obj_t *fps_rows[3];
     lv_obj_t *fps_dots[3];
+    lv_obj_t *fps_labels[3];
     lv_obj_t *jpeg_rows[2];
     lv_obj_t *jpeg_dots[2];
+    lv_obj_t *jpeg_labels[2];
     lv_obj_t *mirror_horizontal_toggle;
     lv_obj_t *mirror_horizontal_knob;
     lv_obj_t *mirror_vertical_toggle;
@@ -69,6 +77,7 @@ typedef struct ipcam_ui_screen_view_s {
     lv_obj_t *brightness_value;
     lv_obj_t *timeout_rows[5];
     lv_obj_t *timeout_dots[5];
+    lv_obj_t *timeout_labels[5];
 } ipcam_ui_screen_view_t;
 
 typedef struct ipcam_ui_storage_view_s {
@@ -79,8 +88,15 @@ typedef struct ipcam_ui_storage_view_s {
     lv_obj_t *free_value;
     lv_obj_t *usage_fill;
     lv_obj_t *usage_percent;
+    lv_obj_t *device_value;
+    lv_obj_t *filesystem_value;
+    lv_obj_t *mount_value;
     lv_obj_t *record_state;
     lv_obj_t *record_segment;
+    lv_obj_t *format_button;
+    lv_obj_t *format_overlay;
+    lv_obj_t *format_card;
+    lv_obj_t *format_status;
 } ipcam_ui_storage_view_t;
 
 typedef struct ipcam_ui_network_view_s {
@@ -138,9 +154,24 @@ struct ipcam_ui_s {
     ipcam_ui_network_view_t network;
     ipcam_ui_state_view_t state_view;
 
+    /* 全局顶层休眠提示覆盖当前页面，避免每个 P01～P08 重复创建一套弹窗。 */
+    lv_obj_t *sleep_overlay;
+    lv_obj_t *sleep_card;
+    lv_obj_t *sleep_countdown;
+    lv_obj_t *sleep_keep_button;
+    lv_obj_t *sleep_sleep_button;
+
     ipcam_ui_video_pending_t video_pending;
     int video_pending_valid;
     int video_dirty;
+
+    /*
+     * 触摸事件回调中只登记目标页面，不立即删除/创建 LVGL 根对象。
+     * LVGL 事件派发尚未返回时销毁当前页面会使回调链和 user_data 失效，
+     * 因而导航必须延后到主循环的安全边界执行。
+     */
+    ipcam_ui_screen_t pending_screen;
+    int navigation_pending;
 
     ipcam_ui_action_binding_t bindings[IPCAM_UI_MAX_ACTION_BINDINGS];
     size_t binding_count;
@@ -150,6 +181,8 @@ struct ipcam_ui_s {
 int ipcam_ui_bind_action(ipcam_ui_t *ui, lv_obj_t *obj,
                          lv_event_code_t event_code,
                          const ipcam_ui_action_t *action);
+int ipcam_ui_dispatch_action(ipcam_ui_t *ui,
+                             const ipcam_ui_action_t *action);
 
 const lv_font_t *ipcam_ui_font_body(const ipcam_ui_t *ui);
 const lv_font_t *ipcam_ui_font_small(const ipcam_ui_t *ui);
@@ -160,6 +193,8 @@ void ipcam_ui_format_bytes(uint64_t bytes, char *buf, size_t buf_sz);
 void ipcam_ui_format_duration(uint64_t elapsed_ms, char *buf, size_t buf_sz);
 const char *ipcam_ui_record_state_text(ipcam_ui_record_state_t state);
 int ipcam_ui_record_active(ipcam_ui_record_state_t state);
+void ipcam_ui_set_radio_selected(lv_obj_t *row, lv_obj_t *dot,
+                                 lv_obj_t *label, int selected);
 
 lv_obj_t *ipcam_ui_home_create(ipcam_ui_t *ui, ipcam_ui_home_view_t *view,
                                int computer_mode);
@@ -183,6 +218,7 @@ lv_obj_t *ipcam_ui_storage_create(ipcam_ui_t *ui,
                                   ipcam_ui_storage_view_t *view);
 void ipcam_ui_storage_update(ipcam_ui_t *ui,
                              ipcam_ui_storage_view_t *view);
+void ipcam_ui_storage_format_prompt(ipcam_ui_t *ui, int visible);
 
 lv_obj_t *ipcam_ui_network_create(ipcam_ui_t *ui,
                                   ipcam_ui_network_view_t *view);
@@ -192,5 +228,9 @@ void ipcam_ui_network_set_tab(ipcam_ui_network_view_t *view, int system_tab);
 
 lv_obj_t *ipcam_ui_state_create(ipcam_ui_t *ui, ipcam_ui_state_view_t *view);
 void ipcam_ui_state_update(ipcam_ui_t *ui, ipcam_ui_state_view_t *view);
+
+/* 创建并刷新全局休眠提示；调用均发生在 LVGL 线程。 */
+int ipcam_ui_sleep_prompt_create(ipcam_ui_t *ui);
+void ipcam_ui_sleep_prompt_update(ipcam_ui_t *ui);
 
 #endif /* IPCAM_UI_INTERNAL_H */

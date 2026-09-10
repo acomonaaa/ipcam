@@ -44,6 +44,7 @@ INCLUDES := -I$(ROOT)/config \
             -I$(ROOT)/src \
             -I$(ROOT)/src/core \
             -I$(ROOT)/src/services \
+            -I$(ROOT)/src/ui \
             -I$(LVGL_DIR)
 
 # 32 位 ARM 仍需支持接近 3 GiB 的 AVI 段，启用 glibc 大文件接口。
@@ -67,7 +68,8 @@ endif
 
 SRCS_CORE     := $(wildcard src/core/*.c)
 SRCS_APP      := src/main.c
-SRCS          := $(SRCS_CORE) $(SRCS_SERVICES) $(ENCODE_SRC) $(SRCS_APP)
+SRCS_UI       := $(wildcard src/ui/*.c)
+SRCS          := $(SRCS_CORE) $(SRCS_SERVICES) $(SRCS_UI) $(ENCODE_SRC) $(SRCS_APP)
 
 OBJS := $(SRCS:.c=.o)
 BIN  := ipcam
@@ -130,11 +132,15 @@ TEST_LDFLAGS := -pthread $(TEST_SANITIZE_FLAGS)
 TEST_SCALE_BIN := $(TEST_BUILD_DIR)/test_ipcam_scale
 TEST_FRAME_BIN := $(TEST_BUILD_DIR)/test_ipcam_frame_diag
 TEST_STREAM_BIN := $(TEST_BUILD_DIR)/test_ipcam_stream_lifecycle
+TEST_SCREEN_BIN := $(TEST_BUILD_DIR)/test_ipcam_screen
+TEST_STORAGE_BIN := $(TEST_BUILD_DIR)/test_ipcam_storage
 
-test-host: $(TEST_SCALE_BIN) $(TEST_FRAME_BIN) $(TEST_STREAM_BIN)
+test-host: $(TEST_SCALE_BIN) $(TEST_FRAME_BIN) $(TEST_STREAM_BIN) $(TEST_SCREEN_BIN) $(TEST_STORAGE_BIN)
 	@$(TEST_SCALE_BIN)
 	@$(TEST_FRAME_BIN)
 	@$(TEST_STREAM_BIN)
+	@$(TEST_SCREEN_BIN)
+	@$(TEST_STORAGE_BIN)
 
 $(TEST_BUILD_DIR):
 	mkdir -p $@
@@ -150,6 +156,12 @@ $(TEST_STREAM_BIN): tests/test_ipcam_stream_lifecycle.c tests/test_ipcam_stream_
                     src/services/ipcam_stream.c src/core/ipcam_ringbuffer.c | $(TEST_BUILD_DIR)
 	$(HOST_CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
 
+$(TEST_SCREEN_BIN): tests/test_ipcam_screen.c src/services/ipcam_screen.c | $(TEST_BUILD_DIR)
+	$(HOST_CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
+
+$(TEST_STORAGE_BIN): tests/test_ipcam_storage.c src/services/ipcam_storage.c | $(TEST_BUILD_DIR)
+	$(HOST_CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
+
 install: $(BIN)
 	install -d $(PREFIX)/usr/bin
 	install -d $(PREFIX)/etc/init.d
@@ -163,5 +175,7 @@ uninstall:
 	rm -rf $(PREFIX)
 
 clean:
-	rm -f $(BIN) $(OBJS)
+	# 真编码和 display-only 空壳不会同时出现在 OBJS，清理时显式覆盖两者，
+	# 避免切换目标后把上一种架构/编译器的对象错误带入链接。
+	rm -f $(BIN) $(OBJS) src/services/ipcam_encode.o src/services/ipcam_encode_stub.o
 	rm -rf $(LVGL_BUILD_DIR) $(LVGL_STATIC_LIB)

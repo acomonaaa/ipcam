@@ -7,6 +7,8 @@
  *  - ipcam_sys_init: 早于所有子系统调用；打印版本横幅 + 注册崩溃 handler
  *  - ipcam_sys_print_banner: 进程启动时打印
  *  - ipcam_sys_register_crash_handlers: 注册 SIGSEGV/SIGBUS/SIGILL handler dump param
+ *  - ipcam_sys_init: 尝试将运行期 CPU governor 调到 performance，便于软件
+ *    RGB565 转换和 LVGL 合成达到 15 FPS；sysfs 不存在时仅记录警告。
  */
 
 #include "ipcam_log.h"

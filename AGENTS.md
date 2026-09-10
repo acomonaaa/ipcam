@@ -8,6 +8,78 @@
 
 已确认蜂窝模组：**广和通（Fibocom）L610 Cat.1**（AT + PPP）。现有 peers/文档仍有 Quectel EC20 风格 `ttyUSB*`；做 4G 相关改动时**禁止写死** Quectel 专用路径，应将 AT/PPP 设备与 peer 名参数化。
 
+## 板端与 Ubuntu/NFS 调试配置（当前已确认）
+
+以下参数是本项目目前连接正点原子 ALIENTEK i.MX6ULL Mini 开发板时的调试约定。
+网络环境或板级介质改变后，先用 Ubuntu 的 `ip addr`、U-Boot 的 `printenv` 和板端
+`ip addr` 重新确认，不要把这里的地址当作所有环境都永久不变的配置。
+
+### 网络与 NFS
+
+- 开发板 IP：`192.168.1.50/24`
+- Ubuntu 调试网卡 `ens33` / NFS、TFTP 服务器 IP：`192.168.1.253/24`
+- 调试网关：`192.168.1.1`
+- 开发板 U-Boot 当前约定：`ethact=FEC1`、`netmask=255.255.255.0`；已记录的板卡 MAC 为
+  `00:04:9f:01:02:03`
+- NFS 根文件系统目录：`/home/acomon/linux/nfs/rootfs`
+- 当前调试使用的 NFS 参数：
+  `root=/dev/nfs nfsroot=192.168.1.253:/home/acomon/linux/nfs/rootfs,v3,proto=tcp rw`
+- 必须显式使用 `v3,proto=tcp`：4.1.15 内核默认可能协商 NFSv2，而当前 Ubuntu
+  NFS 服务端通常不提供 NFSv2。
+
+### U-Boot 启动与串口
+
+- 网络启动入口：`run mybootnet`。该命令从 Ubuntu TFTP 目录加载 `zImage` 和
+  `imx6ull-14x14-emmc-4.3-800x480-c.dtb`，再执行 `bootz`；当前开发调试默认从网络启动，
+  不使用 `run mybootemmc` 作为日常验证入口。
+- 常用加载地址：内核 `0x80800000`，设备树 `0x83000000`。
+- 串口终端参数：`115200 8N1`。
+- Linux 启动链：NFS rootfs 的 `/etc/init.d/rcS` 负责加载 `mx6s_capture`、
+  `ov5640_camera`，随后自动调用 `S90ipcam` 启动应用；正常情况下不需要手工再启动一次。
+
+### 板级设备与应用入口
+
+- LCD：`/dev/fb0`，实测 `800×480 RGB565`。
+- 触摸：`/dev/input/event1`（Goodix）；`event0` 是电源键，禁止把它误设为触摸设备。
+- 摄像头：当前实测 CSI 节点为 `/dev/video1`、sysfs 名称为 `mx6s-csi`；应用默认
+  `IPCAM_VIDEO_DEV` 为空并自动扫描，不应把 `video1` 固化为通用前提。
+- SD 卡存储默认目录：`/mnt/sdcard`；拍照、录像和状态接口必须沿用挂载检查，不能把
+  NFS rootfs 的剩余空间当作 SD 卡可用空间。
+- HTTP 服务：`http://192.168.1.50:8080/`；健康检查为
+  `http://192.168.1.50:8080/healthz`，状态接口为
+  `http://192.168.1.50:8080/api/status`。
+- 串口实时日志优先输出到 `/dev/console`；console 不可用时回退到
+  `/var/log/ipcam.log`。可用 `IPCAM_LOG_FILE` 覆盖日志位置。
+
+### Ubuntu 构建与部署约定
+
+- 项目目录：`/home/acomon/project/ipcam`。
+- 交叉编译器前缀：`arm-linux-gnueabihf-`；完整版本依赖项目内
+  `thirdparts/libjpeg-turbo/install`，无 `libturbojpeg` 时使用
+  `make ipcam-display-only` 验证 LCD/采集链路。
+- LVGL 依赖目录：`thirdparts/lvgl/src`，固定使用 LVGL `v9.5.0`；配置文件为项目根目录
+  的 `lv_conf.h`。
+- ARM 完整程序部署到 NFS rootfs 的目标：
+  `/home/acomon/linux/nfs/rootfs/usr/bin/ipcam`
+- 启动脚本部署到 NFS rootfs 的目标：
+  `/home/acomon/linux/nfs/rootfs/etc/init.d/S90ipcam`
+- 修改后常用部署命令（Ubuntu 执行）：
+
+  ```sh
+  cd /home/acomon/project/ipcam
+  make -B
+  install -m 755 ipcam /home/acomon/linux/nfs/rootfs/usr/bin/ipcam
+  install -m 755 scripts/rootfs/etc/init.d/S90ipcam \
+      /home/acomon/linux/nfs/rootfs/etc/init.d/S90ipcam
+  sync
+  ```
+
+- 板端加载新程序：`/etc/init.d/S90ipcam restart`；也可以重新执行
+  `run mybootnet`，因为板端会重新挂载同一个 NFS rootfs。
+- 可覆盖的板级环境变量包括 `IPCAM_VIDEO_DEV`、`IPCAM_FB_DEV`、`IPCAM_TOUCH_DEV`、
+  `IPCAM_STORAGE_ROOT`、`IPCAM_LOG_FILE`、`IPCAM_4G_AT_DEV` 和 `IPCAM_4G_PPP_PEER`；
+  覆盖后应在启动日志中确认最终生效值。
+
 ## 分层约束（必须遵守）
 
 ```

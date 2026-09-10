@@ -46,7 +46,11 @@
 #define LV_USE_FLEX   1
 #define LV_USE_GRID   1
 
-/* Smoke UI 使用内置 ASCII 字体；中文字库由后续板级资源单独注入。 */
+/*
+ * Montserrat 只作为 LVGL 默认回退字体和 LV_SYMBOL_* 图标字体；页面正文使用
+ * src/ui/ipcam_ui_font_cjk_*.c 中按当前文案裁剪的 CJK 字库，并由
+ * src/services/ipcam_lvgl.c 在创建 UI 时注入，避免把完整中文字库塞进默认配置。
+ */
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_DEFAULT &lv_font_montserrat_14
 #define LV_TXT_ENC LV_TXT_ENC_UTF8

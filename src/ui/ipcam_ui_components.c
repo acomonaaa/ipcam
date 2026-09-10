@@ -1,3 +1,6 @@
+/* 组件分配失败必须能在板端日志中指出控件类别和坐标，便于区分页面逻辑与内存问题。 */
+#define IPCAM_LOG_MODULE "UI  "
+#include "ipcam_log.h"
 #include "ipcam_ui_components.h"
 
 #include <string.h>
@@ -5,14 +8,19 @@
 #define IPCAM_UI_TEXT_PRIMARY   0xffffffU
 #define IPCAM_UI_TEXT_SECONDARY 0xbdb8c0U
 #define IPCAM_UI_ACCENT         0xc2ef4eU
+#define IPCAM_UI_SURFACE        0x150f23U
+#define IPCAM_UI_PRESSED        0x3f3849U
 #define IPCAM_UI_INK            0x101418U
 
-/* 给新屏幕创建固定画布根对象；固定坐标来自 approved .pen 的 1024×600 页面。 */
+/* 给新屏幕创建固定画布根对象；坐标严格对应最新 .pen 的 800×480 页面。 */
 lv_obj_t *ipcam_ui_make_root(ipcam_ui_t *ui, int black_background)
 {
     if (!ui) return NULL;
     lv_obj_t *root = lv_obj_create(NULL);
-    if (!root) return NULL;
+    if (!root) {
+        MLOGE("create UI root failed: black=%d\n", black_background);
+        return NULL;
+    }
     lv_obj_set_size(root, IPCAM_UI_SCREEN_WIDTH, IPCAM_UI_SCREEN_HEIGHT);
     lv_obj_set_pos(root, 0, 0);
     lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
@@ -28,7 +36,11 @@ lv_obj_t *ipcam_ui_make_panel(ipcam_ui_t *ui, lv_obj_t *parent,
 {
     if (!ui || !parent || width <= 0 || height <= 0) return NULL;
     lv_obj_t *panel = lv_obj_create(parent);
-    if (!panel) return NULL;
+    if (!panel) {
+        MLOGE("create UI panel failed: pos=%d,%d size=%dx%d\n",
+              x, y, width, height);
+        return NULL;
+    }
     lv_obj_set_pos(panel, x, y);
     lv_obj_set_size(panel, width, height);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
@@ -45,7 +57,11 @@ lv_obj_t *ipcam_ui_make_label(ipcam_ui_t *ui, lv_obj_t *parent,
 {
     if (!ui || !parent || width <= 0 || height <= 0) return NULL;
     lv_obj_t *label = lv_label_create(parent);
-    if (!label) return NULL;
+    if (!label) {
+        MLOGE("create UI label failed: pos=%d,%d size=%dx%d text=%s\n",
+              x, y, width, height, text ? text : "<null>");
+        return NULL;
+    }
     lv_obj_set_pos(label, x, y);
     lv_obj_set_size(label, width, height);
     lv_label_set_text(label, text ? text : "");
@@ -81,7 +97,11 @@ lv_obj_t *ipcam_ui_make_button(ipcam_ui_t *ui, lv_obj_t *parent,
 {
     if (!ui || !parent || width <= 0 || height <= 0) return NULL;
     lv_obj_t *button = lv_button_create(parent);
-    if (!button) return NULL;
+    if (!button) {
+        MLOGE("create UI button failed: pos=%d,%d size=%dx%d\n",
+              x, y, width, height);
+        return NULL;
+    }
     lv_obj_set_pos(button, x, y);
     lv_obj_set_size(button, width, height);
     lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
@@ -89,24 +109,30 @@ lv_obj_t *ipcam_ui_make_button(ipcam_ui_t *ui, lv_obj_t *parent,
     if (normal) lv_obj_add_style(button, normal, 0);
     if (pressed) lv_obj_add_style(button, pressed, LV_STATE_PRESSED);
     if (action && ipcam_ui_bind_action(ui, button, LV_EVENT_CLICKED, action) != 0) {
+        MLOGE("bind UI button action failed: pos=%d,%d\n", x, y);
         lv_obj_del(button);
         return NULL;
     }
 
     lv_obj_t *icon_obj = NULL;
     lv_obj_t *label_obj = NULL;
+    /* 深色 surface 上用白色内容，荧光按钮上用深色内容，保持文字对比度。 */
+    int dark_content = normal == &ui->styles.accent_button ||
+                       normal == &ui->styles.danger_button;
+    lv_color_t content_color = lv_color_hex(dark_content ? IPCAM_UI_INK :
+                                            IPCAM_UI_TEXT_PRIMARY);
     if (icon && *icon) {
         icon_obj = ipcam_ui_make_icon(ui, button, icon, 12, 0, 32, height,
-                                      lv_color_hex(IPCAM_UI_INK), 0);
+                                      content_color, 0);
         label_obj = ipcam_ui_make_label(ui, button, text, 48, 0,
                                        width - 56, height,
                                        ipcam_ui_font_body(ui),
-                                       lv_color_hex(IPCAM_UI_INK),
+                                       content_color,
                                        LV_TEXT_ALIGN_LEFT, 0);
     } else {
         label_obj = ipcam_ui_make_label(ui, button, text, 0, 0, width, height,
                                        ipcam_ui_font_body(ui),
-                                       lv_color_hex(IPCAM_UI_TEXT_PRIMARY),
+                                       content_color,
                                        LV_TEXT_ALIGN_CENTER, 0);
     }
     if (!label_obj || (icon && *icon && !icon_obj)) {
@@ -128,6 +154,9 @@ lv_obj_t *ipcam_ui_make_action_panel(ipcam_ui_t *ui, lv_obj_t *parent,
     if (!ui || !parent) return NULL;
     lv_obj_t *panel = ipcam_ui_make_panel(ui, parent, x, y, width, height, normal);
     if (!panel) return NULL;
+    /* lv_obj_create 的默认 flag 可能随 LVGL 配置变化；显式设置才能保证
+     * 卡片、单选行和二态开关在不同主题/版本下都能成为触控命中目标。 */
+    lv_obj_add_flag(panel, LV_OBJ_FLAG_CLICKABLE);
     if (pressed) lv_obj_add_style(panel, pressed, LV_STATE_PRESSED);
     if (action && ipcam_ui_bind_action(ui, panel, LV_EVENT_CLICKED, action) != 0) {
         lv_obj_del(panel);
@@ -169,19 +198,22 @@ lv_obj_t *ipcam_ui_make_top_bar(ipcam_ui_t *ui, lv_obj_t *root,
 {
     if (!ui || !root) return NULL;
     lv_obj_t *bar = ipcam_ui_make_panel(ui, root, 0, 0,
-                                       IPCAM_UI_SCREEN_WIDTH, 56,
+                                       IPCAM_UI_SCREEN_WIDTH, 48,
                                        &ui->styles.surface);
     if (!bar) return NULL;
     ipcam_ui_action_t back = { .type = IPCAM_UI_ACTION_BACK };
     lv_obj_t *icon = NULL;
-    if (!ipcam_ui_make_button(ui, bar, 8, 4, 48, 48,
+    if (!ipcam_ui_make_button(ui, bar, 4, 0, 48, 48,
                               &ui->styles.surface, &ui->styles.pressed,
                               LV_SYMBOL_LEFT, NULL, &back, &icon, NULL))
         return NULL;
-    ipcam_ui_make_label(ui, bar, title, 64, 0, 700, 56,
-                        ipcam_ui_font_title(ui),
-                        lv_color_hex(IPCAM_UI_TEXT_PRIMARY),
-                        LV_TEXT_ALIGN_LEFT, 0);
+    /* 顶部标题也是页面创建链的一部分；显式检查可避免标题分配失败后
+     * 仍把半成品页面交给导航层，最终表现为点击设置页没有任何响应。 */
+    if (!ipcam_ui_make_label(ui, bar, title, 56, 0, 700, 48,
+                             ipcam_ui_font_title(ui),
+                             lv_color_hex(IPCAM_UI_TEXT_PRIMARY),
+                             LV_TEXT_ALIGN_LEFT, 0))
+        return NULL;
     return bar;
 }
 
@@ -189,7 +221,8 @@ lv_obj_t *ipcam_ui_make_top_bar(ipcam_ui_t *ui, lv_obj_t *root,
 int ipcam_ui_make_radio_row(ipcam_ui_t *ui, lv_obj_t *parent,
                             int x, int y, int width, int height,
                             const char *text, const ipcam_ui_action_t *action,
-                            lv_obj_t **row_out, lv_obj_t **dot_out)
+                            lv_obj_t **row_out, lv_obj_t **dot_out,
+                            lv_obj_t **label_out)
 {
     if (!ui || !parent || !row_out || !dot_out) return -1;
     lv_obj_t *row = ipcam_ui_make_action_panel(ui, parent, x, y, width, height,
@@ -203,16 +236,37 @@ int ipcam_ui_make_radio_row(ipcam_ui_t *ui, lv_obj_t *parent,
         return -1;
     }
     lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-    if (!ipcam_ui_make_label(ui, row, text, 48, 0, width - 64, height,
-                             ipcam_ui_font_body(ui),
-                             lv_color_hex(IPCAM_UI_TEXT_SECONDARY),
-                             LV_TEXT_ALIGN_LEFT, 0)) {
+    lv_obj_t *label = ipcam_ui_make_label(ui, row, text, 48, 0, width - 64, height,
+                                          ipcam_ui_font_body(ui),
+                                          lv_color_hex(IPCAM_UI_TEXT_SECONDARY),
+                                          LV_TEXT_ALIGN_LEFT, 0);
+    if (!label) {
         lv_obj_del(row);
         return -1;
     }
     *row_out = row;
     *dot_out = dot;
+    if (label_out) *label_out = label;
     return 0;
+}
+
+/* 单选行的背景、圆点和文字必须同步切换，避免只改变颜色却留下旧状态。 */
+void ipcam_ui_set_radio_selected(lv_obj_t *row, lv_obj_t *dot,
+                                 lv_obj_t *label, int selected)
+{
+    if (row) {
+        lv_obj_set_style_bg_color(row, lv_color_hex(selected ? IPCAM_UI_PRESSED :
+                                                     IPCAM_UI_SURFACE), 0);
+    }
+    if (dot) {
+        lv_obj_set_style_bg_color(dot, lv_color_hex(selected ? IPCAM_UI_ACCENT :
+                                                     IPCAM_UI_SURFACE), 0);
+    }
+    if (label) {
+        lv_obj_set_style_text_color(label,
+                                    lv_color_hex(selected ? IPCAM_UI_TEXT_PRIMARY :
+                                                 IPCAM_UI_TEXT_SECONDARY), 0);
+    }
 }
 
 /* 创建低开销二态开关；使用普通对象而不是复杂主题，确保软件渲染可控。 */

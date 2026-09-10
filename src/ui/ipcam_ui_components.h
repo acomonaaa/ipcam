@@ -38,7 +38,8 @@ lv_obj_t *ipcam_ui_make_top_bar(ipcam_ui_t *ui, lv_obj_t *root,
 int ipcam_ui_make_radio_row(ipcam_ui_t *ui, lv_obj_t *parent,
                             int x, int y, int width, int height,
                             const char *text, const ipcam_ui_action_t *action,
-                            lv_obj_t **row_out, lv_obj_t **dot_out);
+                            lv_obj_t **row_out, lv_obj_t **dot_out,
+                            lv_obj_t **label_out);
 lv_obj_t *ipcam_ui_make_toggle(ipcam_ui_t *ui, lv_obj_t *parent,
                                int x, int y, int width, int height,
                                const ipcam_ui_action_t *action,

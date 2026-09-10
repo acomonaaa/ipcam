@@ -64,7 +64,13 @@ typedef struct ipcam_control_status_s {
     int network_link;
     char network_ip[64];
     uint8_t storage_mounted;
+    uint64_t storage_total_bytes;
+    uint64_t storage_used_bytes;
     uint64_t storage_available_bytes;
+    uint8_t storage_format_supported;
+    char storage_mount_path[256];
+    char storage_device[256];
+    char storage_fs_type[32];
     uint32_t capture_fps; /* 驱动报告的采集帧率；0 表示驱动未返回有效值 */
     uint32_t output_fps;  /* 依据目标/软件选帧推导的输出上限，实测值见 metrics 日志 */
     uint64_t jpeg_live_dropped;
@@ -85,7 +91,8 @@ typedef enum ipcam_control_command_type_e {
     IPCAM_CONTROL_SET_SCREEN_TIMEOUT,
     IPCAM_CONTROL_RECORD_START,
     IPCAM_CONTROL_RECORD_STOP,
-    IPCAM_CONTROL_PHOTO
+    IPCAM_CONTROL_PHOTO,
+    IPCAM_CONTROL_FORMAT_STORAGE
 } ipcam_control_command_type_t;
 
 typedef struct ipcam_control_command_s {

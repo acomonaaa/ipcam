@@ -81,6 +81,20 @@ int ipcam_display_set_backlight_percent(int percent)
     return -1;
 }
 
+/* 流程测试不连接真实 framebuffer；补齐新的上下文背光接口，保持测试只验证 HTTP 生命周期。 */
+int ipcam_display_backlight_available(ipcam_display_ctx_t *ctx)
+{
+    (void)ctx;
+    return 0;
+}
+
+int ipcam_display_set_backlight(ipcam_display_ctx_t *ctx, int percent)
+{
+    (void)ctx;
+    (void)percent;
+    return -1;
+}
+
 void ipcam_display_get_view(ipcam_display_ctx_t *ctx, int *enabled,
                             float *zoom, float *center_x, float *center_y)
 {
