@@ -18,10 +18,28 @@
 
 #include "ipcam_control.h"
 #include "ipcam_display.h"
+#include "ipcam_perf.h"
 #include "ipcam_touch.h"
 #include "ipcam_ui.h"
 
 #define IPCAM_LVGL_ACTION_QUEUE_DEPTH 32
+
+typedef struct ipcam_lvgl_perf_s {
+    uint64_t handler_avg_ns;
+    uint64_t handler_p95_ns;
+    uint64_t handler_max_ns;
+    uint64_t video_avg_ns;
+    uint64_t video_p95_ns;
+    uint64_t video_max_ns;
+    uint64_t sleep_avg_ns;
+    uint64_t sleep_p95_ns;
+    uint64_t sleep_max_ns;
+    uint64_t handler_count;
+    uint64_t video_frames;
+    uint64_t sleep_redraws;
+    int sleep_fast_path;
+    int sleep_fast_active;
+} ipcam_lvgl_perf_t;
 
 typedef struct ipcam_lvgl_ctx_s {
     ipcam_display_ctx_t *display;
@@ -39,6 +57,18 @@ typedef struct ipcam_lvgl_ctx_s {
     size_t video_buf_size;
     lv_image_dsc_t video_dsc;
     ipcam_ui_t *ui;
+
+    /* 休眠提示的固定合成缓冲；边沿时生成 backdrop，视频帧只更新同矩形图层。 */
+    uint16_t *sleep_bg_buf;
+    size_t sleep_bg_size;
+    uint16_t *sleep_video_buf;
+    size_t sleep_video_size;
+    uint16_t *sleep_lut;
+    lv_image_dsc_t sleep_bg_dsc;
+    lv_image_dsc_t sleep_video_dsc;
+    int sleep_fast_path;
+    int sleep_fast_active;
+    uint64_t sleep_prompt_redraws;
 
     uint64_t last_rendered;
     uint64_t last_fps_frames;
@@ -70,6 +100,13 @@ typedef struct ipcam_lvgl_ctx_s {
     pthread_mutex_t service_mtx;
     ipcam_control_ctx_t *control;
 
+    pthread_mutex_t stats_mtx; /* 保护 handler/video/sleep 固定窗口 */
+    ipcam_perf_window_t handler_window;
+    ipcam_perf_window_t video_window;
+    ipcam_perf_window_t sleep_window;
+    uint64_t handler_count;
+    uint64_t video_frames;
+
     /* 主线程不能直接调用 LVGL；动作结果先放入反馈槽，由 LVGL 线程在
      * 下一次状态刷新时显示。格式化期间单独保留忙状态，防止重复提交。 */
     pthread_mutex_t feedback_mtx;
@@ -91,6 +128,9 @@ void ipcam_lvgl_process_actions(ipcam_lvgl_ctx_t *ctx);
 /* 接收 ipcam_touch 在 SYN_REPORT 时产生的像素坐标触点快照。 */
 void ipcam_lvgl_touch_report(ipcam_lvgl_ctx_t *ctx,
                              const ipcam_touch_point_t *points, int count);
+
+/* 复制 LVGL 渲染统计；不触碰 UI 对象、网络或存储状态。 */
+void ipcam_lvgl_get_perf(ipcam_lvgl_ctx_t *ctx, ipcam_lvgl_perf_t *out);
 
 /* 停止 LVGL 主循环并释放其对象；调用时触摸服务必须已经停止。 */
 void ipcam_lvgl_stop(ipcam_lvgl_ctx_t *ctx);

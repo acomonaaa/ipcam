@@ -5,7 +5,9 @@
 #include <pthread.h>    /* pthread_t */
 #include <stddef.h>     /* size_t */
 #include <stdint.h>
+#include <linux/fb.h>
 #include "ipcam_ringbuffer.h"
+#include "ipcam_perf.h"
 
 /*
  * LCD 显示线程：从环形缓冲读 YUYV 帧，转换为 RGB565，写入 /dev/fb0 mmap。
@@ -13,6 +15,24 @@
  *
  * 当前仅支持 RGB565 16bpp framebuffer；其他 bpp 在启动时返回 -1。
  */
+typedef struct ipcam_display_perf_s {
+    uint64_t frames_rendered;
+    uint64_t stale_input_frames;
+    uint64_t convert_avg_ns;
+    uint64_t convert_p95_ns;
+    uint64_t convert_max_ns;
+    uint64_t pan_count;
+    uint64_t pan_failures;
+    uint64_t pan_avg_ns;
+    uint64_t pan_p95_ns;
+    uint64_t pan_max_ns;
+    int framebuffer_pan_enabled;
+    int framebuffer_selftest_passed;
+    int framebuffer_fault;
+    int framebuffer_active_page;
+    char framebuffer_mode[24];
+} ipcam_display_perf_t;
+
 typedef struct ipcam_display_ctx_s {
     int      fb_fd;
     int      fb_w;
@@ -27,7 +47,17 @@ typedef struct ipcam_display_ctx_s {
     size_t   fb_page_size;      /* 单个可见页的字节数，用于双缓冲切页 */
     int      fb_pan_enabled;    /* 1 表示驱动接受双页 FBIOPAN_DISPLAY */
     int      fb_active_page;    /* 最近一次提交给 LCD 的虚拟页 */
+    int      fb_selftest_passed;
+    int      fb_fault;
+    uint64_t fb_pan_count;
+    unsigned int fb_pan_failures;
+    int      fb_pending_page;
+    uint64_t fb_last_retry_ns;
+    char     fb_mode[24];       /* double-buffer / partial-degraded */
+    struct fb_var_screeninfo fb_var_template;
+    int      fb_var_template_valid;
     pthread_mutex_t fb_mtx;     /* 串行化 VSYNC 切页、blank 和兼容拷贝 */
+    int      dynamic_video_enabled; /* 仅双页自检成功后允许本地动态视频 */
 
     /* 目标显示尺寸（一般是 LCD 全屏） */
     int      out_w;
@@ -47,6 +77,7 @@ typedef struct ipcam_display_ctx_s {
     uint64_t       frames_rendered;
     volatile sig_atomic_t framebuffer_writer_enabled;
     unsigned short  *preview_base;
+    unsigned short  *preview_work;
     size_t           preview_size;       /* 当前目标尺寸的有效字节数 */
     size_t           preview_capacity;   /* preview_base 实际分配容量 */
     ipcam_frame_t    preview_frame;
@@ -55,6 +86,23 @@ typedef struct ipcam_display_ctx_s {
     int              preview_h;
     int              preview_stride_pixels;
     uint64_t         preview_target_generation;
+    uint32_t         *map_x_pair_offset;
+    uint8_t          *map_x_luma_offset;
+    int              *map_y_source;
+    int              map_valid;
+    int              map_dw;
+    int              map_dh;
+    int              map_sw;
+    int              map_sh;
+    int              map_crop_x;
+    int              map_crop_y;
+    int              map_crop_w;
+    int              map_crop_h;
+    int              map_mirror_h;
+    int              map_mirror_v;
+    ipcam_perf_window_t convert_window;
+    ipcam_perf_window_t pan_window;
+    uint64_t         stale_input_frames;
     int              view_enabled;
     int              screen_paused;
     float            zoom;
@@ -93,6 +141,8 @@ void ipcam_display_get_view(ipcam_display_ctx_t *ctx, int *enabled,
                             float *zoom, float *center_x, float *center_y);
 /* 读取本地预览已渲染帧累计值，供 5 秒性能汇总计算实际帧率。 */
 void ipcam_display_get_stats(ipcam_display_ctx_t *ctx, uint64_t *rendered);
+/* 返回固定容量性能快照；不访问网络、存储或 framebuffer ioctl。 */
+void ipcam_display_get_perf(ipcam_display_ctx_t *ctx, ipcam_display_perf_t *out);
 /* 复制最新 RGB565 预览帧；调用方提供 out_data，成功后无需释放 ring 槽。 */
 int ipcam_display_preview_acquire(ipcam_display_ctx_t *ctx,
                                   void *out_data, size_t out_cap,
@@ -110,6 +160,13 @@ int ipcam_display_set_backlight_percent(int percent);
 void *ipcam_display_framebuffer_page(ipcam_display_ctx_t *ctx, int page);
 /* 只在最后一个 LVGL flush 区域调用，驱动负责在下一次 VSYNC 切换页面。 */
 int ipcam_display_present_page(ipcam_display_ctx_t *ctx, int page);
+/* pan 失败后最多每秒重试一次；成功会清除 fault，失败不做可见页 memcpy。 */
+int ipcam_display_retry_pan(ipcam_display_ctx_t *ctx);
+/* 查询 pan 故障；LVGL 故障期间暂停提交新绘制，避免写入当前扫描页。 */
+int ipcam_display_pan_fault(ipcam_display_ctx_t *ctx);
+/* 复制当前硬件可见页，熄屏提示只在状态边沿调用一次。 */
+int ipcam_display_snapshot_visible(ipcam_display_ctx_t *ctx,
+                                    void *out_data, size_t out_cap);
 /* framebuffer 不支持切页时的兼容路径：把完整页拷贝到当前可见窗口。 */
 int ipcam_display_copy_page_to_visible(ipcam_display_ctx_t *ctx, int page);
 /* 单缓冲兼容模式的局部写屏，内部处理 line_length 与 framebuffer offset。 */

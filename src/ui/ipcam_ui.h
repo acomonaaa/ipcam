@@ -121,6 +121,14 @@ typedef struct ipcam_ui_video_viewport_s {
     uint16_t height;
 } ipcam_ui_video_viewport_t;
 
+typedef struct ipcam_ui_video_rect_s {
+    uint8_t active;
+    int16_t x;
+    int16_t y;
+    uint16_t width;
+    uint16_t height;
+} ipcam_ui_video_rect_t;
+
 typedef struct ipcam_ui_state_s {
     uint8_t camera_ready;
     uint8_t display_ready;
@@ -195,6 +203,8 @@ int ipcam_ui_process_navigation(ipcam_ui_t *ui);
 /* 读取 P01/P02/P03 的固定视频窗口尺寸，只能在 LVGL 所属线程调用。 */
 int ipcam_ui_get_video_viewport(const ipcam_ui_t *ui,
                                 ipcam_ui_video_viewport_t *viewport);
+/* 读取当前页面视频矩形；休眠快速路径用它精确覆盖原视频窗口。 */
+int ipcam_ui_get_video_rect(const ipcam_ui_t *ui, ipcam_ui_video_rect_t *rect);
 
 /* 只在 LVGL 所属线程调用；状态复制后刷新所有已创建页面，便于后续切页。 */
 int ipcam_ui_update(ipcam_ui_t *ui, const ipcam_ui_state_t *state);
@@ -202,5 +212,14 @@ int ipcam_ui_update(ipcam_ui_t *ui, const ipcam_ui_state_t *state);
 /* 将 LVGL port 的 RGB565 帧绑定到 P01/P03 的视频窗口；不复制帧数据。 */
 void ipcam_ui_set_video_source(ipcam_ui_t *ui, const lv_image_dsc_t *source,
                                int valid);
+/* 内容地址不变时只使当前视频矩形失效，不重新绑定 LVGL image source。 */
+void ipcam_ui_invalidate_video(ipcam_ui_t *ui);
+
+/* 休眠快速路径使用一次性 RGB565 backdrop 和同矩形预暗视频层。 */
+int ipcam_ui_sleep_fast_configure(ipcam_ui_t *ui, int ready);
+void ipcam_ui_sleep_fast_set(ipcam_ui_t *ui, int active,
+                             const lv_image_dsc_t *backdrop,
+                             const lv_image_dsc_t *video);
+void ipcam_ui_sleep_fast_invalidate_video(ipcam_ui_t *ui);
 
 #endif /* IPCAM_UI_H */

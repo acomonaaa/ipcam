@@ -19,6 +19,12 @@
 #define IPCAM_CAPTURE_HEIGHT   480
 #endif
 
+/* V4L2 bytesperline 可能按 DMA 对齐扩大；预留行尾 padding，启动时仍会
+ * 用驱动实际 sizeimage 再校验，不能让带 padding 的合法帧静默掉帧。 */
+#ifndef IPCAM_CAPTURE_RING_EXTRA_BYTES
+#define IPCAM_CAPTURE_RING_EXTRA_BYTES (64U * 1024U)
+#endif
+
 /* LCD 显示分辨率（fb0 由内核报告；当前设计和板级默认值为 800×480） */
 #ifndef IPCAM_LCD_WIDTH
 #define IPCAM_LCD_WIDTH        800
@@ -45,6 +51,11 @@
 /* 环形缓冲帧数（采集侧最多缓存 N 帧，超过则丢弃最旧） */
 #ifndef IPCAM_RING_DEPTH
 #define IPCAM_RING_DEPTH       4
+#endif
+
+/* 显示只保留最新两帧；更深队列会把 LCD 延迟变成 FIFO 累积而非平滑。 */
+#ifndef IPCAM_DISPLAY_RING_DEPTH
+#define IPCAM_DISPLAY_RING_DEPTH 2
 #endif
 
 /* 录像消费者使用独立队列，避免慢盘反压采集和 HTTP 直播。 */

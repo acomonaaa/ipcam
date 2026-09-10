@@ -156,6 +156,8 @@ struct ipcam_ui_s {
 
     /* 全局顶层休眠提示覆盖当前页面，避免每个 P01～P08 重复创建一套弹窗。 */
     lv_obj_t *sleep_overlay;
+    lv_obj_t *sleep_backdrop;
+    lv_obj_t *sleep_video_image;
     lv_obj_t *sleep_card;
     lv_obj_t *sleep_countdown;
     lv_obj_t *sleep_keep_button;
@@ -175,6 +177,15 @@ struct ipcam_ui_s {
 
     ipcam_ui_action_binding_t bindings[IPCAM_UI_MAX_ACTION_BINDINGS];
     size_t binding_count;
+
+    /* descriptor 地址长期不变；只有首次绑定/状态边沿才调用 set_src，后续
+     * 预览帧通过 invalidate 通知重绘，避免 LVGL 每帧重复重建 image 缓存。 */
+    const lv_image_dsc_t *video_source;
+    int video_source_valid;
+    const lv_image_dsc_t *sleep_backdrop_source;
+    const lv_image_dsc_t *sleep_video_source;
+    int sleep_fast_ready;
+    int sleep_fast_active;
 };
 
 /* 组件工厂在绑定事件时使用，返回 0 表示绑定成功。 */

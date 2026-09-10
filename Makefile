@@ -18,6 +18,9 @@ PREFIX   ?= $(ROOT)/output
 LVGL_DIR  ?= $(ROOT)/thirdparts/lvgl/src
 BUILD_DIR ?= $(ROOT)/build
 LVGL_BUILD_DIR := $(BUILD_DIR)/lvgl
+# 将源码 revision 编进每个可执行文件；dirty 标记能区分“未提交工作区构建的
+# 测试二进制”和同一 HEAD 上的旧部署，避免现场日志/API 误导版本判断。
+GIT_REVISION ?= $(shell git describe --always --dirty --match=NONE 2>/dev/null || echo unknown)
 
 CROSS_COMPILE ?= arm-linux-gnueabihf-
 CC            = $(CROSS_COMPILE)gcc
@@ -49,7 +52,8 @@ INCLUDES := -I$(ROOT)/config \
 
 # 32 位 ARM 仍需支持接近 3 GiB 的 AVI 段，启用 glibc 大文件接口。
 CFLAGS  := $(OPT) $(WARN) -std=gnu99 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 \
-           -DLV_CONF_INCLUDE_SIMPLE -pthread $(TJ_CFLAGS) $(INCLUDES)
+           -DLV_CONF_INCLUDE_SIMPLE -DIPCAM_GIT_REVISION=\"$(GIT_REVISION)\" \
+           -pthread $(TJ_CFLAGS) $(INCLUDES)
 # 触摸双指距离计算使用 libm；display-only 也要保持同一手势实现可链接。
 LDFLAGS := -pthread $(TJ_LDFLAGS) -lm
 
@@ -113,7 +117,8 @@ endif
 
 # ipcam-display-only：保留 stub 编码器，不需要 libjpeg-turbo
 ipcam-display-only: CFLAGS := $(OPT) $(WARN) -std=gnu99 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 \
-                              -DLV_CONF_INCLUDE_SIMPLE -pthread $(INCLUDES)
+                              -DLV_CONF_INCLUDE_SIMPLE -DIPCAM_GIT_REVISION=\"$(GIT_REVISION)\" \
+                              -pthread $(INCLUDES)
 ipcam-display-only: LDFLAGS := -pthread -lm
 ipcam-display-only: $(BIN)
 
@@ -134,13 +139,15 @@ TEST_FRAME_BIN := $(TEST_BUILD_DIR)/test_ipcam_frame_diag
 TEST_STREAM_BIN := $(TEST_BUILD_DIR)/test_ipcam_stream_lifecycle
 TEST_SCREEN_BIN := $(TEST_BUILD_DIR)/test_ipcam_screen
 TEST_STORAGE_BIN := $(TEST_BUILD_DIR)/test_ipcam_storage
+TEST_PIPELINE_CORE_BIN := $(TEST_BUILD_DIR)/test_ipcam_pipeline_core
 
-test-host: $(TEST_SCALE_BIN) $(TEST_FRAME_BIN) $(TEST_STREAM_BIN) $(TEST_SCREEN_BIN) $(TEST_STORAGE_BIN)
+test-host: $(TEST_SCALE_BIN) $(TEST_FRAME_BIN) $(TEST_STREAM_BIN) $(TEST_SCREEN_BIN) $(TEST_STORAGE_BIN) $(TEST_PIPELINE_CORE_BIN)
 	@$(TEST_SCALE_BIN)
 	@$(TEST_FRAME_BIN)
 	@$(TEST_STREAM_BIN)
 	@$(TEST_SCREEN_BIN)
 	@$(TEST_STORAGE_BIN)
+	@$(TEST_PIPELINE_CORE_BIN)
 
 $(TEST_BUILD_DIR):
 	mkdir -p $@
@@ -153,13 +160,20 @@ $(TEST_FRAME_BIN): tests/test_ipcam_frame_diag.c src/core/ipcam_frame_diag.c \
 	$(HOST_CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
 
 $(TEST_STREAM_BIN): tests/test_ipcam_stream_lifecycle.c tests/test_ipcam_stream_stubs.c \
-                    src/services/ipcam_stream.c src/core/ipcam_ringbuffer.c | $(TEST_BUILD_DIR)
+                    src/services/ipcam_stream.c src/core/ipcam_ringbuffer.c \
+                    src/core/ipcam_perf.c | $(TEST_BUILD_DIR)
 	$(HOST_CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
 
 $(TEST_SCREEN_BIN): tests/test_ipcam_screen.c src/services/ipcam_screen.c | $(TEST_BUILD_DIR)
 	$(HOST_CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
 
 $(TEST_STORAGE_BIN): tests/test_ipcam_storage.c src/services/ipcam_storage.c | $(TEST_BUILD_DIR)
+	$(HOST_CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
+
+$(TEST_PIPELINE_CORE_BIN): tests/test_ipcam_pipeline_core.c \
+                           src/core/ipcam_perf.c src/core/ipcam_quality.c \
+                           src/core/ipcam_ringbuffer.c src/core/ipcam_yuyv.c | $(TEST_BUILD_DIR)
+	# 这些纯逻辑测试不依赖 LVGL、V4L2 或板端设备，先在主机锁住并发时序和镜像边界。
 	$(HOST_CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
 
 install: $(BIN)

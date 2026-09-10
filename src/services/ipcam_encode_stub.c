@@ -63,3 +63,17 @@ void ipcam_encode_get_stats(ipcam_encode_ctx_t *ctx, uint64_t *encoded,
     if (dropped) *dropped = ctx->frames_dropped;
     pthread_mutex_unlock(&ctx->stats_mtx);
 }
+
+/* display-only 没有编码样本，返回配置质量和零性能值以保持状态接口结构稳定。 */
+void ipcam_encode_get_perf(ipcam_encode_ctx_t *ctx, ipcam_encode_perf_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->stats_mtx);
+    *out = ctx->last_window_perf;
+    out->configured_quality = 0;
+    out->effective_quality = 0;
+    out->adaptive_quality = 0;
+    pthread_mutex_unlock(&ctx->stats_mtx);
+}

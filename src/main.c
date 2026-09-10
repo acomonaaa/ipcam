@@ -215,6 +215,12 @@ static uint64_t read_rss_bytes(void)
     return page > 0 ? (uint64_t)resident * (uint64_t)page : 0;
 }
 
+/* 累计计数器只增不减；若服务重启导致回绕/清零，窗口仍按当前值重新计数。 */
+static uint64_t metrics_delta(uint64_t current, uint64_t previous)
+{
+    return current >= previous ? current - previous : current;
+}
+
 /* 按依赖反向停止各服务；先让网络客户端退出，再释放其引用的 ring 和控制器。 */
 static void cleanup_all(subsys_t *s)
 {
@@ -323,8 +329,9 @@ static int run_daemon(void)
 
     uint16_t cap_w_cfg = ipcam_param_get_capture_w();
     uint16_t cap_h_cfg = ipcam_param_get_capture_h();
-    size_t yuyv_bytes = (size_t)cap_w_cfg * cap_h_cfg * 2;
-    s.rb_yuyv_disp = ipcam_ring_create(IPCAM_RING_DEPTH, yuyv_bytes);
+    size_t yuyv_bytes = (size_t)cap_w_cfg * cap_h_cfg * 2U +
+                        IPCAM_CAPTURE_RING_EXTRA_BYTES;
+    s.rb_yuyv_disp = ipcam_ring_create(IPCAM_DISPLAY_RING_DEPTH, yuyv_bytes);
     s.rb_yuyv_enc  = ipcam_ring_create(IPCAM_RING_DEPTH, yuyv_bytes);
     if (!s.rb_yuyv_disp || !s.rb_yuyv_enc) {
         MLOGE("alloc yuyv ring buffer(s) failed\n");
@@ -332,7 +339,7 @@ static int run_daemon(void)
         return 1;
     }
     MLOGI("YUYV rings ready: depth=%d slot=%zu/%zu\n",
-          IPCAM_RING_DEPTH, ipcam_ring_capacity(s.rb_yuyv_disp),
+          IPCAM_DISPLAY_RING_DEPTH, ipcam_ring_capacity(s.rb_yuyv_disp),
           ipcam_ring_capacity(s.rb_yuyv_enc));
 
     /* JPEG 上限按原始 YUYV 尺寸估算并设最低 1 MiB，避免高质量/高分辨率
@@ -452,6 +459,11 @@ static int run_daemon(void)
     }
     s.control_started = 1;
     MLOGI("control pipeline started\n");
+    if (s.encode_started) {
+        ipcam_control_set_encoder(&s.control, &s.enc);
+        /* setter 后立即刷新一次，让首个 /api/status 同时带配置/有效质量。 */
+        ipcam_control_refresh_status(&s.control, 0);
+    }
     if (s.lvgl_started)
         ipcam_lvgl_set_control(&s.lvgl, &s.control);
 
@@ -477,16 +489,35 @@ static int run_daemon(void)
     uint64_t prev_capture_frames = 0;
     uint64_t prev_encode_frames = 0;
     uint64_t prev_display_frames = 0;
-    uint64_t prev_record_frames = 0;
+    uint64_t prev_stream_frames = 0;
+    uint64_t prev_record_real_frames = 0;
+    uint64_t prev_record_repeat_frames = 0;
     int peak_disp = 0, peak_enc = 0, peak_live = 0, peak_record = 0;
     while (g_running) {
         sleep(1);
         /* UI 回调只入队，主线程在这里串行执行硬件/文件控制命令。 */
         if (s.lvgl_started) ipcam_lvgl_process_actions(&s.lvgl);
+        if (s.control_started)
+            ipcam_control_refresh_status(&s.control, 0);
         if (++metrics_tick >= 5) {
             ipcam_record_status_t rst;
             memset(&rst, 0, sizeof(rst));
             if (s.record_started) ipcam_record_get_status(&s.rec, &rst);
+            ipcam_encode_perf_t ep;
+            ipcam_display_perf_t dp;
+            ipcam_stream_perf_t sp;
+            ipcam_record_perf_t rp;
+            ipcam_lvgl_perf_t lp;
+            memset(&ep, 0, sizeof(ep));
+            memset(&dp, 0, sizeof(dp));
+            memset(&sp, 0, sizeof(sp));
+            memset(&rp, 0, sizeof(rp));
+            memset(&lp, 0, sizeof(lp));
+            if (s.encode_started) ipcam_encode_get_perf(&s.enc, &ep);
+            if (s.display_started) ipcam_display_get_perf(&s.dis, &dp);
+            if (s.stream_started) ipcam_stream_get_perf(&s.http, &sp);
+            if (s.record_started) ipcam_record_get_perf(&s.rec, &rp);
+            if (s.lvgl_started) ipcam_lvgl_get_perf(&s.lvgl, &lp);
             int q_disp = ipcam_ring_count(s.rb_yuyv_disp);
             int q_enc = ipcam_ring_count(s.rb_yuyv_enc);
             int q_live = ipcam_ring_count(s.rb_jpeg);
@@ -498,39 +529,79 @@ static int run_daemon(void)
             uint64_t capture_frames = 0, drop_disp = 0, drop_enc = 0;
             if (s.capture_started)
                 ipcam_capture_get_stats(&s.cap, &capture_frames, &drop_disp, &drop_enc);
-            uint64_t delta = capture_frames - prev_capture_frames;
+            uint64_t capture_delta = metrics_delta(capture_frames, prev_capture_frames);
             prev_capture_frames = capture_frames;
-            uint64_t encode_frames = 0, encode_drops = 0;
-            if (s.encode_started)
-                ipcam_encode_get_stats(&s.enc, &encode_frames, &encode_drops);
-            uint64_t display_frames = 0;
-            if (s.display_started)
-                ipcam_display_get_stats(&s.dis, &display_frames);
-            uint64_t record_frames = 0, record_bytes = 0;
-            if (s.record_started)
-                ipcam_record_get_metrics(&s.rec, &record_frames, &record_bytes);
-            double encode_fps = (encode_frames - prev_encode_frames) / 5.0;
-            double display_fps = (display_frames - prev_display_frames) / 5.0;
-            double record_fps = (record_frames - prev_record_frames) / 5.0;
-            prev_encode_frames = encode_frames;
-            prev_display_frames = display_frames;
-            prev_record_frames = record_frames;
-            MLOGI("metrics capture_fps=%.1f encode_fps=%.1f preview_fps=%.1f record_fps=%.1f "
-                  "capture_frames=%llu encode_frames=%llu record_frames=%llu "
-                  "encode_drops=%llu drop_disp=%llu drop_enc=%llu "
+            uint64_t encode_delta = metrics_delta(ep.frames_encoded, prev_encode_frames);
+            uint64_t display_delta = metrics_delta(dp.frames_rendered, prev_display_frames);
+            uint64_t stream_delta = metrics_delta(sp.frames_sent, prev_stream_frames);
+            uint64_t record_real_delta = metrics_delta(rp.real_frames, prev_record_real_frames);
+            uint64_t record_repeat_delta = metrics_delta(rp.repeated_frames,
+                                                         prev_record_repeat_frames);
+            prev_encode_frames = ep.frames_encoded;
+            prev_display_frames = dp.frames_rendered;
+            prev_stream_frames = sp.frames_sent;
+            prev_record_real_frames = rp.real_frames;
+            prev_record_repeat_frames = rp.repeated_frames;
+            MLOGI("metrics capture_fps=%.1f encode_fps=%.1f preview_fps=%.1f "
+                  "stream_fps=%.1f record_real_fps=%.1f record_repeat_fps=%.1f "
+                  "capture_frames=%llu encode_frames=%llu preview_frames=%llu "
+                  "stream_frames=%llu record_real=%llu record_repeat=%llu "
+                  "stale_yuyv_display=%llu stale_yuyv_encode=%llu "
+                  "live_overwrite=%llu record_queue_drop=%llu "
+                  "drop_disp=%llu drop_enc=%llu encode_drop=%llu "
+                  "yuv420_ns=%llu/%llu/%llu jpeg_ns=%llu/%llu/%llu "
+                  "jpeg_bytes=%llu/%llu quality=%u/%u adaptive=%u "
+                  "capture_to_encode_p95_ns=%llu capture_to_send_start_p95_ns=%llu "
+                  "lvgl_handler_ns=%llu/%llu/%llu lvgl_video_ns=%llu/%llu/%llu "
+                  "lvgl_sleep_ns=%llu/%llu/%llu sleep_fast=%d/%d "
+                  "fb_mode=%s fb_page=%d pan_ns=%llu/%llu/%llu pan_fail=%llu "
                   "rss=%lluB q=%d/%d/%d/%d peak=%d/%d/%d/%d "
-                  "record_state=%d record_completed_frames=%llu repeat=%llu record_bytes=%llu\n",
-                  delta / 5.0, encode_fps, display_fps, record_fps,
+                  "record_state=%d record_frames=%llu record_bytes=%llu\n",
+                  capture_delta / 5.0, encode_delta / 5.0, display_delta / 5.0,
+                  stream_delta / 5.0, record_real_delta / 5.0,
+                  record_repeat_delta / 5.0,
                   (unsigned long long)capture_frames,
-                  (unsigned long long)encode_frames,
-                  (unsigned long long)record_frames,
-                  (unsigned long long)encode_drops,
+                  (unsigned long long)ep.frames_encoded,
+                  (unsigned long long)dp.frames_rendered,
+                  (unsigned long long)sp.frames_sent,
+                  (unsigned long long)rp.real_frames,
+                  (unsigned long long)rp.repeated_frames,
+                  (unsigned long long)dp.stale_input_frames,
+                  (unsigned long long)ep.stale_input_frames,
+                  (unsigned long long)ep.live_overwrites,
+                  (unsigned long long)ep.record_drops,
                   (unsigned long long)drop_disp, (unsigned long long)drop_enc,
+                  (unsigned long long)ep.frames_dropped,
+                  (unsigned long long)ep.yuv420_avg_ns,
+                  (unsigned long long)ep.yuv420_p95_ns,
+                  (unsigned long long)ep.yuv420_max_ns,
+                  (unsigned long long)ep.jpeg_avg_ns,
+                  (unsigned long long)ep.jpeg_p95_ns,
+                  (unsigned long long)ep.jpeg_max_ns,
+                  (unsigned long long)ep.jpeg_avg_bytes,
+                  (unsigned long long)ep.jpeg_max_bytes,
+                  ep.configured_quality, ep.effective_quality, ep.adaptive_quality,
+                  (unsigned long long)ep.capture_to_output_p95_ns,
+                  (unsigned long long)sp.capture_to_send_start_p95_ns,
+                  (unsigned long long)lp.handler_avg_ns,
+                  (unsigned long long)lp.handler_p95_ns,
+                  (unsigned long long)lp.handler_max_ns,
+                  (unsigned long long)lp.video_avg_ns,
+                  (unsigned long long)lp.video_p95_ns,
+                  (unsigned long long)lp.video_max_ns,
+                  (unsigned long long)lp.sleep_avg_ns,
+                  (unsigned long long)lp.sleep_p95_ns,
+                  (unsigned long long)lp.sleep_max_ns,
+                  lp.sleep_fast_path, lp.sleep_fast_active,
+                  dp.framebuffer_mode, dp.framebuffer_active_page,
+                  (unsigned long long)dp.pan_avg_ns,
+                  (unsigned long long)dp.pan_p95_ns,
+                  (unsigned long long)dp.pan_max_ns,
+                  (unsigned long long)dp.pan_failures,
                   (unsigned long long)read_rss_bytes(), q_disp, q_enc, q_live, q_record,
                   peak_disp, peak_enc, peak_live, peak_record,
-                  (int)rst.state, (unsigned long long)rst.frame_count,
-                  (unsigned long long)rst.repeated_frames,
-                  (unsigned long long)(s.record_started ? record_bytes : rst.bytes_written));
+                  (int)rst.state, (unsigned long long)rp.frame_count,
+                  (unsigned long long)rp.bytes_written);
             metrics_tick = 0;
         }
     }

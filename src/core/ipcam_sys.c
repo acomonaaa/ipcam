@@ -232,10 +232,10 @@ void ipcam_sys_print_banner(void)
 {
     fprintf(stderr,
         "=========================================================\n"
-        "  ipcam  model=%s  swver=%s  build=%s %s\n"
+        "  ipcam  model=%s  swver=%s  git=%s  build=%s %s\n"
         "  param path: %s\n"
         "=========================================================\n",
-        IPCAM_MODEL, IPCAM_VERSION, __DATE__, __TIME__,
+        IPCAM_MODEL, IPCAM_VERSION, LIBIPCAM_GIT_INFO, __DATE__, __TIME__,
         IPCAM_PARAM_PATH_DEF);
 }
 

@@ -4,6 +4,7 @@
 #include <signal.h>     /* sig_atomic_t */
 #include <pthread.h>    /* pthread_t */
 #include "ipcam_ringbuffer.h"
+#include "ipcam_perf.h"
 #include "ipcam_control.h"
 #include "ipcam_record.h"
 #include "ipcam_display.h"
@@ -35,6 +36,15 @@
  */
 #define IPCAM_MAX_TRACKED_CLIENTS 32
 
+typedef struct ipcam_stream_perf_s {
+    uint64_t frames_sent;
+    uint64_t bytes_sent;
+    uint64_t send_timeouts;
+    uint64_t send_failures;
+    uint64_t capture_to_send_start_p95_ns;
+    uint32_t window_frames;
+} ipcam_stream_perf_t;
+
 typedef struct ipcam_stream_ctx_s {
     int                  listen_fd;
     int                  port;
@@ -50,8 +60,14 @@ typedef struct ipcam_stream_ctx_s {
     pthread_mutex_t      client_mtx;    /* 保护 client_cnt + client_fds[] */
     pthread_cond_t       client_cond;   /* 客户端线程退出时唤醒 stop 等待者 */
     pthread_mutex_t      ring_mtx;      /* 序列化 jpeg_rb 的多 reader 访问 */
+    pthread_mutex_t      stats_mtx;     /* 保护发送累计值 */
     int                  client_cnt;
     int                  client_fds[IPCAM_MAX_TRACKED_CLIENTS];
+    uint64_t             frames_sent;
+    uint64_t             bytes_sent;
+    uint64_t             send_timeouts;
+    uint64_t             send_failures;
+    ipcam_perf_window_t  send_latency_window; /* 最近捕获到开始发送的延迟样本 */
 } ipcam_stream_ctx_t;
 
 int  ipcam_stream_start(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
@@ -63,6 +79,8 @@ void ipcam_stream_set_recorder(ipcam_stream_ctx_t *ctx, ipcam_record_ctx_t *reco
 void ipcam_stream_set_control(ipcam_stream_ctx_t *ctx, ipcam_control_ctx_t *control);
 void ipcam_stream_set_display(ipcam_stream_ctx_t *ctx, ipcam_display_ctx_t *display);
 void ipcam_stream_set_screen(ipcam_stream_ctx_t *ctx, ipcam_screen_ctx_t *screen);
+/* 复制直播发送统计；查询不访问 ring，也不等待客户端。 */
+void ipcam_stream_get_perf(ipcam_stream_ctx_t *ctx, ipcam_stream_perf_t *out);
 void ipcam_stream_stop(ipcam_stream_ctx_t *ctx);
 
 #endif /* IPCAM_STREAM_HTTP_H */

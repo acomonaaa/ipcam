@@ -42,6 +42,7 @@ typedef struct ipcam_frame_s {
     uint32_t stride;       /* 原始帧行跨度，压缩帧为 0 */
     uint32_t pixel_format; /* V4L2 fourcc；压缩帧为 0 */
     uint32_t config_generation; /* 参数切换代次，便于消费者丢弃旧帧 */
+    uint8_t quality;        /* JPEG 有效质量；原始 YUYV 帧为 0 */
 } ipcam_frame_t;
 
 typedef struct ipcam_frame_meta_s {
@@ -51,6 +52,7 @@ typedef struct ipcam_frame_meta_s {
     uint32_t stride;
     uint32_t pixel_format;
     uint32_t config_generation;
+    uint8_t quality;        /* JPEG 有效质量；原始 YUYV 帧为 0 */
 } ipcam_frame_meta_t;
 
 /*
@@ -75,10 +77,12 @@ typedef struct ipcam_ring_buffer_s {
     pthread_mutex_t mtx;
     pthread_cond_t  cond_not_empty;
     pthread_cond_t  cond_not_full;
+    pthread_cond_t  cond_updated; /* 只表示“有新序号”，不改变消费者所有权 */
 
     int       write_idx;       /* 下一个写入 slot */
     int       read_idx;        /* 下一个读取 slot */
     int       count;           /* 当前已占用槽数 */
+    int       read_held;       /* 1 = 消费者借用 read_idx，生产者不得覆盖该槽 */
     int       closed;          /* 1 = 关闭（生产者退出） */
 
     unsigned long seq_counter;
@@ -135,6 +139,21 @@ int ipcam_ring_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame);
  */
 int ipcam_ring_get_latest(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame);
 
+/*
+ * 定时取最新帧，并返回本次释放的过期帧数量。
+ * timeout_ms < 0 视为参数错误；0 表示只检查当前状态；正数使用
+ * CLOCK_MONOTONIC 绝对截止时间。成功后仍须调用 ipcam_ring_release。
+ */
+int ipcam_ring_get_latest_ex(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame,
+                             unsigned int *stale_count, int timeout_ms);
+
+/*
+ * 定时 FIFO 取帧，返回 0=成功、1=超时且未取到帧、-1=关闭/参数错误。
+ * 录像消费者用它等待生产者事件，避免无帧时用 usleep 轮询。
+ */
+int ipcam_ring_get_timed(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame,
+                         int timeout_ms);
+
 /* 非阻塞取帧：0=成功，1=当前为空，-1=已关闭或参数错误；成功后仍须 release。 */
 int ipcam_ring_try_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame);
 
@@ -147,6 +166,15 @@ int ipcam_ring_try_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame);
 int ipcam_ring_copy_latest(ipcam_ring_buffer_t *rb, void *out_data,
                            size_t out_cap, ipcam_frame_t *out_frame,
                            unsigned long last_seq);
+
+/*
+ * 等待最新序号变化后复制帧，不移动 ring 的消费位置。
+ * 返回 0=复制新帧、1=超时或序号未变化、-1=关闭/参数错误/容量不足。
+ * 多个直播客户端可各自保存 last_seq，不会互相抢占编码结果。
+ */
+int ipcam_ring_copy_latest_wait(ipcam_ring_buffer_t *rb, void *out_data,
+                                size_t out_cap, ipcam_frame_t *out_frame,
+                                unsigned long last_seq, int timeout_ms);
 
 /* 丢弃当前已排队帧；参数变更后用于清理旧配置代次，避免旧帧混入新链路。 */
 void ipcam_ring_clear(ipcam_ring_buffer_t *rb);

@@ -625,6 +625,31 @@ int ipcam_ui_get_video_viewport(const ipcam_ui_t *ui,
     }
 }
 
+int ipcam_ui_get_video_rect(const ipcam_ui_t *ui, ipcam_ui_video_rect_t *rect)
+{
+    if (!ui || !rect) return -1;
+    memset(rect, 0, sizeof(*rect));
+    switch (ui->screen) {
+    case IPCAM_UI_SCREEN_LOCAL_HOME:
+    case IPCAM_UI_SCREEN_COMPUTER_HOME:
+        rect->active = 1;
+        rect->x = 24;
+        rect->y = 104;
+        rect->width = 476;
+        rect->height = 268;
+        return 0;
+    case IPCAM_UI_SCREEN_FULLSCREEN:
+        rect->active = 1;
+        rect->x = 20;
+        rect->y = 56;
+        rect->width = 760;
+        rect->height = 368;
+        return 0;
+    default:
+        return 0;
+    }
+}
+
 ipcam_ui_t *ipcam_ui_create(const ipcam_ui_actions_t *actions,
                             const ipcam_ui_fonts_t *fonts)
 {
@@ -696,23 +721,99 @@ int ipcam_ui_update(ipcam_ui_t *ui, const ipcam_ui_state_t *state)
     return 0;
 }
 
-/* image descriptor 由 LVGL port 持有，UI 只改变源指针和占位层可见性。 */
+/* image descriptor 由 LVGL port 持有；内容地址不变时只刷新可见矩形。 */
 void ipcam_ui_set_video_source(ipcam_ui_t *ui, const lv_image_dsc_t *source,
                                int valid)
 {
     if (!ui) return;
+    int source_valid = valid && source;
+    int binding_changed = ui->video_source != source ||
+                          ui->video_source_valid != source_valid;
+    if (binding_changed) {
+        ui->video_source = source;
+        ui->video_source_valid = source_valid;
+    }
     lv_obj_t *images[2] = { ui->local_home.video_image, ui->fullscreen.video_image };
     lv_obj_t *placeholders[2] = { ui->local_home.video_placeholder,
                                   ui->fullscreen.video_placeholder };
     for (size_t i = 0; i < 2; i++) {
         if (!images[i]) continue;
-        if (valid && source) {
-            lv_image_set_src(images[i], source);
+        if (source_valid) {
+            if (binding_changed) lv_image_set_src(images[i], source);
             lv_obj_clear_flag(images[i], LV_OBJ_FLAG_HIDDEN);
             if (placeholders[i]) lv_obj_add_flag(placeholders[i], LV_OBJ_FLAG_HIDDEN);
         } else {
-            lv_obj_add_flag(images[i], LV_OBJ_FLAG_HIDDEN);
+            if (binding_changed || !lv_obj_has_flag(images[i], LV_OBJ_FLAG_HIDDEN))
+                lv_obj_add_flag(images[i], LV_OBJ_FLAG_HIDDEN);
             if (placeholders[i]) lv_obj_clear_flag(placeholders[i], LV_OBJ_FLAG_HIDDEN);
         }
     }
+    if (source_valid && !binding_changed) ipcam_ui_invalidate_video(ui);
+}
+
+void ipcam_ui_invalidate_video(ipcam_ui_t *ui)
+{
+    if (!ui || !ui->video_source_valid) return;
+    lv_obj_t *image = NULL;
+    if (ui->screen == IPCAM_UI_SCREEN_LOCAL_HOME)
+        image = ui->local_home.video_image;
+    else if (ui->screen == IPCAM_UI_SCREEN_COMPUTER_HOME)
+        image = ui->computer_home.video_image;
+    else if (ui->screen == IPCAM_UI_SCREEN_FULLSCREEN)
+        image = ui->fullscreen.video_image;
+    if (image) lv_obj_invalidate(image);
+}
+
+int ipcam_ui_sleep_fast_configure(ipcam_ui_t *ui, int ready)
+{
+    if (!ui) return -1;
+    ui->sleep_fast_ready = ready && ui->sleep_backdrop && ui->sleep_video_image ? 1 : 0;
+    ui->sleep_fast_active = 0;
+    ui->sleep_backdrop_source = NULL;
+    ui->sleep_video_source = NULL;
+    if (ui->sleep_backdrop) lv_obj_add_flag(ui->sleep_backdrop, LV_OBJ_FLAG_HIDDEN);
+    if (ui->sleep_video_image) lv_obj_add_flag(ui->sleep_video_image, LV_OBJ_FLAG_HIDDEN);
+    /* 固定缓冲已分配但 overlay 控件缺失时不能假报快速路径可用，调用方
+     * 需要保留旧的半透明提示并把 sleep_fast_path=0 写入诊断日志。 */
+    return ui->sleep_fast_ready ? 0 : -1;
+}
+
+void ipcam_ui_sleep_fast_set(ipcam_ui_t *ui, int active,
+                             const lv_image_dsc_t *backdrop,
+                             const lv_image_dsc_t *video)
+{
+    if (!ui || !ui->sleep_fast_ready || !ui->sleep_backdrop ||
+        !ui->sleep_video_image) return;
+    int show = active && backdrop;
+    if (backdrop != ui->sleep_backdrop_source && backdrop) {
+        lv_image_set_src(ui->sleep_backdrop, backdrop);
+        ui->sleep_backdrop_source = backdrop;
+    }
+    if (video != ui->sleep_video_source && video) {
+        lv_image_set_src(ui->sleep_video_image, video);
+        ui->sleep_video_source = video;
+    }
+    ipcam_ui_video_rect_t rect;
+    if (ipcam_ui_get_video_rect(ui, &rect) == 0 && rect.active) {
+        lv_obj_set_pos(ui->sleep_video_image, rect.x, rect.y);
+        lv_obj_set_size(ui->sleep_video_image, rect.width, rect.height);
+    }
+    ui->sleep_fast_active = show ? 1 : 0;
+    if (show) {
+        lv_obj_clear_flag(ui->sleep_backdrop, LV_OBJ_FLAG_HIDDEN);
+        if (video) lv_obj_clear_flag(ui->sleep_video_image, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(ui->sleep_video_image, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_opa(ui->sleep_overlay, LV_OPA_0, 0);
+        lv_obj_move_foreground(ui->sleep_overlay);
+    } else {
+        lv_obj_add_flag(ui->sleep_backdrop, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(ui->sleep_video_image, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_opa(ui->sleep_overlay, LV_OPA_70, 0);
+    }
+}
+
+void ipcam_ui_sleep_fast_invalidate_video(ipcam_ui_t *ui)
+{
+    if (!ui || !ui->sleep_fast_active || !ui->sleep_video_image) return;
+    lv_obj_invalidate(ui->sleep_video_image);
 }

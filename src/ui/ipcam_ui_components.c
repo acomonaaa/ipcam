@@ -165,16 +165,23 @@ lv_obj_t *ipcam_ui_make_action_panel(ipcam_ui_t *ui, lv_obj_t *parent,
     return panel;
 }
 
-/* 统一刷新标签，避免业务状态更新时重复判断空对象。 */
+/*
+ * 统一刷新标签；LVGL 的 set_text 会重新分配文本并使对象失效，因此值未变
+ * 时必须跳过调用。业务层只管生成目标字符串，变更判断集中在这里。
+ */
 void ipcam_ui_set_label(lv_obj_t *label, const char *text)
 {
-    if (label) lv_label_set_text(label, text ? text : "");
+    if (!label) return;
+    const char *next = text ? text : "";
+    const char *current = lv_label_get_text(label);
+    if (!current || strcmp(current, next) != 0) lv_label_set_text(label, next);
 }
 
 /* 更新动态提示的语义颜色；状态颜色与 .pen 的 accent/success/warning 对齐。 */
 void ipcam_ui_set_label_color(lv_obj_t *label, lv_color_t color)
 {
-    if (label) lv_obj_set_style_text_color(label, color, 0);
+    if (label && !lv_color_eq(lv_obj_get_style_text_color(label, 0), color))
+        lv_obj_set_style_text_color(label, color, 0);
 }
 
 /* 更新分段按钮的 selected 颜色，同时修正文字颜色以保持 RGB565 对比度。 */
@@ -183,12 +190,14 @@ void ipcam_ui_set_selected_button(lv_obj_t *button, lv_obj_t *label,
                                   lv_color_t normal_color)
 {
     if (!button) return;
-    lv_obj_set_style_bg_color(button,
-                              selected ? selected_color : normal_color, 0);
+    lv_color_t background = selected ? selected_color : normal_color;
+    if (!lv_color_eq(lv_obj_get_style_bg_color(button, 0), background))
+        lv_obj_set_style_bg_color(button, background, 0);
     if (label) {
-        lv_obj_set_style_text_color(label,
-                                    selected ? lv_color_hex(IPCAM_UI_INK) :
-                                    lv_color_hex(IPCAM_UI_TEXT_SECONDARY), 0);
+        lv_color_t text_color = selected ? lv_color_hex(IPCAM_UI_INK) :
+                                         lv_color_hex(IPCAM_UI_TEXT_SECONDARY);
+        if (!lv_color_eq(lv_obj_get_style_text_color(label, 0), text_color))
+            lv_obj_set_style_text_color(label, text_color, 0);
     }
 }
 
@@ -254,18 +263,23 @@ int ipcam_ui_make_radio_row(ipcam_ui_t *ui, lv_obj_t *parent,
 void ipcam_ui_set_radio_selected(lv_obj_t *row, lv_obj_t *dot,
                                  lv_obj_t *label, int selected)
 {
+    lv_color_t row_color = lv_color_hex(selected ? IPCAM_UI_PRESSED :
+                                         IPCAM_UI_SURFACE);
     if (row) {
-        lv_obj_set_style_bg_color(row, lv_color_hex(selected ? IPCAM_UI_PRESSED :
-                                                     IPCAM_UI_SURFACE), 0);
+        if (!lv_color_eq(lv_obj_get_style_bg_color(row, 0), row_color))
+            lv_obj_set_style_bg_color(row, row_color, 0);
     }
+    lv_color_t dot_color = lv_color_hex(selected ? IPCAM_UI_ACCENT :
+                                         IPCAM_UI_SURFACE);
     if (dot) {
-        lv_obj_set_style_bg_color(dot, lv_color_hex(selected ? IPCAM_UI_ACCENT :
-                                                     IPCAM_UI_SURFACE), 0);
+        if (!lv_color_eq(lv_obj_get_style_bg_color(dot, 0), dot_color))
+            lv_obj_set_style_bg_color(dot, dot_color, 0);
     }
     if (label) {
-        lv_obj_set_style_text_color(label,
-                                    lv_color_hex(selected ? IPCAM_UI_TEXT_PRIMARY :
-                                                 IPCAM_UI_TEXT_SECONDARY), 0);
+        lv_color_t text_color = lv_color_hex(selected ? IPCAM_UI_TEXT_PRIMARY :
+                                              IPCAM_UI_TEXT_SECONDARY);
+        if (!lv_color_eq(lv_obj_get_style_text_color(label, 0), text_color))
+            lv_obj_set_style_text_color(label, text_color, 0);
     }
 }
 
@@ -304,10 +318,16 @@ void ipcam_ui_toggle_set(lv_obj_t *toggle, lv_obj_t *knob, int enabled,
     int knob_size = lv_obj_get_width(knob);
     int max_x = width - knob_size - 8;
     if (max_x < 8) max_x = 8;
-    lv_obj_set_x(knob, enabled ? max_x : 8);
-    lv_obj_remove_style(toggle, &styles->toggle_track, 0);
-    lv_obj_remove_style(toggle, &styles->toggle_active, 0);
-    lv_obj_add_style(toggle, enabled ? &styles->toggle_active :
-                     &styles->toggle_track, 0);
+    int target_x = enabled ? max_x : 8;
+    if (lv_obj_get_x(knob) != target_x) lv_obj_set_x(knob, target_x);
+    /* LVGL 没有公开 style 身份查询，背景颜色比较足以避免常见重复失效。 */
+    lv_color_t target_color = lv_obj_get_style_bg_color(toggle, 0);
+    lv_color_t expected = lv_color_hex(enabled ? IPCAM_UI_ACCENT : IPCAM_UI_SURFACE);
+    if (!lv_color_eq(target_color, expected)) {
+        lv_obj_remove_style(toggle, &styles->toggle_track, 0);
+        lv_obj_remove_style(toggle, &styles->toggle_active, 0);
+        lv_obj_add_style(toggle, enabled ? &styles->toggle_active :
+                         &styles->toggle_track, 0);
+    }
     (void)height;
 }

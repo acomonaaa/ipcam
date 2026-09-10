@@ -29,6 +29,206 @@ static uint32_t lvgl_tick_cb(void)
                       (uint64_t)ts.tv_nsec / 1000000ULL);
 }
 
+/* LVGL tick 只有毫秒精度；性能窗口使用独立的纳秒单调时钟，避免短 flush
+ * 样本被全部量化为 0，也避免 32 位 tick 回绕影响时延统计。 */
+static uint64_t lvgl_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* 休眠状态会被 LVGL 线程写入、主线程 status 查询读取，统一经过 stats_mtx
+ * 访问，避免在低频状态查询时与页面边沿切换发生 C 数据竞争。 */
+static void lvgl_sleep_flags_get(ipcam_lvgl_ctx_t *ctx, int *fast_path,
+                                 int *fast_active)
+{
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->stats_mtx);
+    if (fast_path) *fast_path = ctx->sleep_fast_path;
+    if (fast_active) *fast_active = ctx->sleep_fast_active;
+    pthread_mutex_unlock(&ctx->stats_mtx);
+}
+
+/* 启动阶段和运行阶段都使用同一发布路径，保证 getter 看到完整的状态变化。 */
+static void lvgl_sleep_path_set(ipcam_lvgl_ctx_t *ctx, int enabled)
+{
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->stats_mtx);
+    ctx->sleep_fast_path = enabled ? 1 : 0;
+    pthread_mutex_unlock(&ctx->stats_mtx);
+}
+
+static void lvgl_sleep_active_set(ipcam_lvgl_ctx_t *ctx, int active)
+{
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->stats_mtx);
+    ctx->sleep_fast_active = active ? 1 : 0;
+    pthread_mutex_unlock(&ctx->stats_mtx);
+}
+
+/* 休眠提示只在固定内存路径中做 RGB565 查表，避免每帧执行全屏 alpha 混合。 */
+static uint16_t sleep_darken_pixel(uint16_t pixel, const uint16_t *lut)
+{
+    return lut ? lut[pixel] : pixel;
+}
+
+/* 初始化与 LVGL image descriptor 配套的 RGB565 元数据；数据地址长期稳定。 */
+static void lvgl_init_rgb565_dsc(lv_image_dsc_t *dsc, int width, int height,
+                                 uint16_t *data)
+{
+    memset(dsc, 0, sizeof(*dsc));
+    dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
+    dsc->header.cf = LV_COLOR_FORMAT_RGB565;
+    dsc->header.w = (uint16_t)width;
+    dsc->header.h = (uint16_t)height;
+    dsc->header.stride = (uint32_t)width * sizeof(uint16_t);
+    dsc->data_size = (uint32_t)((size_t)width * (size_t)height * sizeof(uint16_t));
+    dsc->data = (const uint8_t *)data;
+}
+
+/* 构造一次性 30% 亮度 LUT；65536 项固定分配换取休眠期间 O(1) 预暗。 */
+static void lvgl_build_sleep_lut(uint16_t *lut)
+{
+    if (!lut) return;
+    for (uint32_t value = 0; value <= UINT16_MAX; value++) {
+        unsigned r = (value >> 11) & 0x1fU;
+        unsigned g = (value >> 5) & 0x3fU;
+        unsigned b = value & 0x1fU;
+        r = (r * 3U + 5U) / 10U;
+        g = (g * 3U + 5U) / 10U;
+        b = (b * 3U + 5U) / 10U;
+        lut[value] = (uint16_t)((r << 11) | (g << 5) | b);
+    }
+}
+
+/*
+ * 休眠快速路径的额外缓冲在 LVGL 启动时一次性申请。失败只关闭快速合成，
+ * 保留原有半透明提示并明确记录 sleep_fast_path=0，不能把验收失败隐藏掉。
+ */
+static int lvgl_prepare_sleep_fast_path(ipcam_lvgl_ctx_t *ctx,
+                                        ipcam_display_ctx_t *display)
+{
+    if (!ctx || !display || display->out_w != IPCAM_UI_SCREEN_WIDTH ||
+        display->out_h != IPCAM_UI_SCREEN_HEIGHT) {
+        MLOGW("sleep_fast_path=0 reason=display_size_not_800x480\n");
+        return -1;
+    }
+    size_t bg_pixels = (size_t)display->out_w * (size_t)display->out_h;
+    size_t video_pixels = (size_t)760U * 368U;
+    if (bg_pixels > SIZE_MAX / sizeof(uint16_t) ||
+        video_pixels > SIZE_MAX / sizeof(uint16_t)) {
+        MLOGW("sleep_fast_path=0 reason=buffer_size_overflow\n");
+        return -1;
+    }
+    ctx->sleep_bg_size = bg_pixels * sizeof(uint16_t);
+    ctx->sleep_video_size = video_pixels * sizeof(uint16_t);
+    ctx->sleep_bg_buf = malloc(ctx->sleep_bg_size);
+    ctx->sleep_video_buf = malloc(ctx->sleep_video_size);
+    ctx->sleep_lut = malloc(65536U * sizeof(uint16_t));
+    if (!ctx->sleep_bg_buf || !ctx->sleep_video_buf || !ctx->sleep_lut) {
+        MLOGW("sleep_fast_path=0 reason=alloc bg=%zu video=%zu lut=%zu\n",
+              ctx->sleep_bg_size, ctx->sleep_video_size,
+              65536U * sizeof(uint16_t));
+        free(ctx->sleep_bg_buf);
+        free(ctx->sleep_video_buf);
+        free(ctx->sleep_lut);
+        ctx->sleep_bg_buf = NULL;
+        ctx->sleep_video_buf = NULL;
+        ctx->sleep_lut = NULL;
+        ctx->sleep_bg_size = 0;
+        ctx->sleep_video_size = 0;
+        return -1;
+    }
+    lvgl_build_sleep_lut(ctx->sleep_lut);
+    lvgl_init_rgb565_dsc(&ctx->sleep_bg_dsc, display->out_w, display->out_h,
+                         ctx->sleep_bg_buf);
+    /* video descriptor 的尺寸在每次新预览帧到来时更新，但 data 地址不变。 */
+    lvgl_init_rgb565_dsc(&ctx->sleep_video_dsc, 760, 368, ctx->sleep_video_buf);
+    lvgl_sleep_path_set(ctx, 1);
+    MLOGI("sleep_fast_path=1 buffers=%zu+%zu+%zu\n",
+          ctx->sleep_bg_size, ctx->sleep_video_size,
+          65536U * sizeof(uint16_t));
+    return 0;
+}
+
+/* 把已复制的可见 framebuffer 预暗成不透明 backdrop；只在提示边沿调用。 */
+static int lvgl_build_sleep_backdrop(ipcam_lvgl_ctx_t *ctx)
+{
+    int fast_path = 0;
+    lvgl_sleep_flags_get(ctx, &fast_path, NULL);
+    if (!ctx || !fast_path || !ctx->sleep_bg_buf || !ctx->display) return -1;
+    if (ipcam_display_snapshot_visible(ctx->display, ctx->sleep_bg_buf,
+                                       ctx->sleep_bg_size) != 0)
+        return -1;
+    size_t pixels = ctx->sleep_bg_size / sizeof(uint16_t);
+    for (size_t i = 0; i < pixels; i++)
+        ctx->sleep_bg_buf[i] = sleep_darken_pixel(ctx->sleep_bg_buf[i], ctx->sleep_lut);
+    return 0;
+}
+
+/* 把当前普通预览副本预暗到提示层；只复制视频矩形，不触碰底层页面。 */
+static int lvgl_build_sleep_video(ipcam_lvgl_ctx_t *ctx, uint16_t width,
+                                  uint16_t height, uint32_t stride)
+{
+    int fast_path = 0;
+    lvgl_sleep_flags_get(ctx, &fast_path, NULL);
+    if (!ctx || !fast_path || !ctx->video_buf ||
+        !ctx->sleep_video_buf || width == 0 || height == 0 ||
+        stride < (uint32_t)width * sizeof(uint16_t) ||
+        (size_t)width * height * sizeof(uint16_t) > ctx->sleep_video_size)
+        return -1;
+    size_t source_stride = stride;
+    size_t row_bytes = (size_t)width * sizeof(uint16_t);
+    for (uint16_t y = 0; y < height; y++) {
+        const uint16_t *source = (const uint16_t *)(ctx->video_buf +
+                                                    (size_t)y * source_stride);
+        uint16_t *target = ctx->sleep_video_buf + (size_t)y * width;
+        for (uint16_t x = 0; x < width; x++)
+            target[x] = sleep_darken_pixel(source[x], ctx->sleep_lut);
+    }
+    ctx->sleep_video_dsc.header.w = width;
+    ctx->sleep_video_dsc.header.h = height;
+    /* 预暗层按紧凑行存储，避免把源帧可能存在的 line padding 带入 image。 */
+    ctx->sleep_video_dsc.header.stride = (uint32_t)row_bytes;
+    ctx->sleep_video_dsc.data_size = (uint32_t)((size_t)height * row_bytes);
+    return 0;
+}
+
+/* 仅在 screen_sleep_prompt 的 0→1/1→0 边沿操作 backdrop，避免每帧整屏重绘。 */
+static int lvgl_apply_sleep_state(ipcam_lvgl_ctx_t *ctx,
+                                  const ipcam_ui_state_t *state)
+{
+    if (!ctx || !ctx->ui || !state) return 0;
+    int fast_path = 0;
+    int fast_active = 0;
+    lvgl_sleep_flags_get(ctx, &fast_path, &fast_active);
+    int prompt = state->screen_sleep_prompt && !state->screen_sleeping;
+    if (!prompt) {
+        if (fast_active) {
+            ipcam_ui_sleep_fast_set(ctx->ui, 0, NULL, NULL);
+            lvgl_sleep_active_set(ctx, 0);
+            /* 退出提示时让当前普通视频 descriptor 在下一轮重新可见。 */
+            ctx->last_rendered = UINT64_MAX;
+        }
+        return 0;
+    }
+    if (fast_active || !fast_path) return 0;
+    if (lvgl_build_sleep_backdrop(ctx) != 0) {
+        MLOGW("sleep_fast_path=0 reason=visible_snapshot_failed\n");
+        lvgl_sleep_path_set(ctx, 0);
+        return 0;
+    }
+    const lv_image_dsc_t *video = NULL;
+    if (ctx->video_valid && lvgl_build_sleep_video(ctx, ctx->video_dsc.header.w,
+                                                   ctx->video_dsc.header.h,
+                                                   ctx->video_dsc.header.stride) == 0)
+        video = &ctx->sleep_video_dsc;
+    ipcam_ui_sleep_fast_set(ctx->ui, 1, &ctx->sleep_bg_dsc, video);
+    lvgl_sleep_active_set(ctx, 1);
+    return 1;
+}
+
 /* 结果由主线程写入、由 LVGL 线程读取；禁止跨线程直接改 label。 */
 static void lvgl_set_feedback(ipcam_lvgl_ctx_t *ctx, const char *message,
                               ipcam_ui_message_severity_t severity)
@@ -548,29 +748,45 @@ static void lvgl_sync_preview_target(ipcam_lvgl_ctx_t *ctx)
 }
 
 /* 按当前页面目标尺寸复制最新预览帧，避免 LVGL 再执行全屏 image 缩放。 */
-static void lvgl_update_video(ipcam_lvgl_ctx_t *ctx)
+static int lvgl_update_video(ipcam_lvgl_ctx_t *ctx)
 {
-    int preview_enabled = ipcam_param_get_preview_enabled() ? 1 : 0;
-    if (!preview_enabled || ctx->preview_target_w <= 0 || ctx->preview_target_h <= 0) {
+    int fast_active = 0;
+    lvgl_sleep_flags_get(ctx, NULL, &fast_active);
+    if (!ctx->display->dynamic_video_enabled) {
         if (ctx->video_valid) {
             ctx->video_valid = 0;
             ipcam_ui_set_video_source(ctx->ui, NULL, 0);
         }
         ctx->last_rendered = UINT64_MAX;
-        return;
+        return 0;
+    }
+    int preview_enabled = ipcam_param_get_preview_enabled() ? 1 : 0;
+    if (!preview_enabled || ctx->preview_target_w <= 0 || ctx->preview_target_h <= 0) {
+        if (ctx->video_valid) {
+            ctx->video_valid = 0;
+            if (fast_active)
+                ipcam_ui_sleep_fast_set(ctx->ui, 1, &ctx->sleep_bg_dsc, NULL);
+            else
+                ipcam_ui_set_video_source(ctx->ui, NULL, 0);
+        }
+        ctx->last_rendered = UINT64_MAX;
+        return 0;
     }
 
     uint64_t rendered = 0;
     ipcam_display_get_stats(ctx->display, &rendered);
-    if (rendered == ctx->last_rendered) return;
+    if (rendered == ctx->last_rendered) return 0;
 
     ipcam_frame_t frame;
     if (ipcam_display_preview_acquire(ctx->display, ctx->video_buf,
                                       ctx->video_buf_size, &frame) != 0) {
         ctx->video_valid = 0;
         ctx->last_rendered = rendered;
-        ipcam_ui_set_video_source(ctx->ui, NULL, 0);
-        return;
+        if (fast_active)
+            ipcam_ui_sleep_fast_set(ctx->ui, 1, &ctx->sleep_bg_dsc, NULL);
+        else
+            ipcam_ui_set_video_source(ctx->ui, NULL, 0);
+        return 0;
     }
     if (frame.width != (uint16_t)ctx->preview_target_w ||
         frame.height != (uint16_t)ctx->preview_target_h ||
@@ -579,17 +795,32 @@ static void lvgl_update_video(ipcam_lvgl_ctx_t *ctx)
               frame.width, frame.height, frame.stride);
         ctx->video_valid = 0;
         ctx->last_rendered = rendered;
-        ipcam_ui_set_video_source(ctx->ui, NULL, 0);
-        return;
+        if (fast_active)
+            ipcam_ui_sleep_fast_set(ctx->ui, 1, &ctx->sleep_bg_dsc, NULL);
+        else
+            ipcam_ui_set_video_source(ctx->ui, NULL, 0);
+        return 0;
     }
     ctx->video_dsc.header.w = frame.width;
     ctx->video_dsc.header.h = frame.height;
     ctx->video_dsc.header.stride = frame.stride;
     ctx->video_dsc.data_size = (uint32_t)((size_t)frame.stride * frame.height);
     /* video_dsc.data 始终指向 video_buf；复制完成后 UI 只引用该稳定地址。 */
-    ipcam_ui_set_video_source(ctx->ui, &ctx->video_dsc, 1);
+    if (fast_active) {
+        if (lvgl_build_sleep_video(ctx, frame.width, frame.height, frame.stride) == 0) {
+            ipcam_ui_sleep_fast_set(ctx->ui, 1, &ctx->sleep_bg_dsc,
+                                    &ctx->sleep_video_dsc);
+            ipcam_ui_sleep_fast_invalidate_video(ctx->ui);
+        } else {
+            /* 该帧无法安全映射到提示层时不显示半成品，下一帧继续尝试。 */
+            ipcam_ui_sleep_fast_set(ctx->ui, 1, &ctx->sleep_bg_dsc, NULL);
+        }
+    } else {
+        ipcam_ui_set_video_source(ctx->ui, &ctx->video_dsc, 1);
+    }
     ctx->last_rendered = rendered;
     ctx->video_valid = 1;
+    return fast_active ? 2 : 1;
 }
 
 /* 每 500ms 计算一次实际 LCD 帧率，避免按 5ms LVGL tick 得到抖动数值。 */
@@ -620,6 +851,15 @@ static void *lvgl_thread(void *arg)
           IPCAM_UI_SCREEN_WIDTH, IPCAM_UI_SCREEN_HEIGHT);
     ctx->preview_target_screen = (ipcam_ui_screen_t)-1;
     while (*ctx->running && ctx->service_running) {
+        /* pan 失败后暂缓下一次 LVGL 绘制；重试最多每秒一次，成功前不让
+         * renderer 触碰仍在扫描的可见页，网络/编码/录像线程继续运行。 */
+        if (ctx->framebuffer_direct && ipcam_display_pan_fault(ctx->display)) {
+            (void)ipcam_display_retry_pan(ctx->display);
+            if (ipcam_display_pan_fault(ctx->display)) {
+                usleep(5 * 1000);
+                continue;
+            }
+        }
         /* 页面创建/销毁必须避开 lv_timer_handler 的事件回调栈；若导航失败，
          * 也强制重绑视频源，确保恢复出来的新首页不会停留在占位图。 */
         int navigation = ipcam_ui_process_navigation(ctx->ui);
@@ -629,18 +869,52 @@ static void *lvgl_thread(void *arg)
             ctx->video_valid = 0;
         }
         lvgl_sync_preview_target(ctx);
-        lvgl_update_video(ctx);
+        uint64_t video_started_ns = lvgl_now_ns();
+        int video_result = lvgl_update_video(ctx);
+        uint64_t video_ended_ns = lvgl_now_ns();
+        if (video_result != 0) {
+            pthread_mutex_lock(&ctx->stats_mtx);
+            if (video_ended_ns >= video_started_ns)
+                ipcam_perf_window_add(&ctx->video_window,
+                                      video_ended_ns - video_started_ns);
+            ctx->video_frames++;
+            if (video_result == 2) {
+                if (video_ended_ns >= video_started_ns)
+                    ipcam_perf_window_add(&ctx->sleep_window,
+                                          video_ended_ns - video_started_ns);
+                ctx->sleep_prompt_redraws++;
+            }
+            pthread_mutex_unlock(&ctx->stats_mtx);
+        }
         update_measured_fps(ctx);
-        /* 标签和滑块更新会触发局部重绘/文本内存操作，100ms 足够反映状态，
-         * 不应按 5ms 视频循环反复改写全部八个页面。 */
+        /* 业务状态只需 1 Hz；视频序号仍在每次新帧到来时即时更新。 */
         uint32_t now = lvgl_tick_cb();
-        if (ctx->last_ui_tick == 0 || now - ctx->last_ui_tick >= 100) {
+        if (ctx->last_ui_tick == 0 || now - ctx->last_ui_tick >= 1000) {
             ipcam_ui_state_t state;
             fill_ui_state(ctx, &state);
+            uint64_t sleep_started_ns = lvgl_now_ns();
+            int sleep_edge = lvgl_apply_sleep_state(ctx, &state);
+            uint64_t sleep_ended_ns = lvgl_now_ns();
+            if (sleep_edge) {
+                pthread_mutex_lock(&ctx->stats_mtx);
+                if (sleep_ended_ns >= sleep_started_ns)
+                    ipcam_perf_window_add(&ctx->sleep_window,
+                                          sleep_ended_ns - sleep_started_ns);
+                ctx->sleep_prompt_redraws++;
+                pthread_mutex_unlock(&ctx->stats_mtx);
+            }
             (void)ipcam_ui_update(ctx->ui, &state);
             ctx->last_ui_tick = now;
         }
+        uint64_t handler_started_ns = lvgl_now_ns();
         lv_timer_handler();
+        uint64_t handler_ended_ns = lvgl_now_ns();
+        pthread_mutex_lock(&ctx->stats_mtx);
+        if (handler_ended_ns >= handler_started_ns)
+            ipcam_perf_window_add(&ctx->handler_window,
+                                  handler_ended_ns - handler_started_ns);
+        ctx->handler_count++;
+        pthread_mutex_unlock(&ctx->stats_mtx);
         usleep(5 * 1000);
     }
     MLOGI("LVGL thread exit\n");
@@ -669,15 +943,26 @@ int ipcam_lvgl_start(ipcam_lvgl_ctx_t *ctx, ipcam_display_ctx_t *display,
     ctx->last_rendered = 0;
     ctx->video_valid = 0;
     ctx->framebuffer_direct = display->fb_pan_enabled && display->fb_page_size > 0;
+    int stats_mutex_rc = pthread_mutex_init(&ctx->stats_mtx, NULL);
+    if (stats_mutex_rc != 0) {
+        MLOGE("init LVGL stats mutex failed: %s (%d)\n",
+              strerror(stats_mutex_rc), stats_mutex_rc);
+        return -1;
+    }
+    ipcam_perf_window_init(&ctx->handler_window);
+    ipcam_perf_window_init(&ctx->video_window);
+    ipcam_perf_window_init(&ctx->sleep_window);
     int mutex_rc = pthread_mutex_init(&ctx->input_mtx, NULL);
     if (mutex_rc != 0) {
         MLOGE("init LVGL input mutex failed: %s (%d)\n", strerror(mutex_rc), mutex_rc);
+        pthread_mutex_destroy(&ctx->stats_mtx);
         return -1;
     }
     mutex_rc = pthread_mutex_init(&ctx->action_mtx, NULL);
     if (mutex_rc != 0) {
         MLOGE("init LVGL action mutex failed: %s (%d)\n", strerror(mutex_rc), mutex_rc);
         pthread_mutex_destroy(&ctx->input_mtx);
+        pthread_mutex_destroy(&ctx->stats_mtx);
         return -1;
     }
     mutex_rc = pthread_mutex_init(&ctx->service_mtx, NULL);
@@ -685,6 +970,7 @@ int ipcam_lvgl_start(ipcam_lvgl_ctx_t *ctx, ipcam_display_ctx_t *display,
         MLOGE("init LVGL service mutex failed: %s (%d)\n", strerror(mutex_rc), mutex_rc);
         pthread_mutex_destroy(&ctx->action_mtx);
         pthread_mutex_destroy(&ctx->input_mtx);
+        pthread_mutex_destroy(&ctx->stats_mtx);
         return -1;
     }
     mutex_rc = pthread_mutex_init(&ctx->feedback_mtx, NULL);
@@ -693,6 +979,7 @@ int ipcam_lvgl_start(ipcam_lvgl_ctx_t *ctx, ipcam_display_ctx_t *display,
         pthread_mutex_destroy(&ctx->service_mtx);
         pthread_mutex_destroy(&ctx->action_mtx);
         pthread_mutex_destroy(&ctx->input_mtx);
+        pthread_mutex_destroy(&ctx->stats_mtx);
         return -1;
     }
 
@@ -720,6 +1007,7 @@ int ipcam_lvgl_start(ipcam_lvgl_ctx_t *ctx, ipcam_display_ctx_t *display,
               ctx->draw_buf_size, ctx->video_buf_size);
         goto fail_buffers;
     }
+    (void)lvgl_prepare_sleep_fast_path(ctx, display);
 
     lv_init();
     MLOGI("LVGL core initialized\n");
@@ -792,6 +1080,13 @@ int ipcam_lvgl_start(ipcam_lvgl_ctx_t *ctx, ipcam_display_ctx_t *display,
         goto fail_lvgl;
     }
     MLOGI("IPCam UI object created\n");
+    int sleep_fast_path = 0;
+    lvgl_sleep_flags_get(ctx, &sleep_fast_path, NULL);
+    if (sleep_fast_path &&
+        ipcam_ui_sleep_fast_configure(ctx->ui, sleep_fast_path) != 0) {
+        lvgl_sleep_path_set(ctx, 0);
+        MLOGW("sleep_fast_path=0 reason=overlay_objects_unavailable\n");
+    }
     ipcam_ui_set_video_source(ctx->ui, NULL, 0);
     if (display->out_w != IPCAM_UI_SCREEN_WIDTH ||
         display->out_h != IPCAM_UI_SCREEN_HEIGHT)
@@ -816,6 +1111,12 @@ fail_lvgl:
     ctx->lv_display = NULL;
     ctx->lv_indev = NULL;
 fail_buffers:
+    free(ctx->sleep_lut);
+    free(ctx->sleep_video_buf);
+    free(ctx->sleep_bg_buf);
+    ctx->sleep_lut = NULL;
+    ctx->sleep_video_buf = NULL;
+    ctx->sleep_bg_buf = NULL;
     free(ctx->video_buf);
     free(ctx->draw_buf);
     ctx->video_buf = NULL;
@@ -825,6 +1126,7 @@ fail_mutex:
     pthread_mutex_destroy(&ctx->service_mtx);
     pthread_mutex_destroy(&ctx->action_mtx);
     pthread_mutex_destroy(&ctx->input_mtx);
+    pthread_mutex_destroy(&ctx->stats_mtx);
     memset(ctx, 0, sizeof(*ctx));
     return -1;
 }
@@ -899,6 +1201,29 @@ void ipcam_lvgl_touch_report(ipcam_lvgl_ctx_t *ctx,
     pthread_mutex_unlock(&ctx->input_mtx);
 }
 
+/* 复制 LVGL 固定窗口快照；排序 P95 只处理最多 64 个样本，不触发堆分配。 */
+void ipcam_lvgl_get_perf(ipcam_lvgl_ctx_t *ctx, ipcam_lvgl_perf_t *out)
+{
+    if (!ctx || !out) return;
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&ctx->stats_mtx);
+    out->handler_avg_ns = ipcam_perf_window_avg(&ctx->handler_window);
+    out->handler_p95_ns = ipcam_perf_window_p95(&ctx->handler_window);
+    out->handler_max_ns = ipcam_perf_window_max(&ctx->handler_window);
+    out->video_avg_ns = ipcam_perf_window_avg(&ctx->video_window);
+    out->video_p95_ns = ipcam_perf_window_p95(&ctx->video_window);
+    out->video_max_ns = ipcam_perf_window_max(&ctx->video_window);
+    out->sleep_avg_ns = ipcam_perf_window_avg(&ctx->sleep_window);
+    out->sleep_p95_ns = ipcam_perf_window_p95(&ctx->sleep_window);
+    out->sleep_max_ns = ipcam_perf_window_max(&ctx->sleep_window);
+    out->handler_count = ctx->handler_count;
+    out->video_frames = ctx->video_frames;
+    out->sleep_redraws = ctx->sleep_prompt_redraws;
+    out->sleep_fast_path = ctx->sleep_fast_path;
+    out->sleep_fast_active = ctx->sleep_fast_active;
+    pthread_mutex_unlock(&ctx->stats_mtx);
+}
+
 /* 触摸必须先停，保证 LVGL 线程退出后不会再有输入快照写入 mutex。 */
 void ipcam_lvgl_stop(ipcam_lvgl_ctx_t *ctx)
 {
@@ -917,11 +1242,18 @@ void ipcam_lvgl_stop(ipcam_lvgl_ctx_t *ctx)
     ctx->lv_indev = NULL;
     free(ctx->video_buf);
     free(ctx->draw_buf);
+    free(ctx->sleep_lut);
+    free(ctx->sleep_video_buf);
+    free(ctx->sleep_bg_buf);
     ctx->video_buf = NULL;
     ctx->draw_buf = NULL;
+    ctx->sleep_lut = NULL;
+    ctx->sleep_video_buf = NULL;
+    ctx->sleep_bg_buf = NULL;
     pthread_mutex_destroy(&ctx->service_mtx);
     pthread_mutex_destroy(&ctx->feedback_mtx);
     pthread_mutex_destroy(&ctx->action_mtx);
     pthread_mutex_destroy(&ctx->input_mtx);
+    pthread_mutex_destroy(&ctx->stats_mtx);
     memset(ctx, 0, sizeof(*ctx));
 }

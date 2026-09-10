@@ -13,8 +13,10 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 /*
@@ -157,6 +159,122 @@ static void wait_for_clients(ipcam_stream_ctx_t *ctx, int expected)
     assert(count >= expected);
 }
 
+static void test_stream_sends_validated_frame(void)
+{
+    volatile sig_atomic_t running = 1;
+    ipcam_ring_buffer_t *rb = ipcam_ring_create(4, 256);
+    assert(rb != NULL);
+
+    ipcam_stream_ctx_t ctx;
+    assert(ipcam_stream_start(&ctx, rb, &running) == 0);
+    int port = current_port(ctx.listen_fd);
+    int stream_fd = connect_retry(port);
+    assert(stream_fd >= 0);
+    send_request(stream_fd, "/stream.mjpg");
+    wait_for_clients(&ctx, 1);
+
+    /* 用最小但完整的 JPEG 边界喂入 ring，覆盖直播头部元数据和 SOI/EOI
+     * 校验；真实编码器输出更大，但网络线程的协议约束相同。 */
+    static const unsigned char jpeg[] = {0xff, 0xd8, 0xff, 0xd9};
+    ipcam_frame_meta_t meta;
+    memset(&meta, 0, sizeof(meta));
+    meta.monotonic_ns = 123456789ULL;
+    meta.width = 640;
+    meta.height = 480;
+    meta.quality = 55;
+    assert(ipcam_ring_append_meta(rb, jpeg, sizeof(jpeg), &meta) == 0);
+
+    char response[2048] = {0};
+    size_t got = 0;
+    struct timeval timeout = {.tv_sec = 2, .tv_usec = 0};
+    assert(setsockopt(stream_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                      sizeof(timeout)) == 0);
+    while (got + 1 < sizeof(response)) {
+        ssize_t n = read(stream_fd, response + got,
+                         sizeof(response) - got - 1);
+        if (n <= 0) break;
+        got += (size_t)n;
+        response[got] = '\0';
+        if (strstr(response, "X-IPCam-Frame-Bytes: 4\r\n") &&
+            got >= sizeof(jpeg) &&
+            memmem(response, got, jpeg, sizeof(jpeg)) != NULL)
+            break;
+    }
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "X-IPCam-Seq: 1\r\n") != NULL);
+    assert(strstr(response, "X-IPCam-Capture-Ns: 123456789\r\n") != NULL);
+    assert(strstr(response, "X-IPCam-Quality: 55\r\n") != NULL);
+    assert(strstr(response, "X-IPCam-Frame-Bytes: 4\r\n") != NULL);
+    assert(memmem(response, got, jpeg, sizeof(jpeg)) != NULL);
+
+    ipcam_stream_perf_t perf;
+    memset(&perf, 0, sizeof(perf));
+    for (int i = 0; i < 100; i++) {
+        ipcam_stream_get_perf(&ctx, &perf);
+        if (perf.frames_sent >= 1) break;
+        usleep(10 * 1000);
+    }
+    assert(perf.frames_sent >= 1);
+    assert(perf.bytes_sent > sizeof(jpeg));
+    assert(perf.window_frames >= 1);
+
+    close(stream_fd);
+    ipcam_stream_stop(&ctx);
+    ipcam_ring_destroy(rb);
+}
+
+static void test_stream_times_out_slow_client(void)
+{
+    volatile sig_atomic_t running = 1;
+    const size_t frame_size = 2U * 1024U * 1024U;
+    ipcam_ring_buffer_t *rb = ipcam_ring_create(2, frame_size);
+    assert(rb != NULL);
+
+    ipcam_stream_ctx_t ctx;
+    assert(ipcam_stream_start(&ctx, rb, &running) == 0);
+    int port = current_port(ctx.listen_fd);
+    int stream_fd = connect_retry(port);
+    assert(stream_fd >= 0);
+
+    /* 把接收窗口压到很小且全程不读，稳定触发服务端单帧 500ms 截止时间；
+     * 这比依赖网络拥塞或特定内核缓冲默认值更能锁住慢客户端隔离约束。 */
+    int receive_buffer = 1024;
+    assert(setsockopt(stream_fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
+                      sizeof(receive_buffer)) == 0);
+    send_request(stream_fd, "/stream.mjpg");
+    wait_for_clients(&ctx, 1);
+
+    unsigned char *jpeg = malloc(frame_size);
+    assert(jpeg != NULL);
+    memset(jpeg, 0x11, frame_size);
+    jpeg[0] = 0xff;
+    jpeg[1] = 0xd8;
+    jpeg[frame_size - 2] = 0xff;
+    jpeg[frame_size - 1] = 0xd9;
+
+    ipcam_frame_meta_t meta;
+    memset(&meta, 0, sizeof(meta));
+    meta.monotonic_ns = 223456789ULL;
+    meta.width = 1920;
+    meta.height = 1080;
+    meta.quality = 60;
+    assert(ipcam_ring_append_meta(rb, jpeg, frame_size, &meta) == 0);
+    free(jpeg);
+
+    ipcam_stream_perf_t perf;
+    memset(&perf, 0, sizeof(perf));
+    for (int i = 0; i < 250; i++) {
+        ipcam_stream_get_perf(&ctx, &perf);
+        if (perf.send_timeouts >= 1) break;
+        usleep(10 * 1000);
+    }
+    assert(perf.send_timeouts >= 1);
+
+    close(stream_fd);
+    ipcam_stream_stop(&ctx);
+    ipcam_ring_destroy(rb);
+}
+
 static void test_stop_wakes_waiting_clients(void)
 {
     volatile sig_atomic_t running = 1;
@@ -228,6 +346,8 @@ int main(void)
 {
     /* 网络写端断开时只应让客户端线程收尾，不应终止测试进程。 */
     signal(SIGPIPE, SIG_IGN);
+    test_stream_sends_validated_frame();
+    test_stream_times_out_slow_client();
     test_stop_wakes_waiting_clients();
     test_healthz_reports_closed_output();
     puts("ipcam stream lifecycle tests: PASS");

@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include "ipcam_display.h"
+#include "ipcam_encode.h"
 #include "ipcam_capture.h"
 #include "ipcam_light.h"
 #include "ipcam_record.h"
@@ -34,6 +35,8 @@ typedef struct ipcam_control_capabilities_s {
     size_t video_count;
     uint8_t jpeg_quality_min;
     uint8_t jpeg_quality_max;
+    uint8_t adaptive_quality;
+    uint8_t jpeg_quality_levels[3];
     uint8_t mirror_horizontal;
     uint8_t mirror_vertical;
     uint8_t preview_zoom;
@@ -78,6 +81,14 @@ typedef struct ipcam_control_status_s {
     uint64_t capture_frames;
     uint64_t capture_dropped_display;
     uint64_t capture_dropped_encode;
+    uint8_t configured_jpeg_quality;
+    uint8_t effective_jpeg_quality;
+    uint8_t adaptive_quality;
+    char pipeline[64];
+    char framebuffer_mode[24];
+    ipcam_encode_perf_t encode_perf;
+    ipcam_display_perf_t display_perf;
+    ipcam_record_perf_t record_perf;
     ipcam_record_status_t record;
 } ipcam_control_status_t;
 
@@ -127,10 +138,16 @@ typedef struct ipcam_control_ctx_s {
     ipcam_record_ctx_t *recorder;
     ipcam_capture_ctx_t *capture;
     ipcam_display_ctx_t *display;
+    ipcam_encode_ctx_t *encoder;
     ipcam_screen_ctx_t *screen;
     ipcam_ring_buffer_t *jpeg_live_rb;
     volatile sig_atomic_t *running;
     pthread_mutex_t mtx;
+    pthread_mutex_t status_mtx;
+    ipcam_control_status_t status_cache;
+    int status_cache_valid;
+    uint64_t last_network_probe_ns;
+    uint64_t last_storage_probe_ns;
     uint64_t next_request_id;
     ipcam_control_result_t results[16];
     size_t result_cursor;
@@ -152,6 +169,10 @@ int ipcam_control_get_capabilities(ipcam_control_ctx_t *ctx,
                                    ipcam_control_capabilities_t *out);
 int ipcam_control_get_status(ipcam_control_ctx_t *ctx,
                              ipcam_control_status_t *out);
+/* 每秒由 main 调用；网络最多 2 秒探测一次，存储最多 5 秒探测一次。 */
+int ipcam_control_refresh_status(ipcam_control_ctx_t *ctx, int force);
+/* 注入编码器引用，使状态能同时呈现配置质量和当前有效质量。 */
+void ipcam_control_set_encoder(ipcam_control_ctx_t *ctx, ipcam_encode_ctx_t *encoder);
 
 /* 串行校验并提交一个命令，request_id 可用于查询最终结果。 */
 int ipcam_control_submit_command(ipcam_control_ctx_t *ctx,

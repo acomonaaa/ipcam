@@ -23,8 +23,14 @@
 #define LIBIPCAM_STREAM_VERSION    0x00010001
 #define LIBIPCAM_NET_VERSION       0x00010001
 
-/* 库版本字符串（g_git_info 占位；实际项目用 git describe） */
-#define LIBIPCAM_GIT_INFO   "dev"
+/*
+ * 构建系统注入短 revision；未经过 Makefile 构建（例如单文件测试）时仍
+ * 保留可识别的 unknown，而不是把固定分支名误报成实际运行二进制版本。
+ */
+#ifndef IPCAM_GIT_REVISION
+#define IPCAM_GIT_REVISION   "unknown"
+#endif
+#define LIBIPCAM_GIT_INFO     IPCAM_GIT_REVISION
 #define LIBIPCAM_BUILD_USER "build"
 
 #define LIBIPCAM_LIB_VER_FMT(lib_name)                                   \

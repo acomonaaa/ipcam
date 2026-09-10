@@ -15,8 +15,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/time.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <stdint.h>
 #include <unistd.h>
 
@@ -70,44 +70,62 @@ static inline unsigned short yuyv_to_rgb565(int y, int u, int v)
  * src_w 必须 >= 2（YUYV 是 4:2:2 packed，每两像素一个 Cb/Cr）。
  */
 /* 依据视口和独立翻转选样，只写目标 framebuffer 区域，不改网络/录像帧。 */
-static void yuyv_to_rgb565_scaled(const unsigned char *src, int sw, int sh,
+static void yuyv_to_rgb565_scaled(ipcam_display_ctx_t *ctx,
+                                  const unsigned char *src, int sw, int sh,
                                   unsigned short *dst, int dw, int dh,
                                   int dst_stride_pixels,
                                   size_t src_stride,
                                   int crop_x, int crop_y, int crop_w, int crop_h,
                                   int mirror_h, int mirror_v)
 {
-    if (!src || !dst || sw < 2 || sh <= 0 || dw <= 0 || dh <= 0 ||
+    if (!ctx || !src || !dst || sw < 2 || sh <= 0 || dw <= 0 || dh <= 0 ||
         crop_w < 2 || crop_h < 1 || dst_stride_pixels < dw)
         return;  /* YUYV 4:2:2 需要至少 2 像素宽 */
 
     /* 原实现把两次整数除法放在每个目标像素内循环；P03 每帧约 28 万
-     * 像素，在 396MHz i.MX6ULL 上会直接把 LCD 帧率压低。映射表只在一帧
-     * 开始时计算一次，内层只保留指针加法和颜色转换，且仍保持最近邻语义。 */
-    uint32_t x_pair_offset[dw];
-    uint8_t x_luma_offset[dw];
-    int y_source[dh];
-    for (int dx = 0; dx < dw; dx++) {
-        int cx = dx * crop_w / dw;
-        int sx = mirror_h ? (crop_x + crop_w - 1 - cx) : (crop_x + cx);
-        int sx0 = sx & ~1;
-        if (sx0 >= sw - 1) sx0 = sw - 2;
-        if (sx0 < 0) sx0 = 0;
-        x_pair_offset[dx] = (uint32_t)(sx0 * 2);
-        x_luma_offset[dx] = (uint8_t)((sx & 1) ? 2 : 0);
-    }
-    for (int dy = 0; dy < dh; dy++) {
-        int cy = dy * crop_h / dh;
-        y_source[dy] = mirror_v ? (crop_y + crop_h - 1 - cy) : (crop_y + cy);
+     * 像素，在 396MHz i.MX6ULL 上会直接把 LCD 帧率压低。映射表只在
+     * 视口/尺寸/镜像改变时生成，帧内只保留指针加法和颜色转换。 */
+    if (!ctx->map_x_pair_offset || !ctx->map_x_luma_offset || !ctx->map_y_source)
+        return;
+    if (!ctx->map_valid || ctx->map_dw != dw || ctx->map_dh != dh ||
+        ctx->map_sw != sw || ctx->map_sh != sh || ctx->map_crop_x != crop_x ||
+        ctx->map_crop_y != crop_y || ctx->map_crop_w != crop_w ||
+        ctx->map_crop_h != crop_h || ctx->map_mirror_h != mirror_h ||
+        ctx->map_mirror_v != mirror_v) {
+        for (int dx = 0; dx < dw; dx++) {
+            int cx = dx * crop_w / dw;
+            int sx = mirror_h ? (crop_x + crop_w - 1 - cx) : (crop_x + cx);
+            int sx0 = sx & ~1;
+            if (sx0 >= sw - 1) sx0 = sw - 2;
+            if (sx0 < 0) sx0 = 0;
+            ctx->map_x_pair_offset[dx] = (uint32_t)(sx0 * 2);
+            ctx->map_x_luma_offset[dx] = (uint8_t)((sx & 1) ? 2 : 0);
+        }
+        for (int dy = 0; dy < dh; dy++) {
+            int cy = dy * crop_h / dh;
+            ctx->map_y_source[dy] = mirror_v ?
+                (crop_y + crop_h - 1 - cy) : (crop_y + cy);
+        }
+        ctx->map_dw = dw;
+        ctx->map_dh = dh;
+        ctx->map_sw = sw;
+        ctx->map_sh = sh;
+        ctx->map_crop_x = crop_x;
+        ctx->map_crop_y = crop_y;
+        ctx->map_crop_w = crop_w;
+        ctx->map_crop_h = crop_h;
+        ctx->map_mirror_h = mirror_h;
+        ctx->map_mirror_v = mirror_v;
+        ctx->map_valid = 1;
     }
 
     for (int dy = 0; dy < dh; dy++) {
-        const unsigned char *src_row = src + (size_t)y_source[dy] * src_stride;
+        const unsigned char *src_row = src + (size_t)ctx->map_y_source[dy] * src_stride;
         unsigned short *dst_row = dst + (size_t)dy * dst_stride_pixels;
         for (int dx = 0; dx < dw; dx++) {
-            const unsigned char *pair = src_row + x_pair_offset[dx];
+            const unsigned char *pair = src_row + ctx->map_x_pair_offset[dx];
             /* YUYV 每两像素一对 (Cb, Cr)，映射表已保证 pair 不越过行尾。 */
-            dst_row[dx] = yuyv_to_rgb565(pair[x_luma_offset[dx]],
+            dst_row[dx] = yuyv_to_rgb565(pair[ctx->map_x_luma_offset[dx]],
                                          pair[1], pair[3]);
         }
     }
@@ -209,6 +227,14 @@ static void display_clear_framebuffer(ipcam_display_ctx_t *ctx)
     pthread_mutex_unlock(&ctx->fb_mtx);
 }
 
+/* 返回单调纳秒时间；pan/转换耗时必须与系统校时解耦。 */
+static uint64_t display_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 /* 尝试把 visible framebuffer 扩展成两页；失败只关闭 VSYNC 切页能力，不影响旧路径。 */
 static int display_try_enable_pan(ipcam_display_ctx_t *ctx,
                                   struct fb_var_screeninfo *vinfo,
@@ -266,10 +292,83 @@ static int display_try_enable_pan(ipcam_display_ctx_t *ctx,
     ctx->fb_yres_virtual = (int)next_var.yres_virtual;
     ctx->fb_page_size = (size_t)page_size;
     ctx->fb_active_page = 0;
+    snprintf(ctx->fb_mode, sizeof(ctx->fb_mode), "double-buffer");
+    next_var.xoffset = 0;
+    next_var.yoffset = 0;
+    next_var.activate = FB_ACTIVATE_VBL;
+    ctx->fb_var_template = next_var;
+    ctx->fb_var_template_valid = 1;
     MLOGI("fb double buffer ready: virtual=%ux%u page=%zu ypanstep=%u "
           "present=FBIOPAN_DISPLAY(VSYNC)\n", next_var.xres, next_var.yres_virtual,
           ctx->fb_page_size, next_fix.ypanstep);
     return 1;
+}
+
+/*
+ * 在正式交给 LVGL 前验证 page1→page0 的真实 pan 闭环。
+ * 仅检查 yres_virtual/ypanstep 会漏掉“ioctl 返回成功但 yoffset 不生效”的
+ * BSP；本测试只在启动时做两次 pan + GET 读回，运行时不再为每帧 GET。
+ */
+static int display_pan_selftest(ipcam_display_ctx_t *ctx)
+{
+    if (!ctx || !ctx->fb_pan_enabled || !ctx->fb_base ||
+        ctx->fb_page_size == 0) return -1;
+
+    pthread_mutex_lock(&ctx->fb_mtx);
+    for (int page = 0; page < 2; page++) {
+        size_t offset = (size_t)page * ctx->fb_page_size;
+        if (offset >= ctx->fb_size || ctx->fb_page_size > ctx->fb_size - offset) {
+            pthread_mutex_unlock(&ctx->fb_mtx);
+            return -1;
+        }
+        /* 自测前再次清黑每页，避免把上一页业务画面误当成切页成功。 */
+        memset((unsigned char *)ctx->fb_base + offset, 0, ctx->fb_page_size);
+    }
+
+    struct fb_var_screeninfo base = ctx->fb_var_template;
+    if (!ctx->fb_var_template_valid) {
+        memset(&base, 0, sizeof(base));
+        base.xres = (uint32_t)ctx->fb_w;
+        base.yres = (uint32_t)ctx->fb_h;
+        base.yres_virtual = (uint32_t)ctx->fb_yres_virtual;
+        base.xres_virtual = (uint32_t)ctx->fb_w;
+    }
+    base.xoffset = 0;
+    base.activate = FB_ACTIVATE_VBL;
+    for (int pass = 0; pass < 2; pass++) {
+        int page = pass == 0 ? 1 : 0;
+        struct fb_var_screeninfo request = base;
+        struct fb_var_screeninfo readback;
+        request.yoffset = (uint32_t)page * (uint32_t)ctx->fb_h;
+        if (ioctl(ctx->fb_fd, FBIOPAN_DISPLAY, &request) < 0 ||
+            ioctl(ctx->fb_fd, FBIOGET_VSCREENINFO, &readback) < 0 ||
+            readback.xoffset != 0 || readback.yoffset != request.yoffset) {
+            MLOGE("fb pan self-test failed: page=%d request_y=%u\n",
+                  page, request.yoffset);
+            /* 尽量回到 page0；失败时仍然禁止运行时切页，不能依赖 memcpy 补救。 */
+            struct fb_var_screeninfo recovery = base;
+            recovery.xoffset = 0;
+            recovery.yoffset = 0;
+            (void)ioctl(ctx->fb_fd, FBIOPAN_DISPLAY, &recovery);
+            pthread_mutex_unlock(&ctx->fb_mtx);
+            return -1;
+        }
+        base = readback;
+    }
+
+    base.xoffset = 0;
+    base.yoffset = 0;
+    base.activate = FB_ACTIVATE_VBL;
+    ctx->fb_var_template = base;
+    ctx->fb_var_template_valid = 1;
+    ctx->fb_selftest_passed = 1;
+    ctx->fb_fault = 0;
+    ctx->fb_active_page = 0;
+    ctx->fb_xoffset = 0;
+    ctx->fb_yoffset = 0;
+    pthread_mutex_unlock(&ctx->fb_mtx);
+    MLOGI("fb pan self-test passed: page1->page0 yoffset=%d->0\n", ctx->fb_h);
+    return 0;
 }
 
 /* 打开并核验 framebuffer；实际节点由板级环境变量提供，失败只停本地预览。 */
@@ -330,6 +429,7 @@ static int display_open_fb(ipcam_display_ctx_t *ctx)
     }
     /* mxsfb 支持 yres_virtual=2*yres 和 ypanstep=1；启用后 LVGL 只切页，
      * 不再逐行覆盖 LCD 当前扫描的那一页，从根源上消除由扫描竞争造成的撕裂。 */
+    snprintf(ctx->fb_mode, sizeof(ctx->fb_mode), "partial-degraded");
     (void)display_try_enable_pan(ctx, &vinfo, &finfo);
 
     ctx->fb_w  = (int)vinfo.xres;
@@ -368,6 +468,14 @@ static int display_open_fb(ipcam_display_ctx_t *ctx)
     display_probe_backlight(ctx);
     /* 只清理可见页和备用页，不能把 32 MiB 的驱动映射区全部写零。 */
     display_clear_framebuffer(ctx);
+    if (ctx->fb_pan_enabled && display_pan_selftest(ctx) != 0) {
+        ctx->fb_pan_enabled = 0;
+        ctx->fb_selftest_passed = 0;
+        ctx->fb_fault = 1;
+        ctx->fb_pending_page = -1;
+        snprintf(ctx->fb_mode, sizeof(ctx->fb_mode), "partial-degraded");
+        MLOGE("fb mode=partial-degraded: dynamic video disabled until BSP pan is fixed\n");
+    }
     MLOGI("fb ready: visible=%dx%d virtual=%dx%d bpp=%d line_length=%d "
           "page=%zu pan=%d size=%zu\n", ctx->fb_w, ctx->fb_h,
           vinfo.xres_virtual, vinfo.yres_virtual, ctx->fb_bpp,
@@ -375,24 +483,65 @@ static int display_open_fb(ipcam_display_ctx_t *ctx)
     return 0;
 }
 
-/* 只读取显示专用最新帧副本；关闭预览/熄屏时停止转换，避免拖慢编码链路。 */
+/* 将已经完成转换的整屏帧写入备用页；pan 失败时绝不 memcpy 到当前可见页。 */
+static int display_write_full_frame(ipcam_display_ctx_t *ctx,
+                                    const unsigned short *source,
+                                    int width, int height, int stride)
+{
+    if (!ctx || !source || width != ctx->out_w || height != ctx->out_h ||
+        !ctx->fb_base) return -1;
+
+    /* LVGL 回退到直接写屏后也必须遵守同一条 pan 故障策略：先按秒重试
+     * pending page，失败期间不再写备用页并重复提交 ioctl，避免故障驱动被
+     * 每个视频帧轰击，也避免把未确认可见页当成安全目标。 */
+    if (ctx->fb_pan_enabled && ipcam_display_pan_fault(ctx))
+        (void)ipcam_display_retry_pan(ctx);
+
+    int page = 0;
+    pthread_mutex_lock(&ctx->fb_mtx);
+    if (ctx->fb_pan_enabled) {
+        if (ctx->fb_fault) {
+            pthread_mutex_unlock(&ctx->fb_mtx);
+            return -1;
+        }
+        page = 1 - ctx->fb_active_page;
+        size_t page_offset = (size_t)page * ctx->fb_page_size;
+        if (page_offset >= ctx->fb_size || ctx->fb_page_size > ctx->fb_size - page_offset) {
+            pthread_mutex_unlock(&ctx->fb_mtx);
+            return -1;
+        }
+        for (int y = 0; y < height; y++) {
+            memcpy((unsigned char *)ctx->fb_base + page_offset +
+                       (size_t)y * (size_t)ctx->fb_line_length,
+                   source + (size_t)y * (size_t)stride,
+                   (size_t)width * sizeof(*source));
+        }
+        pthread_mutex_unlock(&ctx->fb_mtx);
+        return ipcam_display_present_page(ctx, page);
+    }
+
+    /* 无 pan 时只保留历史兼容写屏；默认 LVGL 主流程会在启动阶段禁用动态视频。 */
+    for (int y = 0; y < height; y++) {
+        memcpy((unsigned char *)ctx->fb_base +
+                   (size_t)(y + ctx->fb_yoffset) * (size_t)ctx->fb_line_length +
+                   (size_t)ctx->fb_xoffset * sizeof(*source),
+               source + (size_t)y * (size_t)stride,
+               (size_t)width * sizeof(*source));
+    }
+    pthread_mutex_unlock(&ctx->fb_mtx);
+    return 0;
+}
+
+/* 只读取显示专用 ring 槽；转换完成并复制元数据后立即 release，避免复制 614KB 源帧。 */
 static void *display_thread(void *arg)
 {
     ipcam_display_ctx_t *ctx = arg;
     ipcam_frame_t frame;
     unsigned long frames = 0;
-    struct timeval t0, t1;
-    size_t src_cap = ipcam_ring_capacity(ctx->rb);
-    unsigned char *src_copy = src_cap ? malloc(src_cap) : NULL;
-    if (!src_copy) {
-        MLOGE("alloc display source copy failed (%zu bytes)\n", src_cap);
-        return NULL;
-    }
+    uint64_t thread_started_ns = display_now_ns();
     MLOGI("display thread start, out=%dx%d\n", ctx->out_w, ctx->out_h);
-    gettimeofday(&t0, NULL);
 
     int last_enabled = -1;
-    unsigned long last_seq = 0;
     while (*ctx->running && ctx->service_running) {
         int enabled;
         int view_flag;
@@ -409,7 +558,7 @@ static void *display_thread(void *arg)
         target_h = ctx->preview_h;
         target_stride = ctx->preview_stride_pixels;
         target_generation = ctx->preview_target_generation;
-        enabled = view_flag && !paused_flag &&
+        enabled = ctx->dynamic_video_enabled && view_flag && !paused_flag &&
                   target_w > 0 && target_h > 0 &&
                   ipcam_param_get_preview_enabled();
         zoom = ctx->zoom;
@@ -436,15 +585,16 @@ static void *display_thread(void *arg)
                   ctx->framebuffer_writer_enabled);
         last_enabled = 1;
 
-        int latest_rc = ipcam_ring_copy_latest(ctx->rb, src_copy, src_cap,
-                                               &frame, last_seq);
-        if (latest_rc != 0) {
-            /* copy_latest 是非阻塞查询；短暂让出 CPU，避免无帧时忙等。 */
-            usleep(latest_rc < 0 ? 50 * 1000 : 10 * 1000);
-            continue;
+        unsigned int stale_count = 0;
+        /* 条件变量等待新帧；显示线程持有 ring 槽直到转换和元数据复制完成。 */
+        int latest_rc = ipcam_ring_get_latest_ex(ctx->rb, &frame, &stale_count, 1000);
+        if (latest_rc == 1) continue;
+        if (latest_rc != 0) break;
+        if (stale_count > 0) {
+            pthread_mutex_lock(&ctx->stats_mtx);
+            ctx->stale_input_frames += stale_count;
+            pthread_mutex_unlock(&ctx->stats_mtx);
         }
-        last_seq = frame.seqNo;
-        frame.rawData = src_copy;
 
         /*
          * src 宽高由 capture 协商结果传入（ctx->src_w / src_h）。
@@ -458,6 +608,7 @@ static void *display_thread(void *arg)
         if (src_stride < (size_t)src_w * 2 || frame.size < expected) {
             MLOGW("frame size %zu/stride %zu invalid for %dx%d (%zu), skip\n",
                   frame.size, src_stride, src_w, src_h, expected);
+            ipcam_ring_release(ctx->rb);
             continue;
         }
 
@@ -490,56 +641,68 @@ static void *display_thread(void *arg)
         pthread_mutex_lock(&ctx->view_mtx);
         int target_stale = target_generation != ctx->preview_target_generation;
         pthread_mutex_unlock(&ctx->view_mtx);
-        if (target_stale) continue;
+        if (target_stale) {
+            ipcam_ring_release(ctx->rb);
+            continue;
+        }
 
-        /* 直接转换到当前视频窗口大小；LVGL 只需复制同尺寸 RGB565，不再执行
-         * 800×480 全屏转换、全帧复制和 image stretch，降低 i.MX6ULL CPU 负担。 */
-        pthread_mutex_lock(&ctx->preview_mtx);
-        yuyv_to_rgb565_scaled(frame.rawData, src_w, src_h,
-                              ctx->preview_base, target_w, target_h, target_stride,
-                              src_stride,
-                              crop_x, crop_y, crop_w, crop_h,
+        /* 直接转换到 work buffer；front buffer 始终可被 GUI 复制，交换只持有
+         * preview_mtx 的极短临界区，避免 LVGL 与转换线程互相阻塞。 */
+        uint64_t convert_started_ns = display_now_ns();
+        yuyv_to_rgb565_scaled(ctx, frame.rawData, src_w, src_h,
+                              ctx->preview_work, target_w, target_h, target_stride,
+                              src_stride, crop_x, crop_y, crop_w, crop_h,
                               ipcam_param_get_mirror_horizontal(),
                               ipcam_param_get_mirror_vertical());
-        if (ctx->framebuffer_writer_enabled &&
-            target_w == ctx->out_w && target_h == ctx->out_h) {
-            pthread_mutex_lock(&ctx->fb_mtx);
-            for (int y = 0; y < target_h; y++) {
-                memcpy((unsigned char *)ctx->fb_base +
-                           (size_t)(y + ctx->fb_yoffset) * ctx->fb_line_length +
-                           (size_t)ctx->fb_xoffset * sizeof(*ctx->preview_base),
-                       ctx->preview_base + (size_t)y * target_stride,
-                       (size_t)target_w * sizeof(*ctx->preview_base));
-            }
-            pthread_mutex_unlock(&ctx->fb_mtx);
+        uint64_t convert_ended_ns = display_now_ns();
+        if (ctx->framebuffer_writer_enabled && target_w == ctx->out_w &&
+            target_h == ctx->out_h)
+            (void)display_write_full_frame(ctx, ctx->preview_work,
+                                           target_w, target_h, target_stride);
+
+        /* 页面切换可能恰好发生在转换后；旧目标的帧不能发布给新页面。 */
+        pthread_mutex_lock(&ctx->view_mtx);
+        target_stale = target_generation != ctx->preview_target_generation;
+        pthread_mutex_unlock(&ctx->view_mtx);
+        if (target_stale) {
+            ipcam_ring_release(ctx->rb);
+            continue;
         }
+
+        pthread_mutex_lock(&ctx->preview_mtx);
+        unsigned short *published = ctx->preview_work;
+        ctx->preview_work = ctx->preview_base;
+        ctx->preview_base = published;
         ctx->preview_frame = frame;
         ctx->preview_frame.rawData = ctx->preview_base;
-        ctx->preview_frame.size = ctx->preview_size;
+        ctx->preview_frame.size = (size_t)target_w * (size_t)target_h * sizeof(uint16_t);
         ctx->preview_frame.width = (uint16_t)target_w;
         ctx->preview_frame.height = (uint16_t)target_h;
         ctx->preview_frame.stride = (uint32_t)target_stride * 2U;
         ctx->preview_frame.pixel_format = IPCAM_PIXEL_FORMAT_RGB565;
         ctx->preview_valid = 1;
         pthread_mutex_unlock(&ctx->preview_mtx);
+        ipcam_ring_release(ctx->rb);
         pthread_mutex_lock(&ctx->stats_mtx);
         ctx->frames_rendered++;
+        if (convert_ended_ns > convert_started_ns)
+            ipcam_perf_window_add(&ctx->convert_window,
+                                  convert_ended_ns - convert_started_ns);
         pthread_mutex_unlock(&ctx->stats_mtx);
         frames++;
-        /* 与 BCF2 视频线程一致，首批帧和周期帧带上源序号/时间戳，便于把 LCD
-         * 卡顿与 CSI、颜色转换或 framebuffer 提交区分开。 */
-        if (frames <= 3 || (frames % 30) == 0) {
+        /* 只打印首 3 帧，避免日志 I/O 在 15 FPS 热路径中反过来制造卡顿。 */
+        if (frames <= 3) {
             MLOGI("frame no=%lu src_seq=%lu ts=%llu src=%dx%d crop=%dx%d+%d+%d\n",
                   frames, frame.seqNo, (unsigned long long)frame.monotonic_ns,
                   src_w, src_h, crop_w, crop_h, crop_x, crop_y);
         }
     }
 
-    gettimeofday(&t1, NULL);
-    double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) / 1e6;
+    uint64_t thread_ended_ns = display_now_ns();
+    double sec = thread_ended_ns > thread_started_ns ?
+                 (double)(thread_ended_ns - thread_started_ns) / 1e9 : 0.0;
     MLOGI("display thread exit, frames=%lu avg_fps=%.1f\n",
-          frames, sec > 0 ? frames / sec : 0);
-    free(src_copy);
+          frames, sec > 0 ? frames / sec : 0.0);
     return NULL;
 }
 
@@ -556,6 +719,8 @@ int ipcam_display_start_ex(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
     (void)pthread_once(&s_yuyv_lut_once, yuyv_init_lut);
     ctx->fb_fd = -1;
     ctx->fb_base = NULL;
+    ctx->fb_pending_page = -1;
+    snprintf(ctx->fb_mode, sizeof(ctx->fb_mode), "partial-degraded");
     ctx->rb = rb;
     ctx->running = running;
     ctx->service_running = 1;
@@ -566,6 +731,8 @@ int ipcam_display_start_ex(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
     pthread_mutex_init(&ctx->view_mtx, NULL);
     pthread_mutex_init(&ctx->preview_mtx, NULL);
     pthread_mutex_init(&ctx->stats_mtx, NULL);
+    ipcam_perf_window_init(&ctx->convert_window);
+    ipcam_perf_window_init(&ctx->pan_window);
     ctx->view_enabled = ipcam_param_get_preview_enabled() ? 1 : 0;
     ctx->zoom = 1.0f;
     ctx->center_x = 0.5f;
@@ -578,6 +745,12 @@ int ipcam_display_start_ex(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
         pthread_mutex_destroy(&ctx->view_mtx);
         return -1;
     }
+    /* 单页/自检失败时保留静态显示能力，但禁止显示线程继续制造动态视频，
+     * 否则后续 LVGL partial-copy 或直接写屏仍会在扫描期间覆盖可见页。 */
+    ctx->dynamic_video_enabled = ctx->fb_pan_enabled ? 1 : 0;
+    if (!ctx->dynamic_video_enabled) ctx->framebuffer_writer_enabled = 0;
+    if (!ctx->dynamic_video_enabled)
+        MLOGW("fb mode=%s: local dynamic video disabled\n", ctx->fb_mode);
     if (ctx->out_w <= 0 || ctx->out_h <= 0 ||
         (size_t)ctx->out_w > SIZE_MAX / (size_t)ctx->out_h / sizeof(*ctx->preview_base)) {
         MLOGE("invalid framebuffer dimensions %dx%d\n", ctx->out_w, ctx->out_h);
@@ -610,6 +783,30 @@ int ipcam_display_start_ex(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
         pthread_mutex_destroy(&ctx->view_mtx);
         return -1;
     }
+    ctx->preview_work = calloc(1, ctx->preview_capacity);
+    ctx->map_x_pair_offset = calloc((size_t)ctx->out_w, sizeof(*ctx->map_x_pair_offset));
+    ctx->map_x_luma_offset = calloc((size_t)ctx->out_w, sizeof(*ctx->map_x_luma_offset));
+    ctx->map_y_source = calloc((size_t)ctx->out_h, sizeof(*ctx->map_y_source));
+    if (!ctx->preview_work || !ctx->map_x_pair_offset ||
+        !ctx->map_x_luma_offset || !ctx->map_y_source) {
+        MLOGE("alloc preview double buffer or mapping cache failed\n");
+        free(ctx->preview_work);
+        free(ctx->map_x_pair_offset);
+        free(ctx->map_x_luma_offset);
+        free(ctx->map_y_source);
+        free(ctx->preview_base);
+        ctx->preview_work = NULL;
+        ctx->preview_base = NULL;
+        munmap(ctx->fb_base, ctx->fb_size);
+        ctx->fb_base = NULL;
+        close(ctx->fb_fd);
+        ctx->fb_fd = -1;
+        pthread_mutex_destroy(&ctx->fb_mtx);
+        pthread_mutex_destroy(&ctx->stats_mtx);
+        pthread_mutex_destroy(&ctx->preview_mtx);
+        pthread_mutex_destroy(&ctx->view_mtx);
+        return -1;
+    }
     /* 背光已经在 display_open_fb 中自动探测；失败不能阻塞视频服务启动。 */
     if (ipcam_display_set_backlight(ctx, ipcam_param_get_backlight_percent()) != 0)
         MLOGW("backlight initial state unavailable; sleep will use best-effort fb blank\n");
@@ -620,7 +817,12 @@ int ipcam_display_start_ex(ipcam_display_ctx_t *ctx, ipcam_ring_buffer_t *rb,
         MLOGE("pthread_create display failed\n");
         if (ctx->fb_base) munmap(ctx->fb_base, ctx->fb_size);
         if (ctx->fb_fd >= 0) close(ctx->fb_fd);
+        free(ctx->map_x_pair_offset);
+        free(ctx->map_x_luma_offset);
+        free(ctx->map_y_source);
+        free(ctx->preview_work);
         free(ctx->preview_base);
+        ctx->preview_work = NULL;
         ctx->preview_base = NULL;
         s_default_display = NULL;
         pthread_mutex_destroy(&ctx->fb_mtx);
@@ -670,6 +872,14 @@ void ipcam_display_stop(ipcam_display_ctx_t *ctx)
     }
     free(ctx->preview_base);
     ctx->preview_base = NULL;
+    free(ctx->preview_work);
+    ctx->preview_work = NULL;
+    free(ctx->map_x_pair_offset);
+    free(ctx->map_x_luma_offset);
+    free(ctx->map_y_source);
+    ctx->map_x_pair_offset = NULL;
+    ctx->map_x_luma_offset = NULL;
+    ctx->map_y_source = NULL;
     ctx->preview_size = 0;
     ctx->preview_capacity = 0;
     if (s_default_display == ctx) s_default_display = NULL;
@@ -684,8 +894,12 @@ void ipcam_display_stop(ipcam_display_ctx_t *ctx)
 void ipcam_display_set_framebuffer_writer(ipcam_display_ctx_t *ctx, int enabled)
 {
     if (!ctx) return;
-    ctx->framebuffer_writer_enabled = enabled ? 1 : 0;
-    if (enabled)
+    int allowed = enabled && ctx->fb_pan_enabled;
+    ctx->framebuffer_writer_enabled = allowed ? 1 : 0;
+    if (enabled && !allowed)
+        MLOGW("framebuffer writer rejected in mode=%s; dynamic video remains disabled\n",
+              ctx->fb_mode);
+    if (allowed)
         (void)ipcam_display_set_preview_target(ctx, ctx->out_w, ctx->out_h);
 }
 
@@ -826,6 +1040,36 @@ void ipcam_display_get_stats(ipcam_display_ctx_t *ctx, uint64_t *rendered)
     pthread_mutex_unlock(&ctx->stats_mtx);
 }
 
+/* 复制显示统计快照；窗口中的 P95 只读固定数组，不调用任何设备 ioctl。 */
+void ipcam_display_get_perf(ipcam_display_ctx_t *ctx, ipcam_display_perf_t *out)
+{
+    if (!ctx || !out) return;
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&ctx->stats_mtx);
+    out->frames_rendered = ctx->frames_rendered;
+    out->stale_input_frames = ctx->stale_input_frames;
+    out->convert_avg_ns = ipcam_perf_window_avg(&ctx->convert_window);
+    out->convert_p95_ns = ipcam_perf_window_p95(&ctx->convert_window);
+    out->convert_max_ns = ipcam_perf_window_max(&ctx->convert_window);
+    pthread_mutex_unlock(&ctx->stats_mtx);
+
+    pthread_mutex_lock(&ctx->fb_mtx);
+    out->pan_count = ctx->fb_pan_count;
+    out->pan_failures = ctx->fb_pan_failures;
+    out->framebuffer_pan_enabled = ctx->fb_pan_enabled;
+    out->framebuffer_selftest_passed = ctx->fb_selftest_passed;
+    out->framebuffer_fault = ctx->fb_fault;
+    out->framebuffer_active_page = ctx->fb_active_page;
+    snprintf(out->framebuffer_mode, sizeof(out->framebuffer_mode), "%s", ctx->fb_mode);
+    pthread_mutex_unlock(&ctx->fb_mtx);
+
+    pthread_mutex_lock(&ctx->stats_mtx);
+    out->pan_avg_ns = ipcam_perf_window_avg(&ctx->pan_window);
+    out->pan_p95_ns = ipcam_perf_window_p95(&ctx->pan_window);
+    out->pan_max_ns = ipcam_perf_window_max(&ctx->pan_window);
+    pthread_mutex_unlock(&ctx->stats_mtx);
+}
+
 /* 复制最新 RGB565 预览帧；复制期间锁住工作缓冲，调用方无需归还槽位。 */
 int ipcam_display_preview_acquire(ipcam_display_ctx_t *ctx,
                                   void *out_data, size_t out_cap,
@@ -856,7 +1100,7 @@ void *ipcam_display_framebuffer_page(ipcam_display_ctx_t *ctx, int page)
 {
     if (!ctx || !ctx->fb_base || page < 0 || page > 1 ||
         (page == 1 && !ctx->fb_pan_enabled) ||
-        ctx->fb_page_size == 0 || (size_t)page > ctx->fb_size / ctx->fb_page_size)
+        ctx->fb_page_size == 0 || (size_t)page >= ctx->fb_size / ctx->fb_page_size)
         return NULL;
     size_t offset = (size_t)page * ctx->fb_page_size;
     if (offset >= ctx->fb_size || ctx->fb_page_size > ctx->fb_size - offset)
@@ -871,27 +1115,93 @@ void *ipcam_display_framebuffer_page(ipcam_display_ctx_t *ctx, int page)
 int ipcam_display_present_page(ipcam_display_ctx_t *ctx, int page)
 {
     if (!ctx || !ctx->fb_pan_enabled || page < 0 || page > 1) return -1;
+    uint64_t started_ns = display_now_ns();
     pthread_mutex_lock(&ctx->fb_mtx);
-    struct fb_var_screeninfo vinfo;
-    int rc = ioctl(ctx->fb_fd, FBIOGET_VSCREENINFO, &vinfo);
-    if (rc == 0) {
-        vinfo.xoffset = 0;
-        vinfo.yoffset = (uint32_t)page * (uint32_t)ctx->fb_h;
-        /* 仅设置 yoffset 并不保证驱动等待扫描垂直消隐；显式请求 VBL
-         * 是消除全屏页面逐行撕裂的关键，mxsfb 会在下一次 VSYNC 切页。 */
-        vinfo.activate = FB_ACTIVATE_VBL;
-        rc = ioctl(ctx->fb_fd, FBIOPAN_DISPLAY, &vinfo);
+    int rc = -1;
+    if (ctx->fb_var_template_valid) {
+        struct fb_var_screeninfo request = ctx->fb_var_template;
+        request.xoffset = 0;
+        request.yoffset = (uint32_t)page * (uint32_t)ctx->fb_h;
+        /* 只提交启动时保存的 var 模板，避免每帧 FBIOGET 把控制 ioctl 变成瓶颈。 */
+        request.activate = FB_ACTIVATE_VBL;
+        rc = ioctl(ctx->fb_fd, FBIOPAN_DISPLAY, &request);
     }
     if (rc == 0) {
-        ctx->fb_xoffset = (int)vinfo.xoffset;
-        ctx->fb_yoffset = (int)vinfo.yoffset;
+        ctx->fb_xoffset = 0;
+        ctx->fb_yoffset = page * ctx->fb_h;
         ctx->fb_active_page = page;
+        ctx->fb_fault = 0;
+        ctx->fb_pending_page = -1;
+        ctx->fb_pan_count++;
     } else {
+        ctx->fb_pan_failures++;
+        ctx->fb_fault = 1;
+        ctx->fb_pending_page = page;
         MLOGW("fb page present failed: page=%d errno=%d(%s)\n", page, errno,
               strerror(errno));
     }
     pthread_mutex_unlock(&ctx->fb_mtx);
+    uint64_t ended_ns = display_now_ns();
+    if (ended_ns > started_ns) {
+        pthread_mutex_lock(&ctx->stats_mtx);
+        ipcam_perf_window_add(&ctx->pan_window, ended_ns - started_ns);
+        pthread_mutex_unlock(&ctx->stats_mtx);
+    }
     return rc;
+}
+
+/* pan 失败时由 LVGL 主循环每秒调用一次，避免故障驱动被每个 flush 持续轰击。 */
+int ipcam_display_retry_pan(ipcam_display_ctx_t *ctx)
+{
+    if (!ctx || !ctx->fb_pan_enabled) return -1;
+    uint64_t now = display_now_ns();
+    int page;
+    pthread_mutex_lock(&ctx->fb_mtx);
+    if (!ctx->fb_fault || ctx->fb_pending_page < 0 ||
+        (now && ctx->fb_last_retry_ns && now - ctx->fb_last_retry_ns < 1000000000ULL)) {
+        pthread_mutex_unlock(&ctx->fb_mtx);
+        return 0;
+    }
+    ctx->fb_last_retry_ns = now;
+    page = ctx->fb_pending_page;
+    pthread_mutex_unlock(&ctx->fb_mtx);
+    return ipcam_display_present_page(ctx, page);
+}
+
+int ipcam_display_pan_fault(ipcam_display_ctx_t *ctx)
+{
+    if (!ctx) return 1;
+    pthread_mutex_lock(&ctx->fb_mtx);
+    int fault = ctx->fb_fault;
+    pthread_mutex_unlock(&ctx->fb_mtx);
+    return fault;
+}
+
+/*
+ * 复制当前可见页为紧凑 RGB565 快照。
+ * 熄屏提示只在状态边沿调用，故这里允许一次整屏 copy；运行中的视频帧不走
+ * 该接口，也不会把扫描中的页面复制回自身。
+ */
+int ipcam_display_snapshot_visible(ipcam_display_ctx_t *ctx,
+                                    void *out_data, size_t out_cap)
+{
+    if (!ctx || !out_data || !ctx->fb_base || ctx->fb_w <= 0 || ctx->fb_h <= 0)
+        return -1;
+    size_t row_bytes = (size_t)ctx->fb_w * sizeof(uint16_t);
+    if ((size_t)ctx->fb_h > SIZE_MAX / row_bytes ||
+        row_bytes * (size_t)ctx->fb_h > out_cap)
+        return -1;
+
+    pthread_mutex_lock(&ctx->fb_mtx);
+    int yoffset = ctx->fb_yoffset;
+    for (int y = 0; y < ctx->fb_h; y++) {
+        const unsigned char *source = (const unsigned char *)ctx->fb_base +
+            (size_t)(y + yoffset) * (size_t)ctx->fb_line_length +
+            (size_t)ctx->fb_xoffset * sizeof(uint16_t);
+        memcpy((unsigned char *)out_data + (size_t)y * row_bytes, source, row_bytes);
+    }
+    pthread_mutex_unlock(&ctx->fb_mtx);
+    return 0;
 }
 
 /* 仅供无 pan 能力的兼容路径使用；运行时 pan 失败时不能在扫描期间整页 memcpy。 */

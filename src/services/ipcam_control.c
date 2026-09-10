@@ -19,6 +19,7 @@
 #include <linux/input.h>
 #include <netinet/in.h>
 #include <sys/ioctl.h>
+#include <time.h>
 
 /*
  * 首版只把 640×480@15 作为对外能力。驱动即使声称支持更多档位，
@@ -118,6 +119,12 @@ static void fill_capabilities(const ipcam_control_ctx_t *ctx,
     caps->video_count = 1;
     caps->jpeg_quality_min = 1;
     caps->jpeg_quality_max = 100;
+    caps->adaptive_quality = 1;
+    const char *adaptive_env = getenv("IPCAM_JPEG_ADAPTIVE");
+    if (adaptive_env && !strcmp(adaptive_env, "0")) caps->adaptive_quality = 0;
+    caps->jpeg_quality_levels[0] = IPCAM_JPEG_QUALITY;
+    caps->jpeg_quality_levels[1] = IPCAM_JPEG_QUALITY > 5 ? IPCAM_JPEG_QUALITY - 5 : 1;
+    caps->jpeg_quality_levels[2] = IPCAM_JPEG_QUALITY > 10 ? IPCAM_JPEG_QUALITY - 10 : 1;
     caps->mirror_horizontal = 1;
     caps->mirror_vertical = 1;
     /* 没有成功打开 LCD 时，本地视口和熄屏服务都不可用；网络/录像
@@ -157,10 +164,11 @@ static ipcam_control_result_t *find_result_locked(ipcam_control_ctx_t *ctx,
     return NULL;
 }
 
-/* 读取有线网卡和 SD 卡状态；GUI/HTTP 共用同一份挂载与容量快照。 */
-static void fill_link_storage(ipcam_control_status_t *status,
-                              ipcam_record_ctx_t *recorder)
+/* 读取网络状态；调用频率由 control_refresh_status 限制到最多每 2 秒一次。 */
+static void fill_network_status(ipcam_control_status_t *status)
 {
+    status->network_link = 0;
+    status->network_ip[0] = '\0';
     const char *iface = getenv("IPCAM_NET_IFACE");
     if (!iface || !*iface) iface = "eth0";
     struct ifaddrs *list = NULL;
@@ -176,6 +184,21 @@ static void fill_link_storage(ipcam_control_status_t *status,
         }
         freeifaddrs(list);
     }
+}
+
+/* 读取 SD 身份/空间；该函数只在低频状态刷新阶段执行，不允许放进 get_status。 */
+static void fill_storage_status(ipcam_control_status_t *status,
+                                 ipcam_record_ctx_t *recorder)
+{
+    /* 每次低频刷新先清掉上一轮身份；未挂载时不能残留旧设备名。 */
+    status->storage_mounted = 0;
+    status->storage_total_bytes = 0;
+    status->storage_used_bytes = 0;
+    status->storage_available_bytes = 0;
+    status->storage_format_supported = 0;
+    memset(status->storage_mount_path, 0, sizeof(status->storage_mount_path));
+    memset(status->storage_device, 0, sizeof(status->storage_device));
+    memset(status->storage_fs_type, 0, sizeof(status->storage_fs_type));
     if (recorder) {
         ipcam_storage_info_t info;
         memset(&info, 0, sizeof(info));
@@ -191,6 +214,102 @@ static void fill_link_storage(ipcam_control_status_t *status,
                  info.device);
         snprintf(status->storage_fs_type, sizeof(status->storage_fs_type), "%s",
                  info.fs_type);
+    }
+}
+
+/* 状态刷新本身不能使用墙上时钟；单调时钟只用于控制探测节流。 */
+static uint64_t control_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/*
+ * 填写不会触发文件系统/网络探测的快速状态部分。调用者传入的 status
+ * 可能带有上一轮低频网络和存储快照，故本函数只覆盖实时服务字段，避免
+ * HTTP 查询因为 getifaddrs/statvfs 进入媒体线程的慢路径。
+ */
+static void fill_fast_status(const ipcam_control_ctx_t *ctx,
+                             ipcam_control_status_t *status)
+{
+    if (!ctx || !status) return;
+    status->video.width = ctx->capture && ctx->capture->width > 0 ?
+                          (uint16_t)ctx->capture->width : ipcam_param_get_capture_w();
+    status->video.height = ctx->capture && ctx->capture->height > 0 ?
+                           (uint16_t)ctx->capture->height : ipcam_param_get_capture_h();
+    status->video.target_fps = ipcam_param_get_target_fps();
+    status->video.jpeg_quality = ipcam_param_get_jpeg_quality();
+    status->configured_jpeg_quality = status->video.jpeg_quality;
+    status->mirror_horizontal = ipcam_param_get_mirror_horizontal();
+    status->mirror_vertical = ipcam_param_get_mirror_vertical();
+    status->preview_enabled = ipcam_param_get_preview_enabled();
+    status->backlight_percent = ipcam_param_get_backlight_percent();
+    status->light_percent = (uint8_t)ipcam_light_get_percent();
+    status->screen_timeout_min = ipcam_param_get_screen_timeout_min();
+    status->config_generation = ipcam_param_get_generation();
+    status->capture_fps = 0;
+    status->output_fps = 0;
+    status->preview_view_enabled = 0;
+    status->preview_zoom = 1.0f;
+    status->preview_center_x = 0.5f;
+    status->preview_center_y = 0.5f;
+    status->jpeg_live_frames = 0;
+    status->jpeg_live_dropped = 0;
+    status->jpeg_record_frames = 0;
+    status->jpeg_record_dropped = 0;
+    status->capture_frames = 0;
+    status->capture_dropped_display = 0;
+    status->capture_dropped_encode = 0;
+    memset(&status->encode_perf, 0, sizeof(status->encode_perf));
+    memset(&status->display_perf, 0, sizeof(status->display_perf));
+    memset(&status->record_perf, 0, sizeof(status->record_perf));
+    memset(&status->record, 0, sizeof(status->record));
+    snprintf(status->pipeline, sizeof(status->pipeline), "%s",
+             "capture->yuyv420->jpeg->live+record");
+    snprintf(status->framebuffer_mode, sizeof(status->framebuffer_mode), "%s",
+             "unavailable");
+
+    if (ctx->capture) {
+        status->capture_fps = ctx->capture->actual_fps;
+        if (ctx->capture->actual_fps == 0 ||
+            ctx->capture->actual_fps >= ctx->capture->target_fps)
+            status->output_fps = ctx->capture->target_fps;
+        else
+            status->output_fps = ctx->capture->actual_fps;
+        ipcam_capture_get_stats((ipcam_capture_ctx_t *)ctx->capture,
+                                &status->capture_frames,
+                                &status->capture_dropped_display,
+                                &status->capture_dropped_encode);
+    }
+    if (ctx->display) {
+        ipcam_display_get_view(ctx->display, &status->preview_view_enabled,
+                               &status->preview_zoom, &status->preview_center_x,
+                               &status->preview_center_y);
+        ipcam_display_get_perf(ctx->display, &status->display_perf);
+        snprintf(status->framebuffer_mode, sizeof(status->framebuffer_mode), "%s",
+                 status->display_perf.framebuffer_mode[0] ?
+                 status->display_perf.framebuffer_mode : "unknown");
+    }
+    if (ctx->jpeg_live_rb) {
+        status->jpeg_live_frames = ipcam_ring_count(ctx->jpeg_live_rb);
+        status->jpeg_live_dropped = ipcam_ring_dropped_count(ctx->jpeg_live_rb);
+    }
+    if (ctx->recorder) {
+        ipcam_record_get_status(ctx->recorder, &status->record);
+        ipcam_record_get_perf(ctx->recorder, &status->record_perf);
+        status->jpeg_record_frames = ipcam_ring_count(ctx->recorder->jpeg_rb);
+        status->jpeg_record_dropped = ipcam_ring_dropped_count(ctx->recorder->jpeg_rb);
+    }
+    if (ctx->encoder) {
+        ipcam_encode_get_perf(ctx->encoder, &status->encode_perf);
+        status->configured_jpeg_quality = status->encode_perf.configured_quality;
+        status->effective_jpeg_quality = status->encode_perf.effective_quality;
+        status->adaptive_quality = status->encode_perf.adaptive_quality;
+    } else {
+        status->effective_jpeg_quality = status->configured_jpeg_quality;
+        const char *adaptive_env = getenv("IPCAM_JPEG_ADAPTIVE");
+        status->adaptive_quality = !(adaptive_env && !strcmp(adaptive_env, "0"));
     }
 }
 
@@ -424,7 +543,11 @@ int ipcam_control_init(ipcam_control_ctx_t *ctx,
 {
     if (!ctx) return -1;
     memset(ctx, 0, sizeof(*ctx));
-    pthread_mutex_init(&ctx->mtx, NULL);
+    if (pthread_mutex_init(&ctx->mtx, NULL) != 0) return -1;
+    if (pthread_mutex_init(&ctx->status_mtx, NULL) != 0) {
+        pthread_mutex_destroy(&ctx->mtx);
+        return -1;
+    }
     ctx->capture = capture;
     ctx->recorder = recorder;
     ctx->display = display;
@@ -433,6 +556,8 @@ int ipcam_control_init(ipcam_control_ctx_t *ctx,
     ctx->running = running;
     ctx->next_request_id = 0;
     ctx->initialized = 1;
+    /* 首次强制刷新只做一次低频探测，之后 HTTP 读取永远只复制缓存。 */
+    (void)ipcam_control_refresh_status(ctx, 1);
     MLOGI("control service ready: capture=%s display=%s screen=%s recorder=%s\n",
           capture ? "yes" : "no", display ? "yes" : "no",
           screen ? "yes" : "no", recorder ? "yes" : "no");
@@ -444,6 +569,7 @@ void ipcam_control_deinit(ipcam_control_ctx_t *ctx)
 {
     if (!ctx || !ctx->initialized) return;
     MLOGI("control service stopping\n");
+    pthread_mutex_destroy(&ctx->status_mtx);
     pthread_mutex_destroy(&ctx->mtx);
     ctx->initialized = 0;
     MLOGI("control service stopped\n");
@@ -464,49 +590,63 @@ int ipcam_control_get_status(ipcam_control_ctx_t *ctx,
                              ipcam_control_status_t *out)
 {
     if (!ctx || !ctx->initialized || !out) return -1;
-    memset(out, 0, sizeof(*out));
-    out->video.width = ctx->capture && ctx->capture->width > 0 ?
-                       (uint16_t)ctx->capture->width : ipcam_param_get_capture_w();
-    out->video.height = ctx->capture && ctx->capture->height > 0 ?
-                        (uint16_t)ctx->capture->height : ipcam_param_get_capture_h();
-    out->video.target_fps = ipcam_param_get_target_fps();
-    out->video.jpeg_quality = ipcam_param_get_jpeg_quality();
-    out->mirror_horizontal = ipcam_param_get_mirror_horizontal();
-    out->mirror_vertical = ipcam_param_get_mirror_vertical();
-    out->preview_enabled = ipcam_param_get_preview_enabled();
-    out->backlight_percent = ipcam_param_get_backlight_percent();
-    out->light_percent = (uint8_t)ipcam_light_get_percent();
-    out->screen_timeout_min = ipcam_param_get_screen_timeout_min();
-    out->config_generation = ipcam_param_get_generation();
-    if (ctx->capture) {
-        out->capture_fps = ctx->capture->actual_fps;
-        /* 驱动高于目标时由采集线程软件选帧，输出仍按目标上限；驱动
-         * 低于目标时不能虚报，只有这一路返回真实的较低值。驱动不返回
-         * 实际帧率（0）时也保留软件目标，实测值由 metrics 日志给出。 */
-        if (ctx->capture->actual_fps == 0 ||
-            ctx->capture->actual_fps >= ctx->capture->target_fps)
-            out->output_fps = ctx->capture->target_fps;
-        else
-            out->output_fps = ctx->capture->actual_fps;
+    pthread_mutex_lock(&ctx->status_mtx);
+    if (!ctx->status_cache_valid) {
+        pthread_mutex_unlock(&ctx->status_mtx);
+        return -1;
     }
-    if (ctx->display) {
-        ipcam_display_get_view(ctx->display, &out->preview_view_enabled,
-                               &out->preview_zoom, &out->preview_center_x,
-                               &out->preview_center_y);
-    }
-    if (ctx->jpeg_live_rb) out->jpeg_live_frames = ipcam_ring_count(ctx->jpeg_live_rb);
-    if (ctx->jpeg_live_rb) out->jpeg_live_dropped = ipcam_ring_dropped_count(ctx->jpeg_live_rb);
-    if (ctx->recorder) {
-        ipcam_record_get_status(ctx->recorder, &out->record);
-        out->jpeg_record_frames = ipcam_ring_count(ctx->recorder->jpeg_rb);
-        out->jpeg_record_dropped = ipcam_ring_dropped_count(ctx->recorder->jpeg_rb);
-    }
-    if (ctx->capture)
-        ipcam_capture_get_stats(ctx->capture, &out->capture_frames,
-                                &out->capture_dropped_display,
-                                &out->capture_dropped_encode);
-    fill_link_storage(out, ctx->recorder);
+    *out = ctx->status_cache;
+    pthread_mutex_unlock(&ctx->status_mtx);
     return 0;
+}
+
+/*
+ * 按固定周期更新状态缓存。快速服务计数每秒刷新，网络和存储分别采用
+ * 2 秒/5 秒节流；force 只用于启动或明确要求立即反映外部状态的场景。
+ */
+int ipcam_control_refresh_status(ipcam_control_ctx_t *ctx, int force)
+{
+    if (!ctx || !ctx->initialized) return -1;
+    uint64_t now = control_now_ns();
+    ipcam_control_status_t next;
+    int network_due, storage_due;
+    uint64_t last_network, last_storage;
+
+    pthread_mutex_lock(&ctx->status_mtx);
+    next = ctx->status_cache;
+    last_network = ctx->last_network_probe_ns;
+    last_storage = ctx->last_storage_probe_ns;
+    network_due = force || last_network == 0 ||
+                  (now && now - last_network >= 2000000000ULL);
+    storage_due = force || last_storage == 0 ||
+                  (now && now - last_storage >= 5000000000ULL);
+    pthread_mutex_unlock(&ctx->status_mtx);
+
+    fill_fast_status(ctx, &next);
+    if (network_due) {
+        fill_network_status(&next);
+        last_network = now;
+    }
+    if (storage_due) {
+        fill_storage_status(&next, ctx->recorder);
+        last_storage = now;
+    }
+
+    pthread_mutex_lock(&ctx->status_mtx);
+    ctx->status_cache = next;
+    ctx->last_network_probe_ns = last_network;
+    ctx->last_storage_probe_ns = last_storage;
+    ctx->status_cache_valid = 1;
+    pthread_mutex_unlock(&ctx->status_mtx);
+    return 0;
+}
+
+void ipcam_control_set_encoder(ipcam_control_ctx_t *ctx, ipcam_encode_ctx_t *encoder)
+{
+    if (!ctx || !ctx->initialized) return;
+    pthread_mutex_lock(&ctx->status_mtx);
+    ctx->encoder = encoder;
+    pthread_mutex_unlock(&ctx->status_mtx);
 }
 
 /* 分配有界 request_id 并在锁内执行校验；返回 0 仅表示请求记录成功。 */
@@ -535,6 +675,8 @@ int ipcam_control_submit_command(ipcam_control_ctx_t *ctx,
     result = find_result_locked(ctx, id);
     if (result) *result = completed;
     pthread_mutex_unlock(&ctx->mtx);
+    /* 参数、视图或录像状态在下一次 1 Hz 刷新时更新；保留上一份完整快照，
+     * 避免控制请求刚返回时 HTTP 状态接口短暂变成 503。 */
     if (apply_rc == 0) {
         MLOGI("command done id=%llu name=%s persisted=%d message=%s path=%s\n",
               (unsigned long long)id, control_command_name(command->type),

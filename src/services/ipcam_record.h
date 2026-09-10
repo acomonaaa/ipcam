@@ -28,12 +28,23 @@ typedef struct ipcam_record_status_s {
     ipcam_record_state_t state;
     uint32_t segment_no;
     uint64_t frame_count;
+    uint64_t real_frames;
     uint64_t repeated_frames;
     uint64_t bytes_written;
     uint64_t elapsed_ms;
     char current_file[256];
     char last_error[128];
 } ipcam_record_status_t;
+
+typedef struct ipcam_record_perf_s {
+    uint64_t frame_count;
+    uint64_t real_frames;
+    uint64_t repeated_frames;
+    uint64_t bytes_written;
+    int storage_mounted;
+    uint64_t storage_available_bytes;
+    uint64_t storage_last_probe_ns;
+} ipcam_record_perf_t;
 
 typedef struct ipcam_record_ctx_s {
     ipcam_ring_buffer_t *jpeg_rb;
@@ -51,7 +62,15 @@ typedef struct ipcam_record_ctx_s {
     int fps;
     uint64_t recording_start_ns; /* 当前一次手动录像的总起点，跨分段不清零 */
     uint64_t frames_written_total; /* 含当前活动段，供性能统计使用 */
+    uint64_t real_frames_written_total;
+    uint64_t repeated_frames_total;
     uint64_t bytes_written_total;
+    int storage_mounted_cached;
+    uint64_t storage_available_cached;
+    uint64_t storage_last_probe_ns;
+    uint64_t storage_bytes_since_probe;
+    int storage_probe_failed;
+    char storage_last_error[128];
     unsigned long session_id;
     void *segment; /* 私有 AVI 段状态，避免把格式细节暴露给调用方。 */
     unsigned char *latest_jpeg; /* 独立快照缓存，避免录像消费者取走后拍照无帧 */
@@ -77,6 +96,8 @@ int ipcam_record_get_storage_status(ipcam_record_ctx_t *ctx,
 /* 读取当前录像线程已写入的帧/字节累计值，包含尚未完成收尾的活动段。 */
 void ipcam_record_get_metrics(ipcam_record_ctx_t *ctx, uint64_t *frames,
                               uint64_t *bytes);
+/* 复制录像真实/重复帧和存储缓存；查询不触发 statvfs。 */
+void ipcam_record_get_perf(ipcam_record_ctx_t *ctx, ipcam_record_perf_t *out);
 
 /* 关闭线程并完成正在写入的 AVI 段；调用后不得再访问 ctx。 */
 void ipcam_record_stop(ipcam_record_ctx_t *ctx);

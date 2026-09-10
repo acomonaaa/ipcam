@@ -16,7 +16,6 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -623,7 +622,11 @@ static void *capture_thread(void *arg)
     struct v4l2_buffer buf;
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     unsigned long frames = 0, dropped_disp = 0, dropped_enc = 0;
-    struct timeval t0, t1;
+    uint64_t thread_started_ns = 0;
+    struct timespec thread_start;
+    if (clock_gettime(CLOCK_MONOTONIC, &thread_start) == 0)
+        thread_started_ns = (uint64_t)thread_start.tv_sec * 1000000000ULL +
+                           (uint64_t)thread_start.tv_nsec;
     uint64_t next_emit_ns = 0;
     uint64_t emit_interval_ns = ctx->target_fps > 0 ?
         1000000000ULL / ctx->target_fps : 66666666ULL;
@@ -637,8 +640,6 @@ static void *capture_thread(void *arg)
     MLOGI("capture stream on: device=%s buffers=%d target_fps=%u actual_fps=%u controlled=%d\n",
           ctx->device_path, ctx->n_bufs, ctx->target_fps, ctx->actual_fps,
           ctx->fps_controlled);
-
-    gettimeofday(&t0, NULL);
 
     while (*ctx->running && ctx->service_running) {
         memset(&buf, 0, sizeof(buf));
@@ -696,7 +697,7 @@ static void *capture_thread(void *arg)
              * 64 位计数，且让 -Wformat=2 能在交叉编译时直接拦住问题。 */
             int drop_disp_now = 0, drop_enc_now = 0;
 
-            /* 双路非阻塞写：任一满则丢该路（不阻塞生产者、不等消费者） */
+            /* 双路非阻塞写：任一满则丢当前帧，采集线程不能被慢消费者反压。 */
             ipcam_frame_meta_t meta;
             memset(&meta, 0, sizeof(meta));
             /* 两路广播必须共享同一个采集时间戳，否则录像时间轴与预览/直播
@@ -712,7 +713,9 @@ static void *capture_thread(void *arg)
             meta.pixel_format = ctx->pixel_format;
             meta.config_generation = ipcam_param_get_generation();
             if (ctx->rb_disp) {
-                if (ipcam_ring_try_append_latest_meta(ctx->rb_disp, src, buf.bytesused, &meta) != 0) {
+                /* 显示 ring 只有两个槽且采用 drop-new；保留正在转换的槽，
+                 * 满时丢当前采集帧，避免覆盖显示线程仍在读取的源数据。 */
+                if (ipcam_ring_try_append_meta(ctx->rb_disp, src, buf.bytesused, &meta) != 0) {
                     dropped_disp++;
                     drop_disp_now = 1;
                 }
@@ -727,10 +730,9 @@ static void *capture_thread(void *arg)
             frames++;
             /*
              * 采集链路不能只靠主循环的 5 秒汇总诊断。沿用 BCF2“首批帧 + 周期帧”
-             * 策略：首 30 帧帮助定位首帧时序，之后每 30 帧报告一次序号、时间戳、
-             * 有效长度和两路广播是否丢帧；不按每帧刷屏，避免日志反过来拖慢 CSI。
+             * 策略：仅首 3 帧帮助定位首帧时序，避免日志反过来拖慢 CSI。
              */
-            if (frames <= 30 || (frames % 30) == 0) {
+            if (frames <= 3) {
                 MLOGI("frame no=%lu v4l2_seq=%u ts=%llu bytes=%u drop_disp=%d drop_enc=%d\n",
                       frames, buf.sequence, (unsigned long long)meta.monotonic_ns,
                       buf.bytesused, drop_disp_now, drop_enc_now);
@@ -751,8 +753,13 @@ static void *capture_thread(void *arg)
 
     xioctl(ctx->fd, VIDIOC_STREAMOFF, &type);
 
-    gettimeofday(&t1, NULL);
-    double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) / 1e6;
+    struct timespec thread_end;
+    uint64_t thread_ended_ns = 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &thread_end) == 0)
+        thread_ended_ns = (uint64_t)thread_end.tv_sec * 1000000000ULL +
+                          (uint64_t)thread_end.tv_nsec;
+    double sec = thread_ended_ns > thread_started_ns ?
+                 (double)(thread_ended_ns - thread_started_ns) / 1e9 : 0.0;
     MLOGI("capture thread exit, frames=%lu drop_disp=%lu drop_enc=%lu avg_fps=%.1f\n",
           frames, dropped_disp, dropped_enc, sec > 0 ? frames / sec : 0);
     return NULL;

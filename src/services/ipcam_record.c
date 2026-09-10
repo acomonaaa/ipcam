@@ -40,6 +40,8 @@ typedef struct avi_segment_s {
     off_t movi_data_start;
     uint64_t start_ns;
     uint64_t frame_count;
+    uint64_t real_frame_count;
+    uint64_t repeated_frame_count;
     uint64_t bytes_written;
     uint64_t container_bytes; /* 含 AVI 头、chunk 头和 padding 的实际累计大小 */
     uint64_t drop_base;
@@ -211,28 +213,90 @@ static int storage_probe(const char *root, int *mounted,
     return 0;
 }
 
-/* 同时检查目录身份和剩余空间，防止 SD 掉挂后落到根文件系统。 */
-static int storage_check(const char *root, char *error, size_t error_sz)
+/*
+ * 刷新存储缓存。statvfs 只在启动/分段和“满 1 秒或累计 8MiB”时调用，
+ * 避免原实现每个 JPEG 都做挂载与空间探测；结果仍由 mtx 保护供状态接口复制。
+ */
+static int record_storage_refresh(ipcam_record_ctx_t *ctx, int force)
 {
+    if (!ctx) return -1;
+    uint64_t now = now_ns();
+    pthread_mutex_lock(&ctx->mtx);
+    int due = force || ctx->storage_last_probe_ns == 0 ||
+              (now && now >= ctx->storage_last_probe_ns &&
+               now - ctx->storage_last_probe_ns >= 1000000000ULL) ||
+              ctx->storage_bytes_since_probe >= 8ULL * 1024ULL * 1024ULL;
+    char root[sizeof(ctx->storage_root)];
+    snprintf(root, sizeof(root), "%s", ctx->storage_root);
+    pthread_mutex_unlock(&ctx->mtx);
+    if (!due) return 0;
+
+    int mounted = 0;
     uint64_t available = 0;
-    if (storage_probe(root, NULL, &available, error, error_sz) != 0)
-        return -1;
-    if (available <= IPCAM_RECORD_RESERVE_BYTES) {
-        snprintf(error, error_sz, "存储空间不足");
-        return -1;
-    }
-    return 0;
+    char error[sizeof(ctx->storage_last_error)] = "";
+    int rc = storage_probe(root, &mounted, &available, error, sizeof(error));
+
+    pthread_mutex_lock(&ctx->mtx);
+    ctx->storage_mounted_cached = rc == 0 && mounted;
+    ctx->storage_available_cached = ctx->storage_mounted_cached ? available : 0;
+    ctx->storage_probe_failed = rc != 0;
+    ctx->storage_last_probe_ns = now ? now : ctx->storage_last_probe_ns;
+    ctx->storage_bytes_since_probe = 0;
+    snprintf(ctx->storage_last_error, sizeof(ctx->storage_last_error), "%s",
+             rc == 0 ? "" : error);
+    pthread_mutex_unlock(&ctx->mtx);
+    return rc;
 }
 
-/* 写入前预留当前 JPEG、索引和 AVI 收尾空间；低空间时主动终止本段，
- * 防止文件尾部 idx1 被截断后仍改名为看似完整的 .avi。 */
-static int storage_has_room(const char *root, uint64_t extra_bytes)
+/* 成功写入实际容器字节后扣减缓存；下次达到阈值会重新从文件系统确认。 */
+static void record_storage_consume(ipcam_record_ctx_t *ctx, uint64_t bytes)
 {
-    uint64_t available = 0;
-    char ignored_error[1];
-    if (storage_probe(root, NULL, &available, ignored_error,
-                      sizeof(ignored_error)) != 0) return 0;
-    return available > IPCAM_RECORD_RESERVE_BYTES + extra_bytes;
+    if (!ctx || bytes == 0) return;
+    pthread_mutex_lock(&ctx->mtx);
+    if (ctx->storage_available_cached > bytes)
+        ctx->storage_available_cached -= bytes;
+    else
+        ctx->storage_available_cached = 0;
+    ctx->storage_bytes_since_probe += bytes;
+    pthread_mutex_unlock(&ctx->mtx);
+}
+
+/* 使用缓存判断当前写入和 AVI 收尾是否有足够余量；必要时先强制刷新一次。 */
+static int record_storage_has_room(ipcam_record_ctx_t *ctx, uint64_t extra_bytes,
+                                   char *error, size_t error_sz)
+{
+    if (!ctx) return 0;
+    if (error && error_sz > 0) error[0] = '\0';
+    (void)record_storage_refresh(ctx, 0);
+    pthread_mutex_lock(&ctx->mtx);
+    uint64_t available = ctx->storage_available_cached;
+    int mounted = ctx->storage_mounted_cached;
+    int probe_failed = ctx->storage_probe_failed;
+    pthread_mutex_unlock(&ctx->mtx);
+    /* 预留区与本次写入量相加必须饱和，避免异常的大尺寸请求回绕成小数。 */
+    uint64_t required = extra_bytes > UINT64_MAX - IPCAM_RECORD_RESERVE_BYTES ?
+                        UINT64_MAX : IPCAM_RECORD_RESERVE_BYTES + extra_bytes;
+    int need_force_probe = mounted && !probe_failed && available <= required;
+    if (need_force_probe) {
+        /* 接近保留线时强制确认，避免缓存扣减和其它进程写入造成误判；
+         * 未挂载/探测失败则等待下一次一秒节流窗口，不能按每帧重试 statvfs。 */
+        (void)record_storage_refresh(ctx, 1);
+        pthread_mutex_lock(&ctx->mtx);
+        available = ctx->storage_available_cached;
+        mounted = ctx->storage_mounted_cached;
+        probe_failed = ctx->storage_probe_failed;
+        if (error && error_sz > 0)
+            snprintf(error, error_sz, "%s", ctx->storage_last_error);
+        pthread_mutex_unlock(&ctx->mtx);
+    }
+    if (!mounted || probe_failed ||
+        available <= required) {
+        if (error && error_sz > 0 && !error[0])
+            snprintf(error, error_sz, "%s", !mounted ? "存储目录未挂载" :
+                     (probe_failed ? "无法读取存储空间" : "存储空间不足"));
+        return 0;
+    }
+    return 1;
 }
 
 /* C99 没有 write_u16le 宏；单独定义以保持 AVI 字段的明确小端布局。 */
@@ -294,7 +358,7 @@ static int avi_close(ipcam_record_ctx_t *ctx, avi_segment_t *seg);
 static int avi_open_segment(ipcam_record_ctx_t *ctx, avi_segment_t **out)
 {
     char error[128];
-    if (storage_check(ctx->storage_root, error, sizeof(error)) != 0) {
+    if (!record_storage_has_room(ctx, 4096, error, sizeof(error))) {
         MLOGW("segment open rejected: root=%s reason=%s\n",
               ctx->storage_root, error);
         status_error(ctx, error);
@@ -336,12 +400,20 @@ static int avi_open_segment(ipcam_record_ctx_t *ctx, avi_segment_t **out)
         status_error(ctx, "创建录像流失败");
         return -1;
     }
+    /* AVI 会频繁追加小 chunk；256KiB stdio 缓冲减少 SD 卡写放大，收尾时
+     * 仍由 avi_close 统一 fflush+fsync，不能在每帧 fsync。 */
+    if (setvbuf(seg->fp, NULL, _IOFBF, 256 * 1024) != 0) {
+        fclose(seg->fp); unlink(seg->temp_path); free(seg);
+        status_error(ctx, "设置录像写缓冲失败");
+        return -1;
+    }
     if (avi_write_header_full(seg, ctx->width, ctx->height, ctx->fps) != 0) {
         fclose(seg->fp); unlink(seg->temp_path); free(seg); status_error(ctx, "写入 AVI 头失败"); return -1;
     }
     pthread_mutex_lock(&ctx->mtx);
     snprintf(ctx->status.current_file, sizeof(ctx->status.current_file), "%s", seg->final_path);
     pthread_mutex_unlock(&ctx->mtx);
+    record_storage_consume(ctx, seg->container_bytes);
     *out = seg;
     seg->drop_base = ipcam_ring_dropped_count(ctx->jpeg_rb);
     MLOGI("segment open: no=%u temp=%s final=%s base_drop=%llu\n",
@@ -401,16 +473,19 @@ static int avi_append_payload(avi_segment_t *seg, const void *data, size_t size)
  */
 static int avi_append(avi_segment_t *seg, const ipcam_frame_t *frame)
 {
-    if (!frame || !frame->rawData || avi_append_payload(seg, frame->rawData, frame->size) != 0)
-        return -1;
+    if (!seg || !frame || !frame->rawData || frame->size == 0) return -1;
+    /* 先准备重复帧副本，再写容器；这样 realloc 失败不会留下“AVI 已写入但
+     * 下一时间槽无法复制”的半更新状态，错误可以统一走分段收尾路径。 */
     if (frame->size > seg->last_jpeg_cap) {
         unsigned char *p = realloc(seg->last_jpeg, frame->size);
         if (!p) return -1;
         seg->last_jpeg = p;
         seg->last_jpeg_cap = frame->size;
     }
+    if (avi_append_payload(seg, frame->rawData, frame->size) != 0) return -1;
     memcpy(seg->last_jpeg, frame->rawData, frame->size);
     seg->last_jpeg_size = frame->size;
+    seg->real_frame_count++;
     return 0;
 }
 
@@ -418,16 +493,27 @@ static int avi_append(avi_segment_t *seg, const ipcam_frame_t *frame)
 static int avi_append_repeated(avi_segment_t *seg)
 {
     if (!seg || !seg->last_jpeg || seg->last_jpeg_size == 0) return -1;
-    return avi_append_payload(seg, seg->last_jpeg, seg->last_jpeg_size);
+    if (avi_append_payload(seg, seg->last_jpeg, seg->last_jpeg_size) != 0) return -1;
+    seg->repeated_frame_count++;
+    return 0;
 }
 
 /* 记录已成功写入的帧和字节；与状态快照共用 mtx，主循环可随时读取。 */
 static void record_add_metrics(ipcam_record_ctx_t *ctx, uint64_t frames,
-                               uint64_t bytes)
+                               uint64_t bytes, int real_frame)
 {
     pthread_mutex_lock(&ctx->mtx);
     ctx->frames_written_total += frames;
     ctx->bytes_written_total += bytes;
+    ctx->status.frame_count += frames;
+    ctx->status.bytes_written += bytes;
+    if (real_frame) {
+        ctx->real_frames_written_total += frames;
+        ctx->status.real_frames += frames;
+    } else {
+        ctx->repeated_frames_total += frames;
+        ctx->status.repeated_frames += frames;
+    }
     pthread_mutex_unlock(&ctx->mtx);
 }
 
@@ -473,16 +559,15 @@ static int avi_close(ipcam_record_ctx_t *ctx, avi_segment_t *seg)
         patch_u32(fp, seg->avih_total_frames_pos, (uint32_t)seg->frame_count) ||
         patch_u32(fp, seg->strh_length_pos, (uint32_t)seg->frame_count) ||
         patch_u32(fp, seg->riff_size_pos, (uint32_t)(end - 8))) goto fail;
+    if ((uint64_t)end > seg->container_bytes)
+        record_storage_consume(ctx, (uint64_t)end - seg->container_bytes);
+    seg->container_bytes = (uint64_t)end;
     /* 收尾失败也必须关闭 fd，避免拔卡/重复启停时泄漏文件描述符。 */
     if (fflush(fp) != 0 || fsync(seg->fd) != 0) goto fail;
     if (fclose(fp) != 0) { fp = NULL; goto fail_no_close; }
     fp = NULL;
     if (access(seg->final_path, F_OK) == 0 || rename(seg->temp_path, seg->final_path) != 0)
         goto fail_no_close;
-    pthread_mutex_lock(&ctx->mtx);
-    ctx->status.frame_count += seg->frame_count;
-    ctx->status.bytes_written += seg->bytes_written;
-    pthread_mutex_unlock(&ctx->mtx);
     MLOGI("segment close: file=%s frames=%llu payload=%llu container=%llu index=%zu\n",
           seg->final_path, (unsigned long long)seg->frame_count,
           (unsigned long long)seg->bytes_written,
@@ -512,10 +597,10 @@ static void *record_thread(void *arg)
     unsigned long consumed = 0;
     MLOGI("record thread start: root=%s\n", ctx->storage_root);
     while (*ctx->running && !record_is_shutdown(ctx)) {
-        int get_rc = ipcam_ring_try_get(ctx->jpeg_rb, &frame);
+        int get_rc = ipcam_ring_get_timed(ctx->jpeg_rb, &frame, 100);
         if (get_rc == 1) {
-            /* 非阻塞轮询让 stop_requested 在无新帧时也能及时收尾；
-             * 录像队列仍由编码线程非阻塞写入，不会因这里的 sleep 反压采集。 */
+            /* 定时等待只用于观察 stop_requested；没有新帧时不做 sleep 轮询，
+             * 编码器仍以非阻塞方式写入，不会因录像线程反压采集。 */
             pthread_mutex_lock(&ctx->mtx);
             int stop_without_frame = ctx->stop_requested;
             int state_without_frame = ctx->status.state;
@@ -547,7 +632,6 @@ static void *record_thread(void *arg)
                 pthread_mutex_unlock(&ctx->mtx);
                 continue;
             }
-            usleep(10 * 1000);
             continue;
         }
         if (get_rc != 0) break;
@@ -638,7 +722,9 @@ static void *record_thread(void *arg)
                             if (avi_rotate_segment(ctx, &seg) != 0) write_failed = 1;
                             break;
                         }
-                        if (!storage_has_room(ctx->storage_root, reserve)) {
+                        char storage_error[128];
+                        if (!record_storage_has_room(ctx, reserve, storage_error,
+                                                     sizeof(storage_error))) {
                             write_failed = 1;
                             break;
                         }
@@ -646,10 +732,9 @@ static void *record_thread(void *arg)
                             write_failed = 1;
                             break;
                         }
-                        record_add_metrics(ctx, 1, seg->last_jpeg_size);
-                        pthread_mutex_lock(&ctx->mtx);
-                        ctx->status.repeated_frames++;
-                        pthread_mutex_unlock(&ctx->mtx);
+                        record_storage_consume(ctx, 8ULL + seg->last_jpeg_size +
+                                               (seg->last_jpeg_size & 1U));
+                        record_add_metrics(ctx, 1, seg->last_jpeg_size, 0);
                         seg->next_slot_ns += interval_ns;
                     }
                 }
@@ -657,14 +742,17 @@ static void *record_thread(void *arg)
                     uint64_t reserve = 4096ULL +
                         ((uint64_t)seg->index_count + 1ULL) * 16ULL +
                         8ULL + frame.size + (frame.size & 1U);
-                    if (!storage_has_room(ctx->storage_root, reserve) ||
+                    char storage_error[128];
+                    if (!record_storage_has_room(ctx, reserve, storage_error,
+                                                 sizeof(storage_error)) ||
                         avi_append(seg, &frame) != 0)
                         write_failed = 1;
                     else {
-                        record_add_metrics(ctx, 1, frame.size);
+                        record_storage_consume(ctx, 8ULL + frame.size + (frame.size & 1U));
+                        record_add_metrics(ctx, 1, frame.size, 1);
                         /* 录像同样保留 BCF2 的首批帧/周期帧摘要，重点确认
                          * SD 写入、时间轴和 JPEG 序号，而不是打印每个字节。 */
-                        if (seg->frame_count <= 30 || (seg->frame_count % 30) == 0) {
+                        if (seg->frame_count <= 3) {
                             MLOGI("record frame no=%llu src_seq=%lu jpeg=%zu file=%s\n",
                                   (unsigned long long)seg->frame_count, frame.seqNo,
                                   frame.size, seg->final_path);
@@ -707,11 +795,13 @@ int ipcam_record_start(ipcam_record_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
     pthread_mutex_init(&ctx->latest_mtx, NULL);
     pthread_cond_init(&ctx->latest_cond, NULL);
     ctx->status.state = IPCAM_RECORD_IDLE;
-    int mounted = 0;
-    uint64_t available = 0;
-    char storage_error[128] = "";
-    int storage_rc = storage_probe(ctx->storage_root, &mounted, &available,
-                                   storage_error, sizeof(storage_error));
+    int storage_rc = record_storage_refresh(ctx, 1);
+    pthread_mutex_lock(&ctx->mtx);
+    int mounted = ctx->storage_mounted_cached;
+    uint64_t available = ctx->storage_available_cached;
+    char storage_error[sizeof(ctx->storage_last_error)];
+    snprintf(storage_error, sizeof(storage_error), "%s", ctx->storage_last_error);
+    pthread_mutex_unlock(&ctx->mtx);
     MLOGI("record service init: root=%s video=%dx%d@%d mounted=%d available=%llu probe_rc=%d%s%s\n",
           ctx->storage_root, ctx->width, ctx->height, ctx->fps, mounted,
           (unsigned long long)available, storage_rc,
@@ -782,9 +872,12 @@ int ipcam_record_get_storage_status(ipcam_record_ctx_t *ctx,
                                     int *mounted, uint64_t *available_bytes)
 {
     if (!ctx) return -1;
-    char error[128];
-    return storage_probe(ctx->storage_root, mounted, available_bytes,
-                         error, sizeof(error));
+    pthread_mutex_lock(&ctx->mtx);
+    if (mounted) *mounted = ctx->storage_mounted_cached;
+    if (available_bytes) *available_bytes = ctx->storage_available_cached;
+    int rc = ctx->storage_mounted_cached && !ctx->storage_probe_failed ? 0 : -1;
+    pthread_mutex_unlock(&ctx->mtx);
+    return rc;
 }
 
 /* 复制含活动段的写入统计；文件收尾失败时仍能看到已写入的工作量。 */
@@ -798,13 +891,28 @@ void ipcam_record_get_metrics(ipcam_record_ctx_t *ctx, uint64_t *frames,
     pthread_mutex_unlock(&ctx->mtx);
 }
 
+/* 复制录像和存储缓存快照；状态查询不会在 HTTP/UI 线程执行 statvfs。 */
+void ipcam_record_get_perf(ipcam_record_ctx_t *ctx, ipcam_record_perf_t *out)
+{
+    if (!ctx || !out) return;
+    pthread_mutex_lock(&ctx->mtx);
+    out->frame_count = ctx->frames_written_total;
+    out->real_frames = ctx->real_frames_written_total;
+    out->repeated_frames = ctx->repeated_frames_total;
+    out->bytes_written = ctx->bytes_written_total;
+    out->storage_mounted = ctx->storage_mounted_cached;
+    out->storage_available_bytes = ctx->storage_available_cached;
+    out->storage_last_probe_ns = ctx->storage_last_probe_ns;
+    pthread_mutex_unlock(&ctx->mtx);
+}
+
 /* 等待受理后的下一张 JPEG，完成 fsync/排他命名后才返回成功。 */
 int ipcam_record_save_photo(ipcam_record_ctx_t *ctx, char *path_out, size_t path_sz)
 {
     if (!ctx || !ctx->jpeg_rb) return -1;
     MLOGI("photo request: root=%s\n", ctx->storage_root);
     char error[128];
-    if (storage_check(ctx->storage_root, error, sizeof(error)) != 0) {
+    if (!record_storage_has_room(ctx, 4096, error, sizeof(error))) {
         status_photo_error(ctx, error);
         return -1;
     }
@@ -843,7 +951,7 @@ int ipcam_record_save_photo(ipcam_record_ctx_t *ctx, char *path_out, size_t path
         return -1;
     }
     /* 拍照也要为 JPEG 本体预留空间，避免只检查固定余量后写到一半满盘。 */
-    if (!storage_has_room(ctx->storage_root, jpeg_size)) {
+    if (!record_storage_has_room(ctx, jpeg_size, error, sizeof(error))) {
         free(jpeg);
         status_photo_error(ctx, "照片空间不足");
         return -1;
@@ -870,6 +978,7 @@ int ipcam_record_save_photo(ipcam_record_ctx_t *ctx, char *path_out, size_t path
     if (!write_ok || !close_ok || access(final, F_OK) == 0 || rename(temp, final) != 0) {
         unlink(temp); status_photo_error(ctx, "照片保存失败"); return -1;
     }
+    record_storage_consume(ctx, jpeg_size);
     if (path_out && path_sz > 0) snprintf(path_out, path_sz, "%s", final);
     status_clear_error(ctx);
     MLOGI("photo saved: file=%s bytes=%zu src_seq=%lu\n",

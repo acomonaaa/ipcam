@@ -66,6 +66,14 @@ void ipcam_record_get_status(ipcam_record_ctx_t *ctx,
     if (out) memset(out, 0, sizeof(*out));
 }
 
+/* 状态接口测试不启动真实录像线程；提供固定零快照，保持 HTTP 测试只关注
+ * 请求生命周期和 ring 等待唤醒，不把存储服务链接进主机桩程序。 */
+void ipcam_record_get_perf(ipcam_record_ctx_t *ctx, ipcam_record_perf_t *out)
+{
+    (void)ctx;
+    if (out) memset(out, 0, sizeof(*out));
+}
+
 int ipcam_record_request_start(ipcam_record_ctx_t *ctx) { (void)ctx; return -1; }
 int ipcam_record_request_stop(ipcam_record_ctx_t *ctx) { (void)ctx; return -1; }
 int ipcam_record_save_photo(ipcam_record_ctx_t *ctx, char *path, size_t path_sz)

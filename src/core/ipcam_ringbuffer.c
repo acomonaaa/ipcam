@@ -1,5 +1,6 @@
 #include "ipcam_ringbuffer.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -27,6 +28,20 @@ static uint64_t monotonic_ns(void)
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* 根据相对毫秒数生成条件变量所需的 CLOCK_MONOTONIC 绝对截止时间。 */
+static int make_deadline(int timeout_ms, struct timespec *deadline)
+{
+    if (!deadline || timeout_ms < 0) return -1;
+    if (clock_gettime(CLOCK_MONOTONIC, deadline) != 0) return -1;
+    deadline->tv_sec += timeout_ms / 1000;
+    deadline->tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline->tv_nsec >= 1000000000L) {
+        deadline->tv_sec++;
+        deadline->tv_nsec -= 1000000000L;
+    }
+    return 0;
 }
 
 /* 分配带帧头的槽位并初始化条件变量；失败时释放已分配资源。 */
@@ -59,9 +74,11 @@ ipcam_ring_buffer_t *ipcam_ring_create(int depth, size_t slot_bytes)
     pthread_mutex_init(&rb->mtx, NULL);
     init_cond_monotonic(&rb->cond_not_empty);
     init_cond_monotonic(&rb->cond_not_full);
+    init_cond_monotonic(&rb->cond_updated);
     rb->write_idx = 0;
     rb->read_idx = 0;
     rb->count = 0;
+    rb->read_held = 0;
     rb->closed = 0;
     rb->seq_counter = 0;
     rb->dropped_count = 0;
@@ -79,6 +96,7 @@ void ipcam_ring_destroy(ipcam_ring_buffer_t *rb)
     pthread_mutex_destroy(&rb->mtx);
     pthread_cond_destroy(&rb->cond_not_empty);
     pthread_cond_destroy(&rb->cond_not_full);
+    pthread_cond_destroy(&rb->cond_updated);
     free(rb);
 }
 
@@ -96,6 +114,7 @@ static void fill_frame_header(ipcam_slot_t *hdr, char *dst, size_t in_bytes,
     hdr->header.stride = meta ? meta->stride : 0;
     hdr->header.pixel_format = meta ? meta->pixel_format : 0;
     hdr->header.config_generation = meta ? meta->config_generation : 0;
+    hdr->header.quality = meta ? meta->quality : 0;
 }
 
 /* 非阻塞写入：满队列计数并丢当前帧，保障采集线程不会被慢消费者拖住。 */
@@ -122,6 +141,7 @@ int ipcam_ring_try_append_meta(ipcam_ring_buffer_t *rb, const void *in_data,
     rb->write_idx = (rb->write_idx + 1) % rb->depth;
     rb->count++;
     pthread_cond_signal(&rb->cond_not_empty);
+    pthread_cond_broadcast(&rb->cond_updated);
     pthread_mutex_unlock(&rb->mtx);
     return 0;
 }
@@ -141,6 +161,12 @@ int ipcam_ring_try_append_latest_meta(ipcam_ring_buffer_t *rb, const void *in_da
     pthread_mutex_lock(&rb->mtx);
     if (rb->closed) { pthread_mutex_unlock(&rb->mtx); return -1; }
     if (rb->count >= rb->depth) {
+        /* 借用槽仍归消费者所有；满队列时没有可安全覆盖的槽位。 */
+        if (rb->read_held) {
+            rb->dropped_count++;
+            pthread_mutex_unlock(&rb->mtx);
+            return -1;
+        }
         /* 直播只关心最新画面；主动释放最旧槽，避免 ring 满后永远不再前进。 */
         rb->dropped_count++;
         overwritten = 1;
@@ -154,6 +180,7 @@ int ipcam_ring_try_append_latest_meta(ipcam_ring_buffer_t *rb, const void *in_da
     rb->write_idx = (rb->write_idx + 1) % rb->depth;
     rb->count++;
     pthread_cond_signal(&rb->cond_not_empty);
+    pthread_cond_broadcast(&rb->cond_updated);
     pthread_mutex_unlock(&rb->mtx);
     return overwritten;
 }
@@ -184,6 +211,7 @@ int ipcam_ring_append_meta(ipcam_ring_buffer_t *rb, const void *in_data,
     rb->write_idx = (rb->write_idx + 1) % rb->depth;
     rb->count++;
     pthread_cond_signal(&rb->cond_not_empty);
+    pthread_cond_broadcast(&rb->cond_updated);
     pthread_mutex_unlock(&rb->mtx);
     return 0;
 }
@@ -193,6 +221,11 @@ int ipcam_ring_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame)
     if (!rb || !out_frame) return -1;
 
     pthread_mutex_lock(&rb->mtx);
+    /* 一个 ring 只有一个消费者；上一次借用未归还时拒绝重复借用。 */
+    if (rb->read_held) {
+        pthread_mutex_unlock(&rb->mtx);
+        return -1;
+    }
     while (rb->count == 0 && !rb->closed) {
         pthread_cond_wait(&rb->cond_not_empty, &rb->mtx);
     }
@@ -204,7 +237,8 @@ int ipcam_ring_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame)
     char *mem = rb->slot_mem[rb->read_idx];
     ipcam_slot_t *hdr = slot_hdr(mem);
     *out_frame = hdr->header;
-    /* 注意：不移动 read_idx；release 时才推进 */
+    /* 注意：不移动 read_idx；release 时才推进，并锁住该槽避免生产者覆盖。 */
+    rb->read_held = 1;
     pthread_mutex_unlock(&rb->mtx);
     return 0;
 }
@@ -214,13 +248,38 @@ int ipcam_ring_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame)
  * 采集生产者仍使用普通非阻塞写入，因而这里释放的只是尚未被消费者
  * 持有的旧槽；返回的最新槽在 release 前不会被本接口再次覆盖。
  */
-int ipcam_ring_get_latest(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame)
+/*
+ * get_latest 的公共实现。timeout_ms=-1 只由旧的阻塞 API 使用；新的定时
+ * API 传入非负毫秒，截止时间在首次等待前生成，避免虚假唤醒反复延长等待。
+ */
+static int ring_get_latest_internal(ipcam_ring_buffer_t *rb,
+                                    ipcam_frame_t *out_frame,
+                                    unsigned int *stale_count, int timeout_ms)
 {
-    if (!rb || !out_frame) return -1;
+    if (!rb || !out_frame || timeout_ms < -1) return -1;
 
     pthread_mutex_lock(&rb->mtx);
+    if (rb->read_held) {
+        pthread_mutex_unlock(&rb->mtx);
+        return -1;
+    }
+    struct timespec deadline;
+    int have_deadline = timeout_ms >= 0 && make_deadline(timeout_ms, &deadline) == 0;
+    if (timeout_ms >= 0 && !have_deadline) {
+        pthread_mutex_unlock(&rb->mtx);
+        return -1;
+    }
     while (rb->count == 0 && !rb->closed) {
-        pthread_cond_wait(&rb->cond_not_empty, &rb->mtx);
+        int wait_rc = timeout_ms < 0 ? pthread_cond_wait(&rb->cond_not_empty, &rb->mtx) :
+                      pthread_cond_timedwait(&rb->cond_not_empty, &rb->mtx, &deadline);
+        if (wait_rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&rb->mtx);
+            return 1;
+        }
+        if (wait_rc != 0) {
+            pthread_mutex_unlock(&rb->mtx);
+            return -1;
+        }
     }
     if (rb->count == 0 && rb->closed) {
         pthread_mutex_unlock(&rb->mtx);
@@ -239,6 +298,57 @@ int ipcam_ring_get_latest(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame)
     }
 
     *out_frame = slot_hdr(rb->slot_mem[latest_idx])->header;
+    rb->read_held = 1;
+    if (stale_count) *stale_count = (unsigned int)stale;
+    pthread_mutex_unlock(&rb->mtx);
+    return 0;
+}
+
+int ipcam_ring_get_latest(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame)
+{
+    return ring_get_latest_internal(rb, out_frame, NULL, -1);
+}
+
+int ipcam_ring_get_latest_ex(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame,
+                             unsigned int *stale_count, int timeout_ms)
+{
+    if (timeout_ms < 0) return -1;
+    return ring_get_latest_internal(rb, out_frame, stale_count, timeout_ms);
+}
+
+int ipcam_ring_get_timed(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame,
+                         int timeout_ms)
+{
+    if (!rb || !out_frame || timeout_ms < 0) return -1;
+
+    pthread_mutex_lock(&rb->mtx);
+    if (rb->read_held) {
+        pthread_mutex_unlock(&rb->mtx);
+        return -1;
+    }
+    struct timespec deadline;
+    if (make_deadline(timeout_ms, &deadline) != 0) {
+        pthread_mutex_unlock(&rb->mtx);
+        return -1;
+    }
+    while (rb->count == 0 && !rb->closed) {
+        int wait_rc = pthread_cond_timedwait(&rb->cond_not_empty, &rb->mtx, &deadline);
+        if (wait_rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&rb->mtx);
+            return 1;
+        }
+        if (wait_rc != 0) {
+            pthread_mutex_unlock(&rb->mtx);
+            return -1;
+        }
+    }
+    if (rb->count == 0 && rb->closed) {
+        pthread_mutex_unlock(&rb->mtx);
+        return -1;
+    }
+
+    *out_frame = slot_hdr(rb->slot_mem[rb->read_idx])->header;
+    rb->read_held = 1;
     pthread_mutex_unlock(&rb->mtx);
     return 0;
 }
@@ -248,11 +358,12 @@ void ipcam_ring_release(ipcam_ring_buffer_t *rb)
     if (!rb) return;
     pthread_mutex_lock(&rb->mtx);
     /* 释放必须与一次成功 ring_get 成对；防御性忽略重复 release，避免计数下溢。 */
-    if (rb->count > 0) {
+    if (rb->read_held && rb->count > 0) {
         rb->read_idx = (rb->read_idx + 1) % rb->depth;
         rb->count--;
+        rb->read_held = 0;
+        pthread_cond_signal(&rb->cond_not_full);
     }
-    pthread_cond_signal(&rb->cond_not_full);
     pthread_mutex_unlock(&rb->mtx);
 }
 
@@ -263,6 +374,7 @@ void ipcam_ring_close(ipcam_ring_buffer_t *rb)
     rb->closed = 1;
     pthread_cond_broadcast(&rb->cond_not_empty);
     pthread_cond_broadcast(&rb->cond_not_full);
+    pthread_cond_broadcast(&rb->cond_updated);
     pthread_mutex_unlock(&rb->mtx);
 }
 
@@ -355,11 +467,68 @@ int ipcam_ring_copy_latest(ipcam_ring_buffer_t *rb, void *out_data,
     return 0;
 }
 
+/*
+ * 等待编码器发布的新序号再复制，复制动作仍在 ring 锁内完成，保证本地
+ * buffer 不会拿到半帧。close 会唤醒等待者，使网络线程可以及时退出。
+ */
+int ipcam_ring_copy_latest_wait(ipcam_ring_buffer_t *rb, void *out_data,
+                                size_t out_cap, ipcam_frame_t *out_frame,
+                                unsigned long last_seq, int timeout_ms)
+{
+    if (!rb || !out_data || !out_frame || timeout_ms < 0) return -1;
+
+    pthread_mutex_lock(&rb->mtx);
+    struct timespec deadline;
+    if (make_deadline(timeout_ms, &deadline) != 0) {
+        pthread_mutex_unlock(&rb->mtx);
+        return -1;
+    }
+
+    for (;;) {
+        int has_new = 0;
+        if (rb->count > 0) {
+            int idx = (rb->write_idx + rb->depth - 1) % rb->depth;
+            has_new = slot_hdr(rb->slot_mem[idx])->header.seqNo != last_seq;
+        }
+        if (has_new) break;
+        if (rb->closed) {
+            pthread_mutex_unlock(&rb->mtx);
+            return -1;
+        }
+
+        int wait_rc = pthread_cond_timedwait(&rb->cond_updated, &rb->mtx, &deadline);
+        if (wait_rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&rb->mtx);
+            return 1;
+        }
+        if (wait_rc != 0) {
+            pthread_mutex_unlock(&rb->mtx);
+            return -1;
+        }
+    }
+
+    int idx = (rb->write_idx + rb->depth - 1) % rb->depth;
+    ipcam_slot_t *hdr = slot_hdr(rb->slot_mem[idx]);
+    if (hdr->header.size > out_cap) {
+        pthread_mutex_unlock(&rb->mtx);
+        return -1;
+    }
+    memcpy(out_data, hdr->header.rawData, hdr->header.size);
+    *out_frame = hdr->header;
+    out_frame->rawData = out_data;
+    pthread_mutex_unlock(&rb->mtx);
+    return 0;
+}
+
 /* 非阻塞取帧供录像线程轮询 stop_requested；避免无新帧时永久睡在条件变量上。 */
 int ipcam_ring_try_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame)
 {
     if (!rb || !out_frame) return -1;
     pthread_mutex_lock(&rb->mtx);
+    if (rb->read_held) {
+        pthread_mutex_unlock(&rb->mtx);
+        return -1;
+    }
     if (rb->count == 0) {
         int closed = rb->closed;
         pthread_mutex_unlock(&rb->mtx);
@@ -367,6 +536,7 @@ int ipcam_ring_try_get(ipcam_ring_buffer_t *rb, ipcam_frame_t *out_frame)
     }
     char *mem = rb->slot_mem[rb->read_idx];
     *out_frame = slot_hdr(mem)->header;
+    rb->read_held = 1;
     pthread_mutex_unlock(&rb->mtx);
     return 0;
 }
@@ -376,8 +546,16 @@ void ipcam_ring_clear(ipcam_ring_buffer_t *rb)
 {
     if (!rb) return;
     pthread_mutex_lock(&rb->mtx);
-    rb->read_idx = rb->write_idx;
-    rb->count = 0;
+    if (rb->read_held) {
+        /* 清空配置旧帧时不能使调用者手中的 rawData 失效，保留借用槽，
+         * 其余排队帧直接丢弃，并把下一次写入定位到借用槽之后。 */
+        rb->write_idx = (rb->read_idx + 1) % rb->depth;
+        rb->count = 1;
+    } else {
+        rb->read_idx = rb->write_idx;
+        rb->count = 0;
+    }
     pthread_cond_broadcast(&rb->cond_not_full);
+    pthread_cond_broadcast(&rb->cond_updated);
     pthread_mutex_unlock(&rb->mtx);
 }

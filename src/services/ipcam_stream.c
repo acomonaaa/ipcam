@@ -12,6 +12,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -23,6 +25,7 @@
 #include <sys/sysinfo.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ipcam_config.h"
@@ -48,8 +51,99 @@ typedef struct ipcam_stream_client_arg_s {
 static void stream_destroy_sync(ipcam_stream_ctx_t *ctx)
 {
     pthread_cond_destroy(&ctx->client_cond);
+    pthread_mutex_destroy(&ctx->stats_mtx);
     pthread_mutex_destroy(&ctx->ring_mtx);
     pthread_mutex_destroy(&ctx->client_mtx);
+}
+
+/* 直播截止时间使用单调时钟，避免 NTP/RTC 校时把 500ms 预算拉长。 */
+static uint64_t stream_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* 为单个长连接切到非阻塞，HTTP 头仍在阻塞读阶段完成，避免影响 body 解析。 */
+static int stream_set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/*
+ * 在一个绝对截止时间前发送完整 buffer；EAGAIN 只等待 POLLOUT，不跨帧丢弃
+ * 已写出的字节。返回 0=完整发送、-2=超时、-1=对端/系统错误。
+ */
+static int send_all_deadline(int fd, const void *buffer, size_t length,
+                             uint64_t deadline_ns)
+{
+    const unsigned char *data = buffer;
+    size_t sent = 0;
+    while (sent < length) {
+        ssize_t n = send(fd, data + sent, length - sent, MSG_NOSIGNAL);
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            uint64_t now = stream_now_ns();
+            if (!now || now >= deadline_ns) return -2;
+            uint64_t remain_ns = deadline_ns - now;
+            int remain_ms = (int)((remain_ns + 999999ULL) / 1000000ULL);
+            if (remain_ms < 1) remain_ms = 1;
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            int poll_rc = poll(&pfd, 1, remain_ms);
+            if (poll_rc == 0) return -2;
+            if (poll_rc < 0 && errno == EINTR) continue;
+            if (poll_rc < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return -1;
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+/* 发送成功/超时/失败单独计数，便于区分编码没有新帧和客户端网络瓶颈。 */
+static void stream_add_stats(ipcam_stream_ctx_t *ctx, size_t bytes,
+                             int send_rc)
+{
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->stats_mtx);
+    if (send_rc == 0) {
+        ctx->frames_sent++;
+        ctx->bytes_sent += bytes;
+    } else if (send_rc == -2) {
+        ctx->send_timeouts++;
+    } else {
+        ctx->send_failures++;
+    }
+    pthread_mutex_unlock(&ctx->stats_mtx);
+}
+
+/* 记录捕获时间到首次 socket 写入的延迟，识别编码正常但网络排队过深的情况。 */
+static void stream_add_capture_latency(ipcam_stream_ctx_t *ctx, uint64_t capture_ns)
+{
+    if (!ctx || capture_ns == 0) return;
+    uint64_t send_start_ns = stream_now_ns();
+    if (send_start_ns <= capture_ns) return;
+    pthread_mutex_lock(&ctx->stats_mtx);
+    ipcam_perf_window_add(&ctx->send_latency_window, send_start_ns - capture_ns);
+    pthread_mutex_unlock(&ctx->stats_mtx);
+}
+
+/* 直播 socket 使用较大的内核发送缓存和非阻塞模式，把慢客户端隔离在自身连接内。 */
+static int stream_configure_client_socket(int fd)
+{
+    int send_buffer = 128 * 1024;
+    int nodelay = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) != 0)
+        MLOGW("set SO_SNDBUF failed: fd=%d errno=%d(%s)\n", fd, errno, strerror(errno));
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) != 0)
+        MLOGW("set TCP_NODELAY failed: fd=%d errno=%d(%s)\n", fd, errno, strerror(errno));
+    return stream_set_nonblocking(fd);
 }
 
 static ssize_t safe_write(int fd, const void *buf, size_t len)
@@ -98,11 +192,15 @@ static void serve_index(int fd)
     safe_write(fd, serve_index_body, strlen(serve_index_body));
 }
 
-/* 汇总控制器快照并返回实际帧参数、网络、存储和队列统计。 */
-static void serve_status(int fd, ipcam_ring_buffer_t *jpeg_rb,
-                         ipcam_record_ctx_t *rec,
-                         ipcam_control_ctx_t *control)
+/*
+ * 返回控制器缓存中的快速状态和最近性能窗口。这里绝不主动探测网络/存储，
+ * 这样慢客户端请求状态时不会与单核上的编码、显示或写盘争抢探测时间。
+ */
+static void serve_status(int fd, ipcam_stream_ctx_t *ctx)
 {
+    ipcam_ring_buffer_t *jpeg_rb = ctx ? ctx->jpeg_rb : NULL;
+    ipcam_record_ctx_t *rec = ctx ? ctx->recorder : NULL;
+    ipcam_control_ctx_t *control = ctx ? ctx->control : NULL;
     int cnt = jpeg_rb ? ipcam_ring_count(jpeg_rb) : 0;
     ipcam_record_status_t rst;
     memset(&rst, 0, sizeof(rst));
@@ -120,8 +218,33 @@ static void serve_status(int fd, ipcam_ring_buffer_t *jpeg_rb,
     uint32_t status_capture_fps = have_control ? cst.capture_fps : 0;
     uint32_t status_output_fps = have_control ? cst.output_fps : 0;
     uint8_t status_q = have_control ? cst.video.jpeg_quality : ipcam_param_get_jpeg_quality();
+    uint8_t configured_q = have_control ? cst.configured_jpeg_quality : status_q;
+    uint8_t effective_q = have_control ? cst.effective_jpeg_quality : status_q;
+    uint8_t adaptive_q = have_control ? cst.adaptive_quality : 0;
+    const char *pipeline = have_control && cst.pipeline[0] ? cst.pipeline : "unknown";
+    const char *framebuffer = have_control && cst.framebuffer_mode[0] ?
+                              cst.framebuffer_mode : "unknown";
+    ipcam_encode_perf_t ep;
+    ipcam_display_perf_t dp;
+    ipcam_record_perf_t rp;
+    ipcam_stream_perf_t sp;
+    memset(&ep, 0, sizeof(ep));
+    memset(&dp, 0, sizeof(dp));
+    memset(&rp, 0, sizeof(rp));
+    memset(&sp, 0, sizeof(sp));
+    if (have_control) {
+        ep = cst.encode_perf;
+        dp = cst.display_perf;
+        rp = cst.record_perf;
+    }
+    if (!have_control && rec) ipcam_record_get_perf(rec, &rp);
+    if (ctx) ipcam_stream_get_perf(ctx, &sp);
+    double record_real_fps = rst.elapsed_ms > 0 ?
+        (double)rp.real_frames * 1000.0 / (double)rst.elapsed_ms : 0.0;
+    double record_repeat_fps = rst.elapsed_ms > 0 ?
+        (double)rp.repeated_frames * 1000.0 / (double)rst.elapsed_ms : 0.0;
     /* 状态响应从同一控制器读取，避免把编译期配置当作实际生效值。 */
-    char buf[1024];
+    char buf[4096];
     int m = snprintf(buf, sizeof(buf),
                  "{\"ring_count\":%d,"
                  "\"model\":\"%s\",\"swver\":\"%s\","
@@ -136,7 +259,27 @@ static void serve_status(int fd, ipcam_ring_buffer_t *jpeg_rb,
                   "\"storage_available\":%llu,"
                   "\"jpeg_live_dropped\":%llu,\"jpeg_record_dropped\":%llu,"
                   "\"capture_frames\":%llu,\"capture_drop_display\":%llu,"
-                  "\"capture_drop_encode\":%llu}\n",
+                  "\"capture_drop_encode\":%llu,"
+                  "\"configured_jpeg_quality\":%u,"
+                  "\"effective_jpeg_quality\":%u,"
+                  "\"adaptive_quality_enabled\":%s,"
+                  "\"pipeline\":\"%s\",\"framebuffer\":\"%s\","
+                  "\"encode\":{\"frames\":%llu,\"stale\":%llu,"
+                  "\"bytes\":%llu,\"avg_ns\":%llu,\"p95_ns\":%llu,"
+                  "\"max_ns\":%llu,\"yuv420_avg_ns\":%llu,"
+                  "\"yuv420_p95_ns\":%llu,\"yuv420_max_ns\":%llu,"
+                  "\"jpeg_avg_ns\":%llu,\"jpeg_p95_ns\":%llu,"
+                  "\"jpeg_max_ns\":%llu,\"jpeg_avg_bytes\":%llu,"
+                  "\"jpeg_max_bytes\":%llu,\"capture_to_output_p95_ns\":%llu,"
+                  "\"window_frames\":%u},"
+                  "\"preview\":{\"frames\":%llu,\"stale\":%llu,"
+                  "\"convert_avg_ns\":%llu,\"convert_p95_ns\":%llu,"
+                  "\"convert_max_ns\":%llu,\"pan_count\":%llu,"
+                  "\"pan_failures\":%llu},"
+                  "\"stream\":{\"frames\":%llu,\"bytes\":%llu,"
+                  "\"send_timeouts\":%llu,\"send_failures\":%llu,"
+                  "\"capture_to_send_start_p95_ns\":%llu,\"window_frames\":%u},"
+                  "\"record_real_fps\":%.3f,\"record_repeat_fps\":%.3f}\n",
                  cnt,
                  ipcam_param_get_model(), ipcam_param_get_swver(),
                  ipcam_param_get_net_mode(), status_w, status_h,
@@ -156,7 +299,39 @@ static void serve_status(int fd, ipcam_ring_buffer_t *jpeg_rb,
                  (unsigned long long)(have_control ? cst.jpeg_record_dropped : 0),
                  (unsigned long long)(have_control ? cst.capture_frames : 0),
                  (unsigned long long)(have_control ? cst.capture_dropped_display : 0),
-                 (unsigned long long)(have_control ? cst.capture_dropped_encode : 0));
+                 (unsigned long long)(have_control ? cst.capture_dropped_encode : 0),
+                 configured_q, effective_q, adaptive_q ? "true" : "false",
+                 pipeline, framebuffer,
+                 (unsigned long long)ep.frames_encoded,
+                 (unsigned long long)ep.stale_input_frames,
+                 (unsigned long long)ep.bytes_encoded,
+                 (unsigned long long)ep.encode_avg_ns,
+                 (unsigned long long)ep.encode_p95_ns,
+                 (unsigned long long)ep.encode_max_ns,
+                 (unsigned long long)ep.yuv420_avg_ns,
+                 (unsigned long long)ep.yuv420_p95_ns,
+                 (unsigned long long)ep.yuv420_max_ns,
+                 (unsigned long long)ep.jpeg_avg_ns,
+                 (unsigned long long)ep.jpeg_p95_ns,
+                 (unsigned long long)ep.jpeg_max_ns,
+                 (unsigned long long)ep.jpeg_avg_bytes,
+                 (unsigned long long)ep.jpeg_max_bytes,
+                 (unsigned long long)ep.capture_to_output_p95_ns,
+                 ep.window_frames,
+                 (unsigned long long)dp.frames_rendered,
+                 (unsigned long long)dp.stale_input_frames,
+                 (unsigned long long)dp.convert_avg_ns,
+                 (unsigned long long)dp.convert_p95_ns,
+                 (unsigned long long)dp.convert_max_ns,
+                 (unsigned long long)dp.pan_count,
+                 (unsigned long long)dp.pan_failures,
+                 (unsigned long long)sp.frames_sent,
+                 (unsigned long long)sp.bytes_sent,
+                 (unsigned long long)sp.send_timeouts,
+                 (unsigned long long)sp.send_failures,
+                 (unsigned long long)sp.capture_to_send_start_p95_ns,
+                 sp.window_frames,
+                 record_real_fps, record_repeat_fps);
     if (m < 0 || m >= (int)sizeof(buf)) {
         const char *err = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
         safe_write(fd, err, strlen(err));
@@ -381,17 +556,22 @@ static void serve_capabilities(int fd, ipcam_control_ctx_t *control)
     char body[512];
     int n = snprintf(body, sizeof(body),
         "{\"video\":[{\"width\":%u,\"height\":%u,\"fps\":[%u]}],"
-        "\"jpeg_quality\":{\"min\":%u,\"max\":%u},"
+        "\"jpeg_quality\":{\"min\":%u,\"max\":%u,"
+        "\"adaptive\":%s,\"levels\":[%u,%u,%u]},"
         "\"mirror\":{\"horizontal\":%s,\"vertical\":%s},"
         "\"preview_zoom\":{\"min\":%.1f,\"max\":%.1f},"
         "\"record\":{\"format\":\"mjpeg-avi\",\"segment_seconds\":%u},"
-        "\"touch_points\":%u,\"backlight\":%s,\"light\":%s}\n",
+        "\"touch_points\":%u,\"backlight\":%s,\"light\":%s,"
+        "\"screen_timeout\":%s}\n",
         caps.video[0].width, caps.video[0].height, caps.video[0].target_fps,
         caps.jpeg_quality_min, caps.jpeg_quality_max,
+        caps.adaptive_quality ? "true" : "false",
+        caps.jpeg_quality_levels[0], caps.jpeg_quality_levels[1],
+        caps.jpeg_quality_levels[2],
         caps.mirror_horizontal ? "true" : "false", caps.mirror_vertical ? "true" : "false",
         caps.preview_zoom_min, caps.preview_zoom_max, caps.record_segment_seconds,
         caps.touch_points, caps.backlight ? "true" : "false",
-        caps.light ? "true" : "false");
+        caps.light ? "true" : "false", caps.screen_timeout ? "true" : "false");
     if (n < 0 || n >= (int)sizeof(body)) return;
     char hdr[256];
     int hn = snprintf(hdr, sizeof(hdr),
@@ -414,10 +594,12 @@ static void serve_record_status(int fd, ipcam_record_ctx_t *rec,
     char body[640];
     int n = snprintf(body, sizeof(body),
         "{\"state\":%d,\"segment_no\":%u,\"frame_count\":%llu,"
+        "\"real_frames\":%llu,"
         "\"repeated_frames\":%llu,\"bytes_written\":%llu,"
         "\"elapsed_ms\":%llu,\"current_file\":\"%s\",\"error\":\"%s\"}\n",
         (int)st.state, st.segment_no,
         (unsigned long long)st.frame_count,
+        (unsigned long long)st.real_frames,
         (unsigned long long)st.repeated_frames,
         (unsigned long long)st.bytes_written,
         (unsigned long long)st.elapsed_ms,
@@ -714,7 +896,8 @@ static void serve_snapshot(int fd, ipcam_ring_buffer_t *jpeg_rb, pthread_mutex_t
 static void serve_stream(int fd, unsigned long sid,
                          ipcam_ring_buffer_t *jpeg_rb, pthread_mutex_t *ring_mtx,
                          volatile sig_atomic_t *running,
-                         volatile sig_atomic_t *service_running)
+                         volatile sig_atomic_t *service_running,
+                         ipcam_stream_ctx_t *stream_ctx)
 {
     const char *hdr =
         "HTTP/1.1 200 OK\r\n"
@@ -723,7 +906,8 @@ static void serve_stream(int fd, unsigned long sid,
         "Connection: close\r\n"
         "\r\n";
 
-    if (safe_write(fd, hdr, strlen(hdr)) < 0) {
+    uint64_t header_deadline = stream_now_ns() + 500000000ULL;
+    if (send_all_deadline(fd, hdr, strlen(hdr), header_deadline) != 0) {
         MLOGW("stream header failed: sid=%lu fd=%d\n", sid, fd);
         return;
     }
@@ -743,15 +927,24 @@ static void serve_stream(int fd, unsigned long sid,
 
     /* 既要响应进程退出，也要响应只停止 HTTP 服务的局部生命周期；
      * 旧实现只检查 running，main 关闭直播时会因客户端仍在等待新帧而无法收敛。 */
-    while (*running && (!service_running || *service_running)) {
+    while (*running && service_running && *service_running) {
         ipcam_frame_t f;
-        int gr = ipcam_ring_copy_latest(jpeg_rb, local, local_cap, &f, last_seq);
-        if (gr != 0) {
-            usleep(gr < 0 ? 50 * 1000 : 10 * 1000);
-            continue;
-        }
+        int gr = ipcam_ring_copy_latest_wait(jpeg_rb, local, local_cap, &f,
+                                             last_seq, 500);
+        if (gr == 1) continue;
+        if (gr != 0) break;
         last_seq = f.seqNo;
         size_t frame_size = f.size;
+
+        /* turbojpeg 的输出必须是完整 JPEG；发现越界/截断时整条连接终止，
+         * 不能把本帧尾部和下一帧拼起来让客户端继续解析。 */
+        if (frame_size < 4 || local[0] != 0xff || local[1] != 0xd8 ||
+            local[frame_size - 2] != 0xff || local[frame_size - 1] != 0xd9) {
+            MLOGW("invalid JPEG frame: sid=%lu seq=%lu bytes=%zu\n",
+                  sid, f.seqNo, frame_size);
+            if (stream_ctx) stream_add_stats(stream_ctx, 0, -1);
+            break;
+        }
 
         /* 现在独立写 socket（ring 已 release，encode 可继续） */
         char part_hdr[256];
@@ -759,16 +952,30 @@ static void serve_stream(int fd, unsigned long sid,
                           "--ipcam\r\n"
                           "Content-Type: image/jpeg\r\n"
                           "Content-Length: %zu\r\n"
+                          "X-IPCam-Seq: %lu\r\n"
+                          "X-IPCam-Capture-Ns: %llu\r\n"
+                          "X-IPCam-Quality: %u\r\n"
+                          "X-IPCam-Frame-Bytes: %zu\r\n"
                           "\r\n",
-                          frame_size);
+                          frame_size, f.seqNo,
+                          (unsigned long long)f.monotonic_ns, f.quality, frame_size);
         if (hn < 0 || hn >= (int)sizeof(part_hdr)) goto cleanup;
-        if (safe_write(fd, part_hdr, (size_t)hn) < 0) goto cleanup;
-        if (frame_size > 0 && safe_write(fd, local, frame_size) < 0) goto cleanup;
-        if (safe_write(fd, "\r\n", 2) < 0) goto cleanup;
+        uint64_t frame_send_start_ns = stream_now_ns();
+        if (stream_ctx) stream_add_capture_latency(stream_ctx, f.monotonic_ns);
+        uint64_t frame_deadline = frame_send_start_ns + 500000000ULL;
+        int send_rc = send_all_deadline(fd, part_hdr, (size_t)hn, frame_deadline);
+        if (send_rc == 0 && frame_size > 0)
+            send_rc = send_all_deadline(fd, local, frame_size, frame_deadline);
+        if (send_rc == 0) send_rc = send_all_deadline(fd, "\r\n", 2, frame_deadline);
+        if (send_rc != 0) {
+            if (stream_ctx) stream_add_stats(stream_ctx, 0, send_rc);
+            goto cleanup;
+        }
+        if (stream_ctx) stream_add_stats(stream_ctx, (size_t)hn + frame_size + 2, 0);
         frames_sent++;
         /* 慢客户端只取最新帧；按首批/周期帧记录发送序号，能直接判断网络
          * 卡顿还是编码端没有产生新 JPEG，同时不会按 15 fps 刷屏。 */
-        if (frames_sent <= 3 || (frames_sent % 30) == 0) {
+        if (frames_sent <= 3) {
             MLOGI("stream frame: sid=%lu no=%lu seq=%lu bytes=%zu\n",
                   sid, frames_sent, f.seqNo, frame_size);
         }
@@ -1036,13 +1243,17 @@ static void handle_client(int fd, ipcam_ring_buffer_t *jpeg_rb, ipcam_stream_ctx
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/stream.mjpg") == 0) {
         unsigned long sid = next_session_id();
         MLOGI("stream session start sid=%lu path=%s\n", sid, path);
-        serve_stream(fd, sid, jpeg_rb, &ctx->ring_mtx, ctx->running,
-                     &ctx->service_running);
+        if (stream_configure_client_socket(fd) != 0) {
+            MLOGW("stream socket nonblocking setup failed: sid=%lu\n", sid);
+        } else {
+            serve_stream(fd, sid, jpeg_rb, &ctx->ring_mtx, ctx->running,
+                         &ctx->service_running, ctx);
+        }
         MLOGI("stream session end sid=%lu\n", sid);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/snapshot.jpg") == 0) {
         serve_snapshot(fd, jpeg_rb, &ctx->ring_mtx);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/status") == 0) {
-        serve_status(fd, jpeg_rb, ctx->recorder, ctx->control);
+        serve_status(fd, ctx);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/capabilities") == 0) {
         serve_capabilities(fd, ctx->control);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/record") == 0) {
@@ -1271,11 +1482,18 @@ int ipcam_stream_start_ex(ipcam_stream_ctx_t *ctx, ipcam_ring_buffer_t *jpeg_rb,
         pthread_mutex_destroy(&ctx->client_mtx);
         return -1;
     }
-    if (pthread_cond_init(&ctx->client_cond, NULL) != 0) {
+    if (pthread_mutex_init(&ctx->stats_mtx, NULL) != 0) {
         pthread_mutex_destroy(&ctx->ring_mtx);
         pthread_mutex_destroy(&ctx->client_mtx);
         return -1;
     }
+    if (pthread_cond_init(&ctx->client_cond, NULL) != 0) {
+        pthread_mutex_destroy(&ctx->stats_mtx);
+        pthread_mutex_destroy(&ctx->ring_mtx);
+        pthread_mutex_destroy(&ctx->client_mtx);
+        return -1;
+    }
+    ipcam_perf_window_init(&ctx->send_latency_window);
     /*
      * client_fds[] 的空槽统一用 -1 表示；当前并发上限由 client_cnt 维护，
      * 但仍需把槽位设为明确的无效 fd，避免后续回收逻辑把 0 误当成连接。
@@ -1367,6 +1585,20 @@ void ipcam_stream_set_display(ipcam_stream_ctx_t *ctx, ipcam_display_ctx_t *disp
 void ipcam_stream_set_screen(ipcam_stream_ctx_t *ctx, ipcam_screen_ctx_t *screen)
 {
     if (ctx) ctx->screen = screen;
+}
+
+/* 复制直播统计快照；停止流程不会清零已发送计数，便于主循环计算窗口差值。 */
+void ipcam_stream_get_perf(ipcam_stream_ctx_t *ctx, ipcam_stream_perf_t *out)
+{
+    if (!ctx || !out) return;
+    pthread_mutex_lock(&ctx->stats_mtx);
+    out->frames_sent = ctx->frames_sent;
+    out->bytes_sent = ctx->bytes_sent;
+    out->send_timeouts = ctx->send_timeouts;
+    out->send_failures = ctx->send_failures;
+    out->capture_to_send_start_p95_ns = ipcam_perf_window_p95(&ctx->send_latency_window);
+    out->window_frames = (uint32_t)ipcam_perf_window_count(&ctx->send_latency_window);
+    pthread_mutex_unlock(&ctx->stats_mtx);
 }
 
 void ipcam_stream_stop(ipcam_stream_ctx_t *ctx)
